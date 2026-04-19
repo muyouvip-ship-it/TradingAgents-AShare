@@ -21,3 +21,6 @@ PyJWT
 cryptography
 json-repair
 markdown
+
+# P3优化：Prometheus监控
+prometheus-client

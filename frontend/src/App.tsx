@@ -12,6 +12,9 @@ import Login from './pages/Login'
 import Feedback from './pages/Feedback'
 import Sponsor from './pages/Sponsor'
 import Thanks from './pages/Thanks'
+import StrategiesV2 from './pages/StrategiesV2'
+import StrategyCreate from './pages/StrategyCreate'
+import Backtest from './pages/Backtest'
 import { useAuthStore } from './stores/authStore'
 
 const ONLINE_HOST = 'app.510168.xyz'
@@ -59,6 +62,11 @@ function App() {
                   <Route path="/analysis" element={<Analysis />} />
                   <Route path="/reports" element={<Reports />} />
                   <Route path="/portfolio" element={<Portfolio />} />
+                  <Route path="/strategies" element={<StrategiesV2 />} />
+                  <Route path="/strategies/create" element={<StrategyCreate />} />
+                  <Route path="/strategies/:id" element={<StrategyCreate />} />
+                  <Route path="/strategies/:id/edit" element={<StrategyCreate />} />
+                  <Route path="/backtest" element={<Backtest />} />
                   <Route path="/settings" element={<Settings />} />
                   <Route path="/feedback" element={<Feedback />} />
                 </Routes>

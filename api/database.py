@@ -8,46 +8,26 @@ from typing import Generator
 from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# Database URL - default to SQLite for simplicity
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tradingagents.db")
+# Database URL - PostgreSQL only
+DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://localhost/trading_agents"
+
+if DATABASE_URL.startswith("sqlite"):
+    raise RuntimeError(
+        "SQLite has been retired for runtime use. Set DATABASE_URL to PostgreSQL."
+    )
+
+# 检测是否为SQLite数据库
+IS_SQLITE = False
 
 # Create engine
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False},
-        echo=False,
-        pool_size=10,
-        max_overflow=20,
-        pool_timeout=60,
-        pool_recycle=3600,
-    )
-
-    def _can_use_wal() -> bool:
-        """Check if WAL mode is safe: db's parent dir must be writable for -shm/-wal files."""
-        import pathlib
-        db_path = DATABASE_URL.replace("sqlite:///", "").replace("sqlite://", "")
-        parent = pathlib.Path(db_path).resolve().parent
-        return os.access(parent, os.W_OK)
-
-    _use_wal = _can_use_wal()
-
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        if _use_wal:
-            cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.close()
-else:
-    # For PostgreSQL/MySQL, use a larger pool to handle concurrency
-    engine = create_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_size=20,
-        max_overflow=10,
-        pool_timeout=30,
-        pool_recycle=3600,
-    )
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=20,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=3600,
+)
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -99,7 +79,17 @@ def _ensure_report_schema() -> None:
     """Add lightweight columns for existing SQLite deployments without migrations."""
     try:
         with engine.begin() as conn:
-            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(reports)"))}
+            if IS_SQLITE:
+                columns = {row[1] for row in conn.execute(text("PRAGMA table_info(reports)"))}
+            else:
+                # PostgreSQL使用information_schema
+                result = conn.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'reports' AND table_schema = 'public'
+                """))
+                columns = {row[0] for row in result}
+            
             if "direction" not in columns:
                 conn.execute(text("ALTER TABLE reports ADD COLUMN direction VARCHAR(50)"))
             if "status" not in columns:
@@ -124,14 +114,31 @@ def _ensure_user_schema() -> None:
     """Add columns to users table for existing SQLite deployments without migrations."""
     try:
         with engine.begin() as conn:
-            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+            if IS_SQLITE:
+                columns = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+                llm_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(user_llm_configs)"))}
+            else:
+                # PostgreSQL使用information_schema
+                user_result = conn.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND table_schema = 'public'
+                """))
+                columns = {row[0] for row in user_result}
+
+                llm_result = conn.execute(text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'user_llm_configs' AND table_schema = 'public'
+                """))
+                llm_columns = {row[0] for row in llm_result}
+            
             if "last_login_ip" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45)"))
             if "email_report_enabled" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN email_report_enabled BOOLEAN NOT NULL DEFAULT 1"))
             if "wecom_report_enabled" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN wecom_report_enabled BOOLEAN NOT NULL DEFAULT 1"))
-            llm_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(user_llm_configs)"))}
             if "wecom_webhook_encrypted" not in llm_columns:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN wecom_webhook_encrypted TEXT"))
             if "default_analysts" not in llm_columns:
@@ -149,7 +156,17 @@ def _migrate_tokens_to_hashed() -> None:
     try:
         with engine.begin() as conn:
             # Add token_hint column if missing
-            token_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_tokens)"))}
+            if IS_SQLITE:
+                token_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_tokens)"))}
+            else:
+                # PostgreSQL使用information_schema
+                result = conn.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'user_tokens' AND table_schema = 'public'
+                """))
+                token_cols = {row[0] for row in result}
+            
             if "token_hint" not in token_cols:
                 conn.execute(text("ALTER TABLE user_tokens ADD COLUMN token_hint VARCHAR(8)"))
 

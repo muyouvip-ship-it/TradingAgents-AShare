@@ -7,6 +7,8 @@ import {
     MessageSquare,
     Settings,
     Wallet,
+    TrendingUp,
+    BarChart3,
 } from 'lucide-react'
 
 export interface SidebarNavItem {
@@ -20,6 +22,8 @@ export const navItems: SidebarNavItem[] = [
     { path: '/analysis', icon: Activity, label: '智能分析' },
     { path: '/reports', icon: FileText, label: '历史报告' },
     { path: '/portfolio', icon: Briefcase, label: '自选 & 定时' },
+    { path: '/strategies', icon: TrendingUp, label: '策略管理' },
+    { path: '/backtest', icon: BarChart3, label: '策略回测' },
     { path: '/tracking-board', icon: Wallet, label: '跟踪看板' },
     { path: '/feedback', icon: MessageSquare, label: '反馈留言' },
     { path: '/settings', icon: Settings, label: '设置' },

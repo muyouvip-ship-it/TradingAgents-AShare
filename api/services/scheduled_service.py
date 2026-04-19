@@ -14,7 +14,7 @@ VALID_HORIZONS = {"short", "medium"}
 
 
 def _validate_trigger_time(t: str) -> str:
-    """Validate HH:MM format. Allowed: 20:00~23:59 or 00:00~08:00."""
+    """Validate HH:MM format. Allowed: 19:00~23:59 or 00:00~08:00."""
     parts = t.strip().split(":")
     if len(parts) != 2:
         raise ValueError("时间格式错误，请使用 HH:MM")
@@ -25,9 +25,9 @@ def _validate_trigger_time(t: str) -> str:
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         raise ValueError("时间格式错误，请使用 HH:MM")
     time_val = hh * 60 + mm
-    # Allowed: 20:00 (1200) ~ 23:59 (1439) or 00:00 (0) ~ 08:00 (480)
-    if 8 * 60 < time_val < 20 * 60:
-        raise ValueError("定时时间仅允许 20:00~次日 08:00（避免影响白天使用）")
+    # Allowed: 19:00 (1140) ~ 23:59 (1439) or 00:00 (0) ~ 08:00 (480)
+    if 8 * 60 < time_val < 19 * 60:
+        raise ValueError("定时时间仅允许 19:00~次日 08:00（避免影响白天使用）")
     return f"{hh:02d}:{mm:02d}"
 
 
@@ -111,7 +111,7 @@ def create_scheduled(
     user_id: str,
     symbol: str,
     horizon: str = "short",
-    trigger_time: str = "20:00",
+    trigger_time: str = "19:00",
 ) -> dict:
     """Create a scheduled analysis task."""
     count = db.query(ScheduledAnalysisDB).filter(
@@ -150,7 +150,7 @@ def ensure_scheduled_for_symbols(
     user_id: str,
     symbols: Iterable[str],
     horizon: str = "short",
-    trigger_time: str = "20:00",
+    trigger_time: str = "19:00",
 ) -> dict:
     """Ensure the given symbols exist in scheduled tasks without duplicating existing items."""
 
@@ -323,7 +323,7 @@ def get_pending_tasks(db: Session, today: str, current_hhmm: str) -> List[Schedu
         .all()
     )
     # Filter by trigger_time <= current_hhmm
-    return [t for t in all_active if (t.trigger_time or "20:00") <= current_hhmm]
+    return [t for t in all_active if (t.trigger_time or "19:00") <= current_hhmm]
 
 
 def mark_run_success(db: Session, item_id: str, trade_date: str, report_id: str):

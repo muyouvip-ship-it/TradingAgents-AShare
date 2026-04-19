@@ -206,6 +206,16 @@ async def lifespan(app: FastAPI):
     """Initialize resources on startup and cleanup on shutdown."""
     init_db()
     _log("Database initialized.")
+    
+    # 初始化策略管理数据库
+    from sqlalchemy import create_engine
+    from api.models.strategy_models import Base
+    db_path = Path(__file__).parent.parent / "data" / "strategy_management.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    strategy_engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(strategy_engine)
+    _log("Strategy management database initialized.")
+    
     store = get_job_store()
     store.clear()
     _background_tasks.clear()
@@ -4051,7 +4061,7 @@ def create_scheduled_analysis(
 ):
     symbol = body.get("symbol", "").strip().upper()
     horizon = body.get("horizon", "short")
-    trigger_time = body.get("trigger_time", "20:00")
+    trigger_time = body.get("trigger_time", "19:00")
     if not symbol:
         raise HTTPException(400, "symbol is required")
     code_to_name = _get_reverse_stock_map()
@@ -4469,3 +4479,57 @@ def run() -> None:
 
     log_config = str(Path(__file__).parent / "logging_config.yaml")
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False, log_config=log_config)
+
+
+# ============================================================
+# 策略管理 API V2 (完整版)
+# ============================================================
+from api.routes.strategies_v2 import router as strategies_v2_router
+
+app.include_router(strategies_v2_router)
+
+# 原有策略管理 API (保留兼容)
+from api.routes.strategies import router as strategies_router
+
+app.include_router(strategies_router)
+
+
+
+# ============================================================
+# 策略回测 API V2 (完整版)
+# ============================================================
+from api.routes.backtest_v2 import router as backtest_v2_router
+
+app.include_router(backtest_v2_router)
+
+# 原有策略回测 API (保留兼容)
+from api.routes.backtest import router as strategy_backtest_router
+
+app.include_router(strategy_backtest_router)
+
+
+
+# ============================================================
+# 数据下载 API
+# ============================================================
+from api.routes.data_download import router as data_download_router
+
+app.include_router(data_download_router)
+
+
+
+# ============================================================
+# 策略执行、优化、风险分析 API
+# ============================================================
+from api.routes.strategy_execution import router as strategy_execution_router
+
+app.include_router(strategy_execution_router)
+
+
+
+# ============================================================
+# 回测数据配置和管理 API
+# ============================================================
+from api.backtest_data_api import router as backtest_data_router
+
+app.include_router(backtest_data_router)

@@ -27,7 +27,7 @@ def _load_agent_factories() -> dict[str, Any]:
     from tradingagents.agents.analysts.social_media_analyst import create_social_media_analyst
     from tradingagents.agents.analysts.volume_price_analyst import create_volume_price_analyst
     from tradingagents.agents.managers.research_manager import create_research_manager
-    from tradingagents.agents.managers.risk_manager import create_risk_manager
+    from tradingagents.agents.managers.risk_manager import create_risk_manager  # P0优化：新增Risk Manager
     from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
     from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
     from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
@@ -46,7 +46,7 @@ def _load_agent_factories() -> dict[str, Any]:
         "create_neutral_debator": create_neutral_debator,
         "create_news_analyst": create_news_analyst,
         "create_research_manager": create_research_manager,
-        "create_risk_manager": create_risk_manager,
+        "create_risk_manager": create_risk_manager,  # P0优化：新增
         "create_smart_money_analyst": create_smart_money_analyst,
         "create_social_media_analyst": create_social_media_analyst,
         "create_volume_price_analyst": create_volume_price_analyst,

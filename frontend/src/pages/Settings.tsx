@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
-import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign } from 'lucide-react'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
 import type { RuntimeWarmupResult, UserToken } from '@/types'
@@ -78,6 +78,22 @@ export default function Settings() {
     const [copiedTokenId, setCopiedTokenId] = useState<string | null>(null)
     const [newlyCreatedToken, setNewlyCreatedToken] = useState<string | null>(null)
 
+    // 回测数据配置状态（简化版）
+    const [dateRange, setDateRange] = useState({
+        start: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
+        end: new Date().toISOString().split('T')[0]
+    })
+    
+    const [selectedDataTypes, setSelectedDataTypes] = useState<string[]>(['daily_kline'])
+    const [dataSource, setDataSource] = useState('quantclass')  // 默认量化课堂
+    const [autoUpdate, setAutoUpdate] = useState(true)  // 默认每日自动更新
+    const [downloading, setDownloading] = useState(false)
+    const [downloadProgress, setDownloadProgress] = useState(0)
+    const [dataStats, setDataStats] = useState<any[]>([])  // 已下载数据统计
+    const [dataTasks, setDataTasks] = useState<any[]>([])  // 下载任务列表
+    const [loadingStats, setLoadingStats] = useState(false)
+    const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)  // 轮询定时器（使用ref避免重新渲染）
+
     const selectedPreset = useMemo(
         () => PROVIDER_PRESETS.find((item) => item.id === providerPreset) || PROVIDER_PRESETS[0],
         [providerPreset],
@@ -140,6 +156,16 @@ export default function Settings() {
 
         // Fetch tokens
         fetchTokens()
+        
+        // 加载回测数据统计和配置
+        loadBacktestDataInfo()
+        
+        // 清理函数：组件卸载时停止轮询
+        return () => {
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current)
+            }
+        }
     }, [])
 
     const fetchTokens = async () => {
@@ -152,6 +178,194 @@ export default function Settings() {
         } finally {
             setTokensLoading(false)
         }
+    }
+
+    // 加载回测数据信息
+    const loadBacktestDataInfo = async () => {
+        setLoadingStats(true)
+        try {
+            // 调用实际API获取数据统计（使用api服务自动添加认证token）
+            const statsResponse = await api.request<{stats?: any[], total?: number}>('/v1/backtest-data/stats')
+            // API返回的是 {stats: [...], total: ...} 格式
+            if (statsResponse && Array.isArray(statsResponse.stats)) {
+                setDataStats(statsResponse.stats)
+            } else if (Array.isArray(statsResponse)) {
+                // 兼容直接返回数组的情况
+                setDataStats(statsResponse)
+            } else {
+                console.warn('stats API返回数据格式异常:', statsResponse)
+                setDataStats([])
+            }
+            
+            // 调用实际API获取任务列表
+            const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
+            // API返回的是 {tasks: [...], total: ...} 格式
+            if (tasksResponse && Array.isArray(tasksResponse.tasks)) {
+                setDataTasks(tasksResponse.tasks)
+            } else if (Array.isArray(tasksResponse)) {
+                // 兼容直接返回数组的情况
+                setDataTasks(tasksResponse)
+            } else {
+                console.warn('tasks API返回数据格式异常:', tasksResponse)
+                setDataTasks([])
+            }
+        } catch (err) {
+            console.error('加载回测数据信息失败:', err)
+            // 发生错误时设置为空数组
+            setDataStats([])
+            setDataTasks([])
+        } finally {
+            setLoadingStats(false)
+        }
+    }
+
+    // 下载回测数据
+    const handleDownloadData = async () => {
+        if (selectedDataTypes.length === 0) {
+            alert('请选择至少一种数据类型')
+            return
+        }
+        
+        setDownloading(true)
+        setDownloadProgress(0)
+        
+        try {
+            // 调用实际API批量下载（使用api服务自动添加认证token）
+            // 默认下载全部股票（不传symbols参数）
+            const result = await api.request<{created_tasks?: number}>('/v1/backtest-data/batch-download', {
+                method: 'POST',
+                body: JSON.stringify({
+                    data_types: selectedDataTypes,
+                    date_range_start: dateRange.start,
+                    date_range_end: dateRange.end,
+                    data_source: dataSource
+                })
+            })
+            console.log('下载任务创建成功:', result)
+            
+            // 显示成功消息
+            alert(`成功创建 ${result.created_tasks || selectedDataTypes.length} 个下载任务`)
+            
+            // 重新加载数据
+            loadBacktestDataInfo()
+            
+            // 启动任务状态轮询
+            startTaskPolling()
+            
+        } catch (err) {
+            console.error('下载数据失败:', err)
+            alert(err instanceof Error ? err.message : '下载数据失败')
+        } finally {
+            setDownloading(false)
+            setDownloadProgress(100)
+        }
+    }
+
+    // 启动任务状态轮询
+    const startTaskPolling = () => {
+        // 清除已有的定时器
+        if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current)
+        }
+        
+        // 立即执行一次
+        loadBacktestDataInfo()
+        
+        // 每2秒轮询一次任务状态
+        const interval = setInterval(async () => {
+            try {
+                const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
+                // 处理API返回的数据格式
+                const tasksData = tasksResponse && Array.isArray(tasksResponse.tasks) 
+                    ? tasksResponse.tasks 
+                    : Array.isArray(tasksResponse) 
+                        ? tasksResponse 
+                        : []
+                
+                if (tasksData.length > 0) {
+                    setDataTasks(tasksData)
+                    
+                    // 检查是否所有任务都已完成
+                    const allCompleted = tasksData.every(task => 
+                        task.status === 'completed' || task.status === 'failed'
+                    )
+                    
+                    if (allCompleted) {
+                        // 所有任务完成，停止轮询并刷新统计数据
+                        clearInterval(interval)
+                        pollingIntervalRef.current = null
+                        loadBacktestDataInfo()
+                    }
+                }
+            } catch (err) {
+                console.error('轮询任务状态失败:', err)
+            }
+        }, 2000)
+        
+        pollingIntervalRef.current = interval
+    }
+
+    // 切换数据类型选择
+    // 数据源兼容性映射
+    const DATA_SOURCE_COMPATIBILITY: Record<string, string[]> = {
+        'daily_kline': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
+        'minute_kline': ['akshare'],  // 量化课堂不支持1分钟K线
+        'index_data': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
+        'chip_data': ['quantclass'],  // 只有量化课堂支持
+        'financial_data': ['quantclass'],  // 只有量化课堂支持
+        'research_reports': ['eastmoney']  // 只有东方财富支持
+    }
+
+    // 数据源名称映射
+    const DATA_SOURCE_NAMES: Record<string, string> = {
+        'quantclass': '量化课堂',
+        'akshare': 'AKShare',
+        'baostock': 'Baostock',
+        'tushare': 'Tushare',
+        'eastmoney': '东方财富'
+    }
+
+    const toggleDataType = (type: string) => {
+        const newSelectedTypes = selectedDataTypes.includes(type) 
+            ? selectedDataTypes.filter(t => t !== type) 
+            : [...selectedDataTypes, type]
+        
+        setSelectedDataTypes(newSelectedTypes)
+        
+        // 检查数据源兼容性
+        const compatibleSources = DATA_SOURCE_COMPATIBILITY[type] || []
+        if (compatibleSources.length > 0 && !compatibleSources.includes(dataSource)) {
+            // 当前数据源不支持该数据类型，自动切换
+            const newSource = compatibleSources[0]
+            setDataSource(newSource)
+            alert(`提示：${getDataTypeName(type)}不支持${DATA_SOURCE_NAMES[dataSource]}，已自动切换到${DATA_SOURCE_NAMES[newSource]}`)
+        }
+    }
+
+    // 获取数据类型显示名称
+    const getDataTypeName = (type: string) => {
+        const names: Record<string, string> = {
+            'daily_kline': '股票日K线',
+            'minute_kline': '股票1分钟K线',
+            'index_data': '指数数据',
+            'chip_data': '筹码数据',
+            'financial_data': '财务数据',
+            'research_reports': '研报数据'
+        }
+        return names[type] || type
+    }
+
+    // 获取数据类型图标
+    const getDataTypeIcon = (type: string) => {
+        const icons: Record<string, any> = {
+            'daily_kline': BarChart3,
+            'minute_kline': LineChart,
+            'index_data': TrendingUp,
+            'chip_data': Database,
+            'financial_data': DollarSign,
+            'research_reports': FileText
+        }
+        return icons[type] || BarChart3
     }
 
     const handleCreateToken = async (e: React.FormEvent) => {
@@ -237,8 +451,22 @@ export default function Settings() {
     const handleSaveAll = async () => {
         setSaveAllSaving(true)
         try {
+            // 保存基础配置
             await submitConfig({ includeEmail: true, includeWecom: true, successMessage: '全部设置已保存' })
-            showSavedMessage('全部设置已保存')
+            
+            // 保存回测数据配置
+            await api.request<void>('/v1/backtest-data/configs', {
+                method: 'POST',
+                body: JSON.stringify({
+                    data_types: selectedDataTypes,
+                    date_range_start: dateRange.start,
+                    date_range_end: dateRange.end,
+                    data_source: dataSource,
+                    auto_update: autoUpdate
+                })
+            })
+            
+            showSavedMessage('全部设置已保存（包含回测数据配置）')
         } catch (err) {
             alert(err instanceof Error ? err.message : '保存全部设置失败')
         } finally {
@@ -766,6 +994,296 @@ export default function Settings() {
                             {wecomWarmupError}
                         </div>
                     )}
+                </div>
+            </div>
+
+            {/* 回测数据配置 */}
+            <div className="card space-y-4">
+                <div className="flex items-center gap-2">
+                    <Database className="w-5 h-5 text-blue-500" />
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">回测数据配置</h2>
+                    {loadingStats && <Loader2 className="ml-auto w-4 h-4 animate-spin text-slate-400" />}
+                </div>
+
+                <div className="space-y-4">
+                    {/* 日期范围选择 */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            日期范围选择
+                        </label>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div className="relative">
+                                <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                <input
+                                    type="date"
+                                    value={dateRange.start}
+                                    onChange={e => setDateRange(prev => ({...prev, start: e.target.value}))}
+                                    className="input w-full pl-10"
+                                />
+                            </div>
+                            <div className="relative">
+                                <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                <input
+                                    type="date"
+                                    value={dateRange.end}
+                                    onChange={e => setDateRange(prev => ({...prev, end: e.target.value}))}
+                                    className="input w-full pl-10"
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 数据类型选择 */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            数据类型选择（可多选）
+                        </label>
+                        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                            {['daily_kline', 'minute_kline', 'index_data', 'chip_data', 'financial_data', 'research_reports'].map(type => {
+                                const Icon = getDataTypeIcon(type)
+                                const isSelected = selectedDataTypes.includes(type)
+                                return (
+                                    <button
+                                        key={type}
+                                        type="button"
+                                        onClick={() => toggleDataType(type)}
+                                        className={`flex items-center gap-2 p-3 rounded-lg border transition-colors ${
+                                            isSelected 
+                                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' 
+                                                : 'border-slate-200 hover:border-slate-300 dark:border-slate-700 dark:hover:border-slate-600'
+                                        }`}
+                                    >
+                                        <Icon className={`w-4 h-4 ${isSelected ? 'text-blue-500' : 'text-slate-400'}`} />
+                                        <span className={`text-sm ${isSelected ? 'text-blue-700 dark:text-blue-300' : 'text-slate-600 dark:text-slate-400'}`}>
+                                            {getDataTypeName(type)}
+                                        </span>
+                                    </button>
+                                )
+                            })}
+                        </div>
+                    </div>
+
+                    {/* 数据源选择 */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            数据源选择
+                        </label>
+                        <select
+                            value={dataSource}
+                            onChange={e => setDataSource(e.target.value)}
+                            className="input w-full"
+                        >
+                            <option value="quantclass">量化课堂（推荐）- 快速、高质量</option>
+                            <option value="akshare">AKShare（免费无限制）</option>
+                            <option value="baostock">Baostock（免费）</option>
+                            <option value="tushare">Tushare（需要API Token）</option>
+                            <option value="eastmoney">东方财富（免费）</option>
+                        </select>
+                    </div>
+
+                    {/* 每日自动更新开关 */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">每日自动更新</div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">
+                                每日自动下载最新数据
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setAutoUpdate(!autoUpdate)}
+                            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                autoUpdate ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-600'
+                            }`}
+                        >
+                            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                autoUpdate ? 'translate-x-6' : 'translate-x-1'
+                            }`} />
+                        </button>
+                    </div>
+
+                    {/* 下载按钮 */}
+                    <div className="pt-2">
+                        <button
+                            onClick={handleDownloadData}
+                            disabled={downloading || selectedDataTypes.length === 0}
+                            className="btn-primary inline-flex items-center gap-2 w-full justify-center"
+                        >
+                            {downloading ? (
+                                <>
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                    下载中... {downloadProgress}%
+                                </>
+                            ) : (
+                                <>
+                                    <Download className="w-4 h-4" />
+                                    下载回测数据（全部股票）
+                                </>
+                            )}
+                        </button>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 text-center">
+                            将下载所选日期范围内的全部股票数据
+                        </p>
+                    </div>
+
+                    {/* 下载进度展示 */}
+                    {dataTasks.filter(t => t.status === 'running' || t.status === 'pending').length > 0 && (
+                        <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700">
+                            <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2">
+                                <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
+                                下载进度
+                            </h3>
+                            
+                            <div className="space-y-3">
+                                {dataTasks
+                                    .filter(t => t.status === 'running' || t.status === 'pending')
+                                    .map((task, index) => {
+                                        const Icon = getDataTypeIcon(task.task_type)
+                                        const progress = task.progress || 0
+                                        
+                                        return (
+                                            <div 
+                                                key={index} 
+                                                className="p-4 rounded-lg border-2 border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/10"
+                                            >
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div className="flex items-center gap-2">
+                                                        <Icon className="w-5 h-5 text-blue-500" />
+                                                        <span className="font-medium text-slate-900 dark:text-slate-100">
+                                                            {getDataTypeName(task.task_type)}
+                                                            {task.date_range_start && task.date_range_end && (
+                                                                <span className="text-slate-500 dark:text-slate-400 ml-2">
+                                                                    ({task.date_range_start} ~ {task.date_range_end})
+                                                                </span>
+                                                            )}
+                                                        </span>
+                                                    </div>
+                                                    <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                                        task.status === 'running' 
+                                                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300' 
+                                                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
+                                                    }`}>
+                                                        {task.status === 'running' ? '下载中...' : '等待中'}
+                                                    </span>
+                                                </div>
+                                                
+                                                {/* 进度条 */}
+                                                <div className="mb-2">
+                                                    <div className="flex justify-between text-xs text-slate-600 dark:text-slate-400 mb-1">
+                                                        <span>进度: {progress}%</span>
+                                                        <span>{task.downloaded_records || 0} 条记录</span>
+                                                    </div>
+                                                    <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
+                                                        <div 
+                                                            className="bg-blue-500 h-2 rounded-full transition-all duration-300" 
+                                                            style={{ width: `${progress}%` }}
+                                                        ></div>
+                                                    </div>
+                                                </div>
+                                                
+                                                {/* 任务信息 */}
+                                                <div className="text-xs text-slate-500 dark:text-slate-400">
+                                                    创建时间: {new Date(task.created_at).toLocaleString('zh-CN')}
+                                                </div>
+                                            </div>
+                                        )
+                                    })}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* 已下载数据展示 */}
+                    <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700">
+                        <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2">
+                            <BarChart3 className="w-4 h-4 text-blue-500" />
+                            已下载数据
+                        </h3>
+                        
+                        {dataStats.length === 0 ? (
+                            <div className="text-center py-8 text-slate-500 dark:text-slate-400">
+                                <Database className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                                <p className="text-sm">暂无已下载的回测数据</p>
+                                <p className="text-xs mt-1">请选择日期范围和数据类型后点击下载</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-3">
+                                {dataStats.map((stat, index) => {
+                                    const Icon = getDataTypeIcon(stat.data_type)
+                                    const isComplete = stat.data_quality_score >= 90
+                                    const hasIssues = stat.data_quality_score < 80
+                                    
+                                    return (
+                                        <div 
+                                            key={index} 
+                                            className={`p-4 rounded-lg border-2 ${
+                                                isComplete 
+                                                    ? 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/10' 
+                                                    : hasIssues 
+                                                        ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/10'
+                                                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/50'
+                                            }`}
+                                        >
+                                            <div className="flex items-start justify-between mb-3">
+                                                <div className="flex items-center gap-2">
+                                                    <Icon className={`w-5 h-5 ${isComplete ? 'text-green-500' : hasIssues ? 'text-amber-500' : 'text-blue-500'}`} />
+                                                    <span className="font-medium text-slate-900 dark:text-slate-100">
+                                                        {getDataTypeName(stat.data_type)}
+                                                    </span>
+                                                </div>
+                                                <div className={`px-2 py-1 rounded text-xs font-medium ${
+                                                    isComplete 
+                                                        ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' 
+                                                        : hasIssues 
+                                                            ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+                                                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
+                                                }`}>
+                                                    {isComplete ? '✓ 完整' : hasIssues ? '⚠ 部分缺失' : '○ 一般'}
+                                                </div>
+                                            </div>
+                                            
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                                <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">数据量</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                                                        {stat.total_records?.toLocaleString() || '0'} 条
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">数据区间</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100 text-xs">
+                                                        {stat.date_range_start || '-'} ~ {stat.date_range_end || '-'}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">股票数量</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                                                        {stat.symbol_count || '全部'}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">质量评分</div>
+                                                    <div className={`font-semibold ${
+                                                        isComplete ? 'text-green-600 dark:text-green-400' :
+                                                        hasIssues ? 'text-amber-600 dark:text-amber-400' :
+                                                        'text-slate-600 dark:text-slate-400'
+                                                    }`}>
+                                                        {stat.data_quality_score || 0}/100
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            {stat.last_updated && (
+                                                <div className="mt-2 pt-2 border-t border-slate-100 dark:border-slate-700 text-xs text-slate-500 dark:text-slate-400">
+                                                    最后更新: {stat.last_updated}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )
+                                })}
+                            </div>
+                        )}
+                    </div>
+
                 </div>
             </div>
 

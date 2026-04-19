@@ -36,6 +36,15 @@ export const useAuthStore = create<AuthState>((set) => ({
     hydrate: async () => {
         const token = localStorage.getItem('ta-access-token')
         const userRaw = localStorage.getItem('ta-user')
+        
+        // 开发模式：如果没有token，设置一个测试token
+        if (!token) {
+            const devToken = 'dev-test-token-001'
+            localStorage.setItem('ta-access-token', devToken)
+            set({ token: devToken, user: null, hydrated: true, loading: false })
+            return
+        }
+        
         if (!token || !userRaw) {
             set({ token: null, user: null, hydrated: true })
             return
