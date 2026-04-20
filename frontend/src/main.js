@@ -374,9 +374,9 @@ els.clearEvents.addEventListener('click', () => {
 });
 
 renderAgentBoard();
-drawRealKlineOrFallback((els.apiBase?.value || 'http://127.0.0.1:8000').trim(), '600519.SH');
+drawRealKlineOrFallback((els.apiBase?.value || 'http://127.0.0.1:8500').trim(), '600519.SH');
 addMessage('assistant', '已切换到 12-Agent 工作台模式。\n直接输入：请分析 600519.SH 在 2026-03-02 的情况。');
 window.addEventListener('resize', () => {
   const current = (els.chartTitle?.textContent || '').replace('K线图 · ', '').trim() || '600519.SH';
-  drawRealKlineOrFallback((els.apiBase?.value || 'http://127.0.0.1:8000').trim(), current);
+  drawRealKlineOrFallback((els.apiBase?.value || 'http://127.0.0.1:8500').trim(), current);
 });
