@@ -185,12 +185,10 @@ def _get_version() -> str:
 
 APP_VERSION = _get_version()
 
-from api.lifespan import lifespan
 
 app = FastAPI(
     title="TradingAgents-AShare API",
     version=APP_VERSION,
-    lifespan=lifespan,
     docs_url=None if _is_prod else "/docs",
     redoc_url=None if _is_prod else "/redoc",
     openapi_url=None if _is_prod else "/openapi.json",
@@ -230,7 +228,6 @@ _background_tasks: set = set()
 
 from api.core.datetime_utils import utcnow_iso as _utcnow_iso
 from api.core.settings import settings as _settings
-from api.lifespan import lifespan
 
 _JOB_TIMEOUT = _settings.ta_job_timeout  # seconds
 
