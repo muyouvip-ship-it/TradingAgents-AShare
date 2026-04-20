@@ -5,13 +5,11 @@ import json
 import os
 import re
 import traceback
-from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from threading import Lock
 from fastapi import Body
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
@@ -19,13 +17,7 @@ from uuid import uuid4
 import logging
 import time
 
-# Configure standard logging to include timestamps
-logging.basicConfig(
-    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+from api.core.logging import logger
 
 from dotenv import load_dotenv
 
@@ -39,24 +31,12 @@ from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy.orm import Session
 import pandas as pd
 
-from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, init_db, get_db, get_db_ctx
+from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
 from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service
 
-def _get_real_ip(request: Request) -> Optional[str]:
-    """Extract real client IP, preferring Cloudflare/proxy headers."""
-    if request is None:
-        return None
-    # Cloudflare Tunnel injects the real client IP here
-    ip = request.headers.get("CF-Connecting-IP")
-    if ip:
-        return ip.strip()
-    # Standard proxy header fallback
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
-
+from api.core.stock_map import load_cn_stock_map as _load_cn_stock_map, get_reverse_stock_map as _get_reverse_stock_map, get_reverse_stock_map_cached_only as _get_reverse_stock_map_cached_only
+from api.core.stock_utils import normalize_symbol as _normalize_symbol, search_cn_stock_by_name as _search_cn_stock_by_name, split_watchlist_batch_text as _split_watchlist_batch_text, resolve_watchlist_identifier as _resolve_watchlist_identifier
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -72,24 +52,11 @@ from tradingagents.agents.utils.context_utils import USER_CONTEXT_KEYS, normaliz
 from tradingagents.agents.utils.agent_states import current_tracker_var
 
 
-def _cors_allow_origins() -> list[str]:
-    raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
-    default_origins = [
-        "http://127.0.0.1:5174",
-        "http://localhost:5174",
-        "http://127.0.0.1:5175",
-        "http://localhost:5175",
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-    ]
-    if not raw:
-        return default_origins
-    return [item.strip() for item in raw.split(",") if item.strip()]
+from api.core.http_utils import cors_allow_origins as _cors_allow_origins, cors_allow_origin_regex as _cors_allow_origin_regex
+from api.core.versioning import get_version as _get_version
 
 
-def _cors_allow_origin_regex() -> str | None:
-    raw = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-    return raw or None
+APP_VERSION = _get_version()
 
 
 def _report_version_stats() -> None:
@@ -201,47 +168,6 @@ async def _run_manual_trigger(
             scheduled_service.record_manual_test_result(db, task_id, "failed")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize resources on startup and cleanup on shutdown."""
-    init_db()
-    _log("Database initialized.")
-    
-    # 初始化策略管理数据库
-    from sqlalchemy import create_engine
-    from api.models.strategy_models import Base
-    db_path = Path(__file__).parent.parent / "data" / "strategy_management.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    strategy_engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(strategy_engine)
-    _log("Strategy management database initialized.")
-    
-    store = get_job_store()
-    store.clear()
-    _background_tasks.clear()
-
-    # Security: warn loudly if using default secret key
-    if not os.getenv("TA_APP_SECRET_KEY"):
-        _log("=" * 70)
-        _log("WARNING: TA_APP_SECRET_KEY is not set!")
-        _log("Using hardcoded default key. ALL encryption and JWT signing")
-        _log("is INSECURE. Set TA_APP_SECRET_KEY env var before production use.")
-        _log("=" * 70)
-
-    _report_version_stats()
-    # Pre-load trade calendar (uses mini_racer/V8 which is not thread-safe)
-    from tradingagents.dataflows.trade_calendar import _load_cn_trade_dates
-    _load_cn_trade_dates()
-    _log("Trade calendar pre-loaded.")
-    # Pre-load stock + ETF name map
-    await asyncio.to_thread(_load_cn_stock_map)
-    _log("Stock map pre-loaded on startup.")
-    yield
-    _log("Shutting down: Cleaning up resources...")
-    _executor.shutdown(wait=True)
-    _log("Executor shutdown complete.")
-
-
 _is_prod = os.getenv("ENV", "").lower() == "prod"
 
 
@@ -300,14 +226,7 @@ _CONFIG_OVERRIDES_ALLOWLIST = {
 # Hold references to fire-and-forget tasks so they are not garbage collected
 _background_tasks: set = set()
 
-# ── A-share stock name → code cache ──────────────────────────────────────────
-_cn_stock_map: Optional[Dict[str, str]] = None  # name -> "XXXXXX.SH/SZ"
-_cn_stock_reverse_map: Optional[Dict[str, str]] = None  # code -> name
-_cn_stock_map_lock = Lock()
-
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from api.core.datetime_utils import utcnow_iso as _utcnow_iso
 
 
 _JOB_TIMEOUT = int(os.getenv("TA_JOB_TIMEOUT", "600"))  # seconds
@@ -339,126 +258,6 @@ def _serialize_datetime_utc(value: Optional[datetime]) -> Optional[str]:
     else:
         value = value.astimezone(timezone.utc)
     return value.isoformat()
-
-
-_cn_stock_map_loaded_at: float = 0  # timestamp of last load
-_STOCK_MAP_TTL = 7 * 86400  # 7 days
-
-
-def _load_cn_stock_map() -> Dict[str, str]:
-    """Lazy-load and cache A-share stock + ETF/fund name→code mapping (7-day TTL).
-
-    Uses akshare stock_info_a_code_name (static list, no anti-crawl) for A-shares,
-    plus fund_name_em for ETFs/funds.
-    """
-    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_loaded_at
-    import time as _time
-    now = _time.time()
-    if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
-        _cn_stock_map = None  # expire cache
-        _cn_stock_reverse_map = None
-    if _cn_stock_map is not None:
-        return _cn_stock_map
-    with _cn_stock_map_lock:
-        if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) <= _STOCK_MAP_TTL:
-            return _cn_stock_map
-        result: Dict[str, str] = {}
-        try:
-            import akshare as ak
-            # A-share stocks (static list, no anti-crawl issue)
-            df = ak.stock_info_a_code_name()
-            for _, row in df.iterrows():
-                name = str(row.get("name", "")).strip()
-                code = str(row.get("code", "")).strip()
-                if name and code:
-                    result[name] = _normalize_symbol(code)
-            stock_count = len(result)
-            # ETF / funds
-            fund_count = 0
-            try:
-                fund_df = ak.fund_name_em()
-                existing_codes = set(result.values())
-                for _, row in fund_df.iterrows():
-                    code = str(row.get("基金代码", "")).strip()
-                    name = str(row.get("基金简称", "")).strip()
-                    if name and code and len(code) == 6 and code.isdigit():
-                        normalized = _normalize_symbol(code)
-                        if normalized not in existing_codes:
-                            result[name] = normalized
-                            existing_codes.add(normalized)
-                fund_count = len(result) - stock_count
-            except Exception as fe:
-                _log(f"[StockMap] ETF/fund load skipped: {fe}")
-            _cn_stock_map = result
-            _cn_stock_reverse_map = {code: name for name, code in result.items()}
-            _cn_stock_map_loaded_at = now
-            _log(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
-        except Exception as e:
-            _log(f"[StockMap] Failed to load: {e}")
-            if _cn_stock_map is None:
-                _cn_stock_map = {}
-                _cn_stock_reverse_map = {}
-    return _cn_stock_map
-
-
-def _get_reverse_stock_map() -> Dict[str, str]:
-    """Return code→name mapping."""
-    _load_cn_stock_map()
-    return dict(_cn_stock_reverse_map or {})
-
-
-def _get_reverse_stock_map_cached_only() -> Dict[str, str]:
-    """Return code→name mapping only from already-warmed cache.
-
-    For list pages we prefer a fast response over blocking on a cold AkShare lookup.
-    When the cache is cold we simply return an empty mapping and let the UI fall back
-    to stock codes. Search endpoints can still call _load_cn_stock_map() explicitly.
-    """
-    if _cn_stock_map is None or _cn_stock_reverse_map is None:
-        return {}
-    return dict(_cn_stock_reverse_map)
-
-
-def _search_cn_stock_by_name(query: str) -> Optional[str]:
-    """Look up A-share stock code by company name (exact then partial match)."""
-    query = query.strip()
-    if not query:
-        return None
-    stock_map = _load_cn_stock_map()
-    # 1. Exact match
-    if query in stock_map:
-        return stock_map[query]
-    # 2. Partial match: query is substring of a stock name or vice versa
-    candidates = [(name, code) for name, code in stock_map.items()
-                  if query in name or name in query]
-    if len(candidates) == 1:
-        return candidates[0][1]
-    # 3. If multiple partial matches, pick the one with shortest name (closest match)
-    if candidates:
-        candidates.sort(key=lambda x: len(x[0]))
-        return candidates[0][1]
-    return None
-
-
-def _split_watchlist_batch_text(text: str) -> List[str]:
-    return [token.strip() for token in re.split(r"[\s,，、；;]+", text.strip()) if token.strip()]
-
-
-def _resolve_watchlist_identifier(
-    raw: str,
-    name_to_code: Dict[str, str],
-    code_to_name: Dict[str, str],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    token = raw.strip()
-    if not token:
-        return None, None, "输入为空"
-    if token in name_to_code:
-        symbol = name_to_code[token]
-        return symbol, code_to_name.get(symbol, token), None
-    symbol = _normalize_symbol(token)
-    if symbol in code_to_name:
-        return symbol, code_to_name.get(symbol, symbol), None
-    return None, None, f"未识别的股票代码或名称: {token}"
 
 
 _auth_scheme = HTTPBearer(auto_error=False)
@@ -2427,37 +2226,8 @@ async def _stream_job_events(job_id: str):
             return
 
 
-@app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-# Simple in-memory rate limiter for version stats: {ip: last_timestamp}
-_vs_rate_limit: Dict[str, float] = {}
-_VS_RATE_INTERVAL = 3600  # at most once per hour per IP
-
-
-@app.post("/api/version-stats")
-def version_stats(payload: Dict[str, Any] = Body(...), request: Request = None, db: Session = Depends(get_db)):
-    """Collect anonymous version statistics from deployed instances."""
-    remote_ip = _get_real_ip(request)
-
-    # Rate limit by IP
-    now = time.time()
-    if remote_ip:
-        last = _vs_rate_limit.get(remote_ip, 0)
-        if now - last < _VS_RATE_INTERVAL:
-            return {"status": "ok"}
-        _vs_rate_limit[remote_ip] = now
-
-    record = VersionStatsDB(
-        version=str(payload.get("v", ""))[:50],
-        nonce=str(payload.get("nonce", ""))[:64],
-        remote_ip=remote_ip,
-    )
-    db.add(record)
-    db.commit()
-    return {"status": "ok"}
+from api.routes.health import router as health_router
+app.include_router(health_router)
 
 
 @app.get("/v1/market/kline", response_model=KlineResponse)
@@ -3216,41 +2986,6 @@ def batch_delete_reports_endpoint(
 
 # ─── API Token Endpoints ────────────────────────────────────────────────────
 
-@app.get("/v1/tokens", response_model=List[UserTokenListItem])
-def list_tokens(
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    """获取当前用户的所有 API Token（不返回完整 token）。"""
-    return token_service.list_user_tokens(db, current_user.id)
-
-
-@app.post("/v1/tokens", response_model=UserTokenResponse)
-def create_token(
-    request: UserTokenCreateRequest,
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    """创建一个新的 API Token。完整 token 仅在此接口返回一次。"""
-    try:
-        return token_service.create_token(db, current_user.id, request.name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.delete("/v1/tokens/{token_id}")
-def delete_token(
-    token_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    """吊销并删除一个 API Token。"""
-    success = token_service.delete_token(db, current_user.id, token_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Token 不存在")
-    return {"message": "Token 已吊销"}
-
-
 # ─── Backtest Endpoints ───────────────────────────────────────────────────────
 
 from api.services import backtest_service as _bt
@@ -3569,194 +3304,6 @@ def _config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntim
         wecom_report_enabled=user.wecom_report_enabled if user and hasattr(user, "wecom_report_enabled") else True,
         default_analysts=json.loads(user_cfg.default_analysts) if user_cfg and user_cfg.default_analysts else ["market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"],
     )
-
-
-@app.post("/v1/auth/request-code")
-def request_login_code(request: AuthRequestCodeRequest):
-    email = auth_service.normalize_email(request.email)
-    if not re.match(r"^[^@\s]+@[^@\s.]+\.[^@\s.]+$", email):
-        raise HTTPException(status_code=400, detail="邮箱格式不正确")
-    with get_db_ctx() as db:
-        code = auth_service.upsert_login_code(db, email)
-    # DB session 已释放，SMTP 不会阻塞连接池
-    dev_code = auth_service.send_login_code(email, code)
-    response = {"message": "验证码已发送"}
-    if dev_code:
-        response["dev_code"] = dev_code
-    return response
-
-
-@app.post("/v1/auth/verify-code", response_model=AuthVerifyCodeResponse)
-def verify_login_code(body: AuthVerifyCodeRequest, request: Request, db: Session = Depends(get_db)):
-    user = auth_service.verify_login_code(db, body.email, body.code, client_ip=_get_real_ip(request))
-    if not user:
-        raise HTTPException(status_code=400, detail="验证码错误或已过期")
-    access_token = auth_service.create_access_token(user)
-    return AuthVerifyCodeResponse(access_token=access_token, user=user)
-
-
-@app.get("/v1/auth/me", response_model=UserResponse)
-def get_me(current_user: UserDB = Depends(_require_web_user)):
-    return current_user
-
-
-@app.get("/v1/config", response_model=UserRuntimeConfigResponse)
-def get_runtime_config(
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    """获取当前用户运行时配置。"""
-    return _config_response_for_user(current_user, db)
-
-
-@app.patch("/v1/config")
-def update_runtime_config(
-    updates: UserRuntimeConfigUpdateRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    """更新当前用户运行时配置，下次分析时生效。"""
-    normalized_wecom_webhook = None
-    if updates.wecom_webhook_url:
-        from api.services.wecom_notification_service import normalize_webhook_url
-
-        try:
-            normalized_wecom_webhook = normalize_webhook_url(updates.wecom_webhook_url)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    persistent_user = db.query(UserDB).filter(UserDB.id == current_user.id).first() or current_user
-    before_cfg = _config_response_for_user(persistent_user, db)
-    pending_cfg = _build_pending_runtime_config(updates, persistent_user.id, db)
-    if _should_probe_runtime_config(before_cfg, pending_cfg, updates):
-        probe = _probe_runtime_config(pending_cfg)
-        _log(
-            f"[LLM Probe] user={persistent_user.id} provider={pending_cfg.get('llm_provider')} "
-            f"model={probe.get('model', '')} status={probe.get('status')}"
-        )
-    row = auth_service.upsert_user_llm_config(
-        db,
-        persistent_user.id,
-        llm_provider=updates.llm_provider,
-        deep_think_llm=updates.deep_think_llm,
-        quick_think_llm=updates.quick_think_llm,
-        backend_url=updates.backend_url,
-        max_debate_rounds=updates.max_debate_rounds,
-        max_risk_discuss_rounds=updates.max_risk_discuss_rounds,
-        api_key=updates.api_key,
-        wecom_webhook_url=normalized_wecom_webhook,
-        clear_api_key=updates.clear_api_key,
-        clear_wecom_webhook=updates.clear_wecom_webhook,
-        default_analysts=updates.default_analysts,
-    )
-    user_pref_updated = False
-    if updates.email_report_enabled is not None:
-        persistent_user.email_report_enabled = updates.email_report_enabled
-        user_pref_updated = True
-    if updates.wecom_report_enabled is not None:
-        persistent_user.wecom_report_enabled = updates.wecom_report_enabled
-        user_pref_updated = True
-    if user_pref_updated:
-        db.commit()
-    current_cfg = _config_response_for_user(persistent_user, db)
-    warmup_models = _warmup_model_names(current_cfg.model_dump())
-    should_warmup = _should_trigger_config_warmup(before_cfg, current_cfg, updates)
-    warmup_payload: Dict[str, Any]
-    if should_warmup and warmup_models:
-        warmup_payload = {
-            "requested": True,
-            "triggered": True,
-            "status": "scheduled",
-            "models": warmup_models,
-            "message": f"模型配置已保存，后台正在预热 {len(warmup_models)} 个模型。",
-        }
-        background_tasks.add_task(
-            _run_config_warmup,
-            _build_runtime_config({}, user_id=persistent_user.id, db=db),
-            persistent_user.id,
-        )
-    elif updates.warmup:
-        warmup_payload = {
-            "requested": True,
-            "triggered": False,
-            "status": "skipped",
-            "models": warmup_models,
-            "message": "模型配置已保存，本次未触发 warmup。",
-        }
-    else:
-        warmup_payload = {
-            "requested": False,
-            "triggered": False,
-            "status": "disabled",
-            "models": [],
-            "message": "模型配置已保存。",
-        }
-    filtered = {
-        k: v
-        for k, v in updates.model_dump().items()
-        if v is not None
-        and k not in {"api_key", "wecom_webhook_url", "warmup", "force_warmup"}
-        and (
-            k in _CONFIG_ALLOWED_KEYS
-            or k in _CONFIG_PREFERENCE_KEYS
-            or (k in {"clear_api_key", "clear_wecom_webhook"} and bool(v))
-        )
-    }
-    return {
-        "message": "用户配置已更新",
-        "applied": filtered,
-        "has_api_key": bool(row.api_key_encrypted),
-        "current": current_cfg,
-        "warmup": warmup_payload,
-    }
-
-
-@app.post("/v1/config/warmup", response_model=UserRuntimeWarmupResponse)
-def warmup_runtime_config(
-    request: UserRuntimeWarmupRequest,
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    pending_cfg = _build_pending_runtime_config(request, current_user.id, db)
-    prompt = (request.prompt or "").strip() or "你好"
-    results = _invoke_runtime_warmup(pending_cfg, prompt, current_user.id)
-    return {
-        "prompt": prompt,
-        "results": results,
-    }
-
-
-@app.post("/v1/config/wecom/warmup", response_model=WecomWebhookWarmupResponse)
-async def warmup_wecom_webhook(
-    request: WecomWebhookWarmupRequest,
-    db: Session = Depends(get_db),
-    current_user: UserDB = Depends(_require_web_user),
-):
-    from api.services.wecom_notification_service import build_test_message, normalize_webhook_url, send_message
-
-    webhook_url = (request.wecom_webhook_url or "").strip()
-    if not webhook_url:
-        user_cfg = auth_service.get_user_llm_config(db, current_user.id)
-        webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None)) or ""
-    if not webhook_url:
-        raise HTTPException(status_code=400, detail="请先填写或保存企业微信 Webhook")
-    try:
-        webhook_url = normalize_webhook_url(webhook_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        sent = await asyncio.to_thread(send_message, build_test_message(request.content), webhook_url)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Webhook 测试发送失败：{exc}") from exc
-    if not sent:
-        raise HTTPException(status_code=400, detail="Webhook 测试发送失败，请检查地址或机器人状态")
-
-    return {
-        "sent": True,
-        "message": "Webhook 测试发送成功",
-        "webhook_display": _mask_wecom_webhook(webhook_url),
-    }
 
 
 # ── Stock Search ──────────────────────────────────────────────────────────────

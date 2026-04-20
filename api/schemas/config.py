@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class UserRuntimeConfigResponse(BaseModel):
+    llm_provider: str
+    deep_think_llm: str
+    quick_think_llm: str
+    backend_url: str
+    max_debate_rounds: int
+    max_risk_discuss_rounds: int
+    has_api_key: bool = False
+    has_wecom_webhook: bool = False
+    wecom_webhook_display: Optional[str] = None
+    server_fallback_enabled: bool = True
+    email_report_enabled: bool = True
+    wecom_report_enabled: bool = True
+    default_analysts: List[str] = Field(default_factory=lambda: ["market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"])
+
+
+class UserRuntimeConfigUpdateRequest(BaseModel):
+    llm_provider: Optional[str] = None
+    deep_think_llm: Optional[str] = None
+    quick_think_llm: Optional[str] = None
+    backend_url: Optional[str] = None
+    max_debate_rounds: Optional[int] = None
+    max_risk_discuss_rounds: Optional[int] = None
+    email_report_enabled: Optional[bool] = None
+    wecom_report_enabled: Optional[bool] = None
+    api_key: Optional[str] = None
+    wecom_webhook_url: Optional[str] = None
+    clear_api_key: bool = False
+    clear_wecom_webhook: bool = False
+    warmup: bool = True
+    force_warmup: bool = False
+    default_analysts: Optional[List[str]] = None
+
+
+class UserRuntimeWarmupRequest(UserRuntimeConfigUpdateRequest):
+    prompt: str = "你好"
+
+
+class RuntimeWarmupResult(BaseModel):
+    model: str
+    targets: List[str] = Field(default_factory=list)
+    content: Optional[str] = None
+    error: Optional[str] = None
+
+
+class UserRuntimeWarmupResponse(BaseModel):
+    prompt: str
+    results: List[RuntimeWarmupResult]
+
+
+class WecomWebhookWarmupRequest(BaseModel):
+    wecom_webhook_url: Optional[str] = None
+    content: Optional[str] = None
+
+
+class WecomWebhookWarmupResponse(BaseModel):
+    sent: bool = True
+    message: str
+    webhook_display: Optional[str] = None
