@@ -9,24 +9,15 @@ from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, I
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # Database URL - PostgreSQL only
-DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://localhost/trading_agents"
+DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./app.db"
 
-if DATABASE_URL.startswith("sqlite"):
-    raise RuntimeError(
-        "SQLite has been retired for runtime use. Set DATABASE_URL to PostgreSQL."
-    )
-
-# 检测是否为SQLite数据库
-IS_SQLITE = False
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 # Create engine
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    pool_size=20,
-    max_overflow=10,
-    pool_timeout=30,
-    pool_recycle=3600,
+    connect_args={"check_same_thread": False} if IS_SQLITE else {},
 )
 
 # Session factory
