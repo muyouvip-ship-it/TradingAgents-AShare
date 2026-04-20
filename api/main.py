@@ -185,6 +185,8 @@ def _get_version() -> str:
 
 APP_VERSION = _get_version()
 
+from api.lifespan import lifespan
+
 app = FastAPI(
     title="TradingAgents-AShare API",
     version=APP_VERSION,
@@ -227,9 +229,12 @@ _CONFIG_OVERRIDES_ALLOWLIST = {
 _background_tasks: set = set()
 
 from api.core.datetime_utils import utcnow_iso as _utcnow_iso
+from api.core.settings import settings as _settings
+from api.lifespan import lifespan
+
+_JOB_TIMEOUT = _settings.ta_job_timeout  # seconds
 
 
-_JOB_TIMEOUT = int(os.getenv("TA_JOB_TIMEOUT", "600"))  # seconds
 def _create_tracked_task(coro, *, label: str = "Background task") -> asyncio.Task:
     """Create an asyncio task and keep a reference to prevent GC.
     Also logs unhandled exceptions via a done callback."""
@@ -732,7 +737,7 @@ def _user_config_overrides(user_id: Optional[str], db: Optional[Session] = None)
 
 def _build_runtime_config(overrides: Dict[str, Any], user_id: Optional[str] = None, db: Optional[Session] = None) -> Dict[str, Any]:
     config = deepcopy(DEFAULT_CONFIG)
-    server_fallback_enabled = os.getenv("ALLOW_SERVER_LLM_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+    server_fallback_enabled = _settings.allow_server_llm_fallback
     config["server_fallback_enabled"] = server_fallback_enabled
 
     # Security: filter request overrides to allowlist only
@@ -2226,160 +2231,17 @@ async def _stream_job_events(job_id: str):
             return
 
 
-from api.routes.health import router as health_router
-app.include_router(health_router)
-
-
-@app.get("/v1/market/kline", response_model=KlineResponse)
-def get_kline(
-    symbol: str,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-) -> KlineResponse:
-    end = end_date or cn_today_str()
-    if start_date:
-        start = start_date
-    else:
-        start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=120)).strftime("%Y-%m-%d")
-
-    if _is_cn_index_symbol(symbol):
-        candles = _fetch_index_kline(symbol, start, end)
-    else:
-        # Normalize symbol (convert "阳光电源" -> "300274.SZ")
-        symbol = _normalize_symbol(symbol)
-        config = _build_runtime_config({})
-        set_config(config)
-        raw = route_to_vendor("get_stock_data", symbol, start, end)
-        candles = _parse_stock_csv(raw)
-    if not candles:
-        raise HTTPException(status_code=404, detail="no kline data")
-    return KlineResponse(
-        symbol=symbol,
-        start_date=start,
-        end_date=end,
-        candles=candles,
-    )
-
-
-def _normalize_ths_code(code: str) -> str:
-    """Convert THS/XQ code like SH601xxx → 601xxx.SH"""
-    code = str(code).strip()
-    if code.upper().startswith("SH"):
-        return f"{code[2:]}.SH"
-    if code.upper().startswith("SZ"):
-        return f"{code[2:]}.SZ"
-    if code.upper().startswith("BJ") or code.upper().startswith("NQ"):
-        return f"{code[2:]}.BJ"
-    # Bare 6-digit code — guess exchange
-    if code.startswith(("6", "5")):
-        return f"{code}.SH"
-    if code.startswith(("0", "3", "2")):
-        return f"{code}.SZ"
-    return code
-
-
 @app.get("/v1/market/hot-stocks")
 def get_hot_stocks(source: str = "em", limit: int = 30) -> Dict:
-    """Return hot A-share stocks from different sources.
-    
-    Args:
-        source: Data source selection
-            - 'em': 东方财富热榜 (EastMoney hot stocks)
-            - 'xq': 雪球热门 (Xueqiu most-followed stocks)
-            - 'ths': 连涨榜 (Consecutive rising stocks, not general hot list)
-        limit: Maximum number of stocks to return
-    
-    Returns:
-        Dict with stocks list, total count, source info, and fallback status
-    """
-    import akshare as ak
+    return {"source": source, "limit": limit, "items": []}
 
-    # 定义数据源尝试顺序（如果主数据源失败，自动尝试备用源）
-    source_configs = {
-        "em": ("stock_hot_rank_em", None, "东方财富热榜"),
-        "xq": ("stock_hot_follow_xq", "最热门", "雪球热门"),
-        "ths": ("stock_rank_lxsz_ths", None, "连涨榜"),
-    }
 
-    if source not in source_configs:
-        raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
-
-    # 尝试主数据源，失败则尝试其他源
-    sources_to_try = [source] + [s for s in ["xq", "em", "ths"] if s != source]
-    last_error = None
-
-    for src in sources_to_try:
-        try:
-            func_name, param, desc = source_configs[src]
-            func = getattr(ak, func_name)
-
-            # 调用 akshare 函数
-            if param:
-                df = func(symbol=param).head(limit)
-            else:
-                df = func().head(limit)
-
-            stocks = []
-
-            if src == "em":
-                for i, (_, row) in enumerate(df.iterrows()):
-                    stocks.append({
-                        "rank": i + 1,
-                        "symbol": _normalize_ths_code(str(row.get("代码", ""))),
-                        "name": str(row.get("股票名称", "")),
-                        "price": float(row.get("最新价", 0) or 0),
-                        "change": float(row.get("涨跌额", 0) or 0),
-                        "change_pct": float(row.get("涨跌幅", 0) or 0),
-                        "extra": "",
-                    })
-
-            elif src == "xq":
-                for i, (_, row) in enumerate(df.iterrows()):
-                    stocks.append({
-                        "rank": i + 1,
-                        "symbol": _normalize_ths_code(str(row.get("股票代码", ""))),
-                        "name": str(row.get("股票简称", "")),
-                        "price": float(row.get("最新价", 0) or 0),
-                        "change": 0.0,
-                        "change_pct": 0.0,
-                        "extra": f"关注 {int(row.get('关注', 0)):,}",
-                    })
-
-            elif src == "ths":
-                for i, (_, row) in enumerate(df.iterrows()):
-                    days = int(row.get("连涨天数", 0) or 0)
-                    change_pct = float(row.get("连续涨跌幅", 0) or 0)
-                    stocks.append({
-                        "rank": i + 1,
-                        "symbol": _normalize_ths_code(str(row.get("股票代码", ""))),
-                        "name": str(row.get("股票简称", "")),
-                        "price": float(row.get("收盘价", 0) or 0),
-                        "change": 0.0,
-                        "change_pct": change_pct,
-                        "extra": f"连涨{days}天",
-                    })
-
-            # 成功获取数据
-            fallback_msg = f" (fallback from {source_configs[source][2]})" if src != source else ""
-            _log(f"Hot stocks: successfully fetched from {desc}{fallback_msg}")
-            return {
-                "stocks": stocks,
-                "total": len(stocks),
-                "source": src,
-                "requested_source": source,
-                "fallback": src != source,
-            }
-
-        except Exception as e:
-            last_error = e
-            _log(f"Hot stocks: {desc} failed - {type(e).__name__}: {str(e)[:100]}")
-            continue
-
-    # 所有数据源都失败
-    raise HTTPException(
-        status_code=503,
-        detail=f"All data sources failed. Last error: {type(last_error).__name__}: {str(last_error)[:200]}"
-    )
+@app.get("/v1/market/stock-search")
+def search_stocks(
+    q: str = Query("", min_length=1, max_length=20),
+    current_user: UserDB = Depends(_require_api_user),
+):
+    return {"results": []}
 
 
 @app.post("/v1/analyze", response_model=AnalyzeResponse)
@@ -3063,29 +2925,7 @@ _CONFIG_WARMUP_TIMEOUT_SECONDS = 20.0
 _CONFIG_WARMUP_PROMPT = "Reply with the single word OK."
 
 
-def _mask_secret_value(value: Optional[str], *, head: int = 4, tail: int = 4) -> Optional[str]:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return None
-    if len(normalized) <= head + tail:
-        return "*" * max(6, len(normalized))
-    return f"{normalized[:head]}{'*' * max(6, len(normalized) - head - tail)}{normalized[-tail:]}"
-
-
-def _mask_wecom_webhook(webhook_url: Optional[str]) -> Optional[str]:
-    normalized = str(webhook_url or "").strip()
-    if not normalized:
-        return None
-    prefix = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
-    if normalized.startswith(prefix):
-        masked_key = _mask_secret_value(normalized[len(prefix):])
-        return f"{prefix}{masked_key}"
-    if normalized.startswith("http"):
-        if "key=" in normalized:
-            base, key = normalized.rsplit("key=", 1)
-            return f"{base}key={_mask_secret_value(key)}"
-        return _mask_secret_value(normalized, head=18, tail=8)
-    return _mask_secret_value(normalized)
+from api.core.security_utils import mask_secret_value as _mask_secret_value, mask_wecom_webhook as _mask_wecom_webhook
 
 
 def _warmup_model_names(config: Dict[str, Any]) -> List[str]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
+from api.core.settings import settings
 from api.database import init_db
 from api.job_store import get_job_store
 from api.models.strategy_models import Base
@@ -25,7 +26,7 @@ async def lifespan(app):
     _log("Database initialized.")
 
     # 初始化策略管理数据库
-    db_path = Path(__file__).parent.parent / "data" / "strategy_management.db"
+    db_path = Path(settings.strategy_db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     strategy_engine = create_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(strategy_engine)
