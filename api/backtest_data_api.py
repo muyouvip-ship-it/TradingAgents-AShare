@@ -11,13 +11,12 @@ import asyncio
 import logging
 
 from api.database import get_db, get_db_ctx, UserDB
+from api.deps import require_api_user as get_current_user
 from api.data_downloader import DataDownloader
 from api.quantclass_downloader import QuantClassDownloader
 from api.quantclass_importer import import_stock_daily_from_quantclass
 from api.data_quality_manager import DataQualityManager
 from api.data_source_monitor import get_data_source_monitor
-# 从主文件导入用户认证
-from api.main import _require_api_user as get_current_user
 from .backtest_data_models import (
     BacktestDataTaskCreate, BacktestDataTask,
     BacktestDataConfigCreate, BacktestDataConfig,

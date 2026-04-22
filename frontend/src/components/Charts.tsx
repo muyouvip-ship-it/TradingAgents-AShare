@@ -8,6 +8,13 @@ interface ChartProps {
   type?: 'line' | 'area' | 'bar'
 }
 
+function formatChineseUnit(value: number) {
+  const abs = Math.abs(value)
+  if (abs >= 1e8) return `${(value / 1e8).toFixed(2)}亿`
+  if (abs >= 1e4) return `${(value / 1e4).toFixed(2)}万`
+  return value.toFixed(2)
+}
+
 export function PerformanceChart({ data, dataKey, title, color = '#3b82f6', type = 'line' }: ChartProps) {
   if (!data || data.length === 0) {
     return (
@@ -18,12 +25,7 @@ export function PerformanceChart({ data, dataKey, title, color = '#3b82f6', type
   }
 
   const formatValue = (value: number) => {
-    if (value >= 1000000) {
-      return `${(value / 1000000).toFixed(2)}M`
-    } else if (value >= 1000) {
-      return `${(value / 1000).toFixed(1)}K`
-    }
-    return value.toFixed(2)
+    return formatChineseUnit(value)
   }
 
   const formatPercent = (value: number) => {
@@ -154,11 +156,7 @@ export function PortfolioValueChart({ data }: { data: any[] }) {
           <YAxis
             stroke="#94a3b8"
             fontSize={12}
-            tickFormatter={(value) => {
-              if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`
-              if (value >= 1000) return `${(value / 1000).toFixed(0)}K`
-              return value
-            }}
+            tickFormatter={(value) => formatChineseUnit(Number(value))}
           />
           <Tooltip
             formatter={(value: any) => [`¥${value.toLocaleString()}`, '']}

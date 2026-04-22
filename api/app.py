@@ -7,6 +7,24 @@ from api.core.http_utils import cors_allow_origins, cors_allow_origin_regex
 from api.core.settings import settings
 from api.core.versioning import get_version
 from api.lifespan import lifespan
+from api.routes.analysis import router as analysis_router
+from api.routes.auth import router as auth_router
+from api.routes.chat import router as chat_router
+from api.routes.config import router as config_router
+from api.routes.data_download import router as data_download_router
+from api.routes.debug import router as debug_router
+from api.routes.health import router as health_router
+from api.routes.jobs import router as jobs_router
+from api.routes.market import router as market_router
+from api.routes.portfolio import router as portfolio_router
+from api.routes.reports import router as reports_router
+from api.routes.scheduled import router as scheduled_router
+from api.routes.backtest_v2 import router as backtest_v2_router
+from api.routes.strategies_v2 import router as strategies_v2_router
+from api.routes.strategy_platform import router as strategy_platform_router
+from api.routes.virtual_warehouse import router as virtual_warehouse_router
+from api.routes.watchlist import router as watchlist_router
+from api.backtest_data_api import router as backtest_data_router
 
 
 _is_prod = settings.env.lower() == "prod"
@@ -28,3 +46,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(health_router)
+app.include_router(auth_router)
+app.include_router(config_router)
+app.include_router(market_router)
+app.include_router(data_download_router)
+app.include_router(debug_router)
+app.include_router(backtest_data_router)
+app.include_router(reports_router)
+app.include_router(analysis_router)
+app.include_router(jobs_router)
+app.include_router(chat_router)
+app.include_router(watchlist_router)
+app.include_router(scheduled_router)
+app.include_router(portfolio_router)
+app.include_router(virtual_warehouse_router)
+app.include_router(strategy_platform_router)
+app.include_router(strategies_v2_router)
+app.include_router(backtest_v2_router)

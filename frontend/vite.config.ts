@@ -49,23 +49,23 @@ export default defineConfig({
     port: 5174,
     proxy: {
       '/api': {
-        target: 'http://localhost:8500',
+        target: 'http://127.0.0.1:8500',
         changeOrigin: true,
       },
       '/v1': {
-        target: 'http://localhost:8500',
+        target: 'http://127.0.0.1:8500',
         changeOrigin: true,
       },
       '/healthz': {
-        target: 'http://localhost:8500',
+        target: 'http://127.0.0.1:8500',
         changeOrigin: true,
       },
       '/openapi.json': {
-        target: 'http://localhost:8500',
+        target: 'http://127.0.0.1:8500',
         changeOrigin: true,
       },
       '/docs': {
-        target: 'http://localhost:8500',
+        target: 'http://127.0.0.1:8500',
         changeOrigin: true,
       },
     },

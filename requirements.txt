@@ -5,7 +5,6 @@ langchain-experimental
 langchain-anthropic
 langchain-google-genai
 langgraph
-langgraph-checkpoint-sqlite
 pandas
 yfinance
 akshare
@@ -17,10 +16,15 @@ setuptools
 fastapi
 uvicorn
 sqlalchemy
+psycopg2-binary
 PyJWT
 cryptography
 json-repair
 markdown
+duckdb
+polars
+pyarrow
+scikit-learn
 
 # P3优化：Prometheus监控
 prometheus-client

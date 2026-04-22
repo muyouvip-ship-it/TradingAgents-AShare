@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -87,6 +87,7 @@ class ApiService {
         messages: Array<{ role: string; content: string }>,
         stream = true,
         selectedAnalysts?: string[],
+        symbol?: string,
     ) {
         const response = await fetch(`${getBaseUrl()}/v1/chat/completions`, {
             method: 'POST',
@@ -98,11 +99,19 @@ class ApiService {
                 messages,
                 stream,
                 selected_analysts: selectedAnalysts,
+                symbol,
             }),
         })
 
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`)
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = data?.detail || data?.message
+                throw new Error(detail || `HTTP error! status: ${response.status}`)
+            }
+            const detail = await response.text().catch(() => '')
+            throw new Error(detail || `HTTP error! status: ${response.status}`)
         }
 
         return response
@@ -172,6 +181,59 @@ class ApiService {
     }
     async getPortfolioOverview(): Promise<PortfolioOverviewResponse> {
         return this.request<PortfolioOverviewResponse>('/v1/portfolio/overview')
+    }
+    async getQmtVirtualWarehouseOverview(accountKey?: string): Promise<VirtualWarehouseOverviewResponse> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        return this.request<VirtualWarehouseOverviewResponse>(`/v1/virtual-warehouse/qmt/overview${params.toString() ? `?${params}` : ''}`)
+    }
+    async syncQmtVirtualWarehouse(accountKey?: string): Promise<{ message: string; source: string; summary: Record<string, unknown>; overview: VirtualWarehouseOverviewResponse }> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        return this.request(`/v1/virtual-warehouse/qmt/sync${params.toString() ? `?${params}` : ''}`, { method: 'POST' })
+    }
+    async getQmtVirtualWarehouseDiagnostics(accountKey?: string, runConnectTest = false): Promise<VirtualWarehouseDiagnosticsResponse> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        if (runConnectTest) params.set('run_connect_test', 'true')
+        return this.request<VirtualWarehouseDiagnosticsResponse>(`/v1/virtual-warehouse/qmt/diagnostics${params.toString() ? `?${params}` : ''}`)
+    }
+    async getQmtOrders(accountKey?: string): Promise<{ items: VirtualWarehouseOrder[]; active_account_key?: string; fetched_at?: string }> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        return this.request(`/v1/virtual-warehouse/qmt/orders${params.toString() ? `?${params}` : ''}`)
+    }
+    async getQmtTrades(accountKey?: string): Promise<{ items: VirtualWarehouseTrade[]; active_account_key?: string; fetched_at?: string }> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        return this.request(`/v1/virtual-warehouse/qmt/trades${params.toString() ? `?${params}` : ''}`)
+    }
+    async submitQmtOrder(payload: QmtOrderSubmitRequest): Promise<QmtOrderSubmitResponse> {
+        return this.request<QmtOrderSubmitResponse>('/v1/virtual-warehouse/qmt/orders', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+        })
+    }
+    async cancelQmtOrder(orderId: string, accountKey?: string): Promise<QmtOrderCancelResponse> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        return this.request<QmtOrderCancelResponse>(`/v1/virtual-warehouse/qmt/orders/${orderId}/cancel${params.toString() ? `?${params}` : ''}`, {
+            method: 'POST',
+        })
+    }
+    async getQmtSyncProfiles(): Promise<{ items: QmtSyncProfile[] }> {
+        return this.request<{ items: QmtSyncProfile[] }>('/v1/virtual-warehouse/qmt/sync-profiles')
+    }
+    async updateQmtSyncProfile(accountKey: string, data: {
+        is_active: boolean
+        sync_interval_seconds?: number
+        sync_tracking_board?: boolean
+        alert_on_disconnect?: boolean
+    }): Promise<QmtSyncProfile> {
+        return this.request<QmtSyncProfile>(`/v1/virtual-warehouse/qmt/sync-profiles/${accountKey}`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
     }
     async createScheduled(symbol: string, horizon?: string, trigger_time?: string): Promise<ScheduledAnalysis> {
         return this.request<ScheduledAnalysis>('/v1/scheduled', {
@@ -255,6 +317,317 @@ class ApiService {
 
     async getDashboardTrackingBoard(): Promise<TrackingBoardResponse> {
         return this.request<TrackingBoardResponse>('/v1/dashboard/tracking-board')
+    }
+
+    async getRuntimeLogSources(): Promise<{ sources: RuntimeLogSource[] }> {
+        return this.request<{ sources: RuntimeLogSource[] }>('/v1/debug/log-sources')
+    }
+
+    async getRuntimeLogs(params: {
+        source?: string
+        lines?: number
+        level?: 'all' | 'error' | 'warning' | 'info'
+    }): Promise<RuntimeLogsResponse> {
+        const query = new URLSearchParams()
+        if (params.source) query.append('source', params.source)
+        if (params.lines) query.append('lines', String(params.lines))
+        if (params.level) query.append('level', params.level)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<RuntimeLogsResponse>(`/v1/debug/logs${suffix}`)
+    }
+
+    async streamRuntimeLogs(params: {
+        source?: string
+        lines?: number
+        level?: 'all' | 'error' | 'warning' | 'info'
+        signal?: AbortSignal
+    }): Promise<Response> {
+        const query = new URLSearchParams()
+        if (params.source) query.append('source', params.source)
+        if (params.lines !== undefined) query.append('lines', String(params.lines))
+        if (params.level) query.append('level', params.level)
+        const token = getAuthToken()
+        const response = await fetch(`${getBaseUrl()}/v1/debug/logs/stream?${query}`, {
+            method: 'GET',
+            signal: params.signal,
+            headers: {
+                Accept: 'text/event-stream',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+        })
+        if (!response.ok) {
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = data?.detail || data?.message
+                throw new Error(detail || `HTTP error! status: ${response.status}`)
+            }
+            const detail = await response.text().catch(() => '')
+            throw new Error(detail || `HTTP error! status: ${response.status}`)
+        }
+        return response
+    }
+
+    async getStrategyPlatformList(params?: {
+        strategy_type?: string
+        status?: string
+        search?: string
+    }): Promise<StrategyListResponseV2> {
+        const query = new URLSearchParams()
+        if (params?.strategy_type) query.append('strategy_type', params.strategy_type)
+        if (params?.status) query.append('status', params.status)
+        if (params?.search) query.append('search', params.search)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<StrategyListResponseV2>(`/v1/strategies${suffix}`)
+    }
+
+    async createStrategyDraft(prompt: string, strategyType?: string): Promise<StrategyDraftResponse> {
+        return this.request<StrategyDraftResponse>('/v1/strategies/llm-draft', {
+            method: 'POST',
+            body: JSON.stringify({ prompt, strategy_type: strategyType }),
+        })
+    }
+
+    async getOfficialStrategyPacks(): Promise<OfficialStrategyPackListResponse> {
+        return this.request<OfficialStrategyPackListResponse>('/v1/strategies/packs')
+    }
+
+    async cloneOfficialStrategyPack(packId: string): Promise<OfficialStrategyPackCloneResponse> {
+        return this.request<OfficialStrategyPackCloneResponse>(`/v1/strategies/packs/${packId}/clone`, {
+            method: 'POST',
+        })
+    }
+
+    async getOfficialStrategyPackItem(packId: string, blueprintId: string): Promise<OfficialStrategyPackItem> {
+        return this.request<OfficialStrategyPackItem>(`/v1/strategies/packs/${packId}/items/${blueprintId}`)
+    }
+
+    async cloneOfficialStrategyPackItem(packId: string, blueprintId: string, data?: {
+        name?: string
+        status?: string
+    }): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/packs/${packId}/items/${blueprintId}/clone`, {
+            method: 'POST',
+            body: JSON.stringify(data ?? {}),
+        })
+    }
+
+    async syncStrategyWithOfficialPack(strategyId: string): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}/sync-official`, {
+            method: 'POST',
+        })
+    }
+
+    async getStrategyDslSchema(): Promise<{
+        schema_name: string
+        schema_version: string
+        structured_outputs: boolean
+        json_schema: Record<string, unknown>
+    }> {
+        return this.request('/v1/strategies/dsl-schema')
+    }
+
+    async previewCompileStrategy(dsl: StrategyDsl): Promise<StrategyCompileResponse> {
+        return this.request<StrategyCompileResponse>('/v1/strategies/compile-preview', {
+            method: 'POST',
+            body: JSON.stringify({ dsl }),
+        })
+    }
+
+    async saveStrategyDefinition(data: {
+        name: string
+        strategy_type: string
+        description?: string
+        dsl: StrategyDsl
+        source?: string
+        status?: string
+    }): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>('/v1/strategies', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async getStrategyDefinition(strategyId: string): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}`)
+    }
+
+    async updateStrategyDefinition(strategyId: string, data: {
+        name: string
+        strategy_type: string
+        description?: string
+        dsl: StrategyDsl
+        source?: string
+        status?: string
+    }): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async deleteStrategyDefinition(strategyId: string): Promise<{ message: string }> {
+        return this.request<{ message: string }>(`/v1/strategies/${strategyId}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async compileStrategy(strategyId: string): Promise<StrategyCompileResponse> {
+        return this.request<StrategyCompileResponse>(`/v1/strategies/${strategyId}/compile`, {
+            method: 'POST',
+        })
+    }
+
+    async getStrategyVersions(strategyId: string): Promise<{ versions: unknown[] }> {
+        return this.request<{ versions: unknown[] }>(`/v1/strategies/${strategyId}/versions`)
+    }
+
+    async createStrategyVersion(strategyId: string, data: {
+        dsl: StrategyDsl
+        change_summary?: string
+        activate?: boolean
+    }): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}/versions`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async cloneStrategy(strategyId: string, data?: { name?: string; status?: string }): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}/clone`, {
+            method: 'POST',
+            body: JSON.stringify(data ?? {}),
+        })
+    }
+
+    async activateStrategy(strategyId: string, status: 'active' | 'paused'): Promise<StrategyDefinition> {
+        return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}/activate`, {
+            method: 'POST',
+            body: JSON.stringify({ status }),
+        })
+    }
+
+    async getStrategyPlatformBacktestMetrics(runId: string): Promise<{
+        run_id: string
+        metrics: BacktestMetrics
+        summary?: Record<string, unknown>
+        artifact_root?: string
+    }> {
+        return this.request(`/v1/backtests/${runId}/metrics`)
+    }
+
+    async getEvolutionExperiment(experimentId: string): Promise<EvolutionExperiment> {
+        return this.request<EvolutionExperiment>(`/v1/evolution/experiments/${experimentId}`)
+    }
+
+    async createPaperAccount(data: { id?: string; name?: string; initial_capital?: number }): Promise<PaperAccount> {
+        return this.request<PaperAccount>('/v1/paper/accounts', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+    async listPaperAccounts(): Promise<{ items: PaperAccount[] }> {
+        return this.request<{ items: PaperAccount[] }>('/v1/paper/accounts')
+    }
+    async runStrategyOnPaperAccount(accountId: string, strategyId: string): Promise<Record<string, unknown>> {
+        const params = new URLSearchParams({ strategy_id: strategyId })
+        return this.request(`/v1/paper/accounts/${accountId}/run-strategy?${params.toString()}`, {
+            method: 'POST',
+        })
+    }
+
+    async runStrategyPlatformBacktest(data: StrategyPlatformBacktestRequest): Promise<BacktestRun> {
+        return this.request<BacktestRun>('/v1/backtests', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async getStrategyPlatformBacktest(runId: string): Promise<BacktestRun> {
+        return this.request<BacktestRun>(`/v1/backtests/${runId}`)
+    }
+
+    async streamStrategyPlatformBacktest(runId: string, signal?: AbortSignal): Promise<Response> {
+        const token = getAuthToken()
+        const response = await fetch(`${getBaseUrl()}/v1/backtests/${runId}/stream`, {
+            method: 'GET',
+            signal,
+            headers: {
+                Accept: 'text/event-stream',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+        })
+        if (!response.ok) {
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = data?.detail || data?.message
+                throw new Error(detail || `HTTP error! status: ${response.status}`)
+            }
+            const detail = await response.text().catch(() => '')
+            throw new Error(detail || `HTTP error! status: ${response.status}`)
+        }
+        return response
+    }
+
+    async cancelStrategyPlatformBacktest(runId: string): Promise<BacktestRun> {
+        return this.request<BacktestRun>(`/v1/backtests/${runId}/cancel`, {
+            method: 'POST',
+        })
+    }
+
+    async compareStrategyPlatformBacktests(runIds: string[]): Promise<BacktestCompareResponse> {
+        return this.request<BacktestCompareResponse>('/v1/backtests/compare', {
+            method: 'POST',
+            body: JSON.stringify({ run_ids: runIds }),
+        })
+    }
+
+    async getStrategyPlatformBacktestTrades(runId: string): Promise<{ items: BacktestTradeRecord[] }> {
+        return this.request<{ items: BacktestTradeRecord[] }>(`/v1/backtests/${runId}/trades`)
+    }
+
+    async getStrategyPlatformBacktestEquity(runId: string): Promise<{ items: BacktestEquityPoint[] }> {
+        return this.request<{ items: BacktestEquityPoint[] }>(`/v1/backtests/${runId}/equity`)
+    }
+
+    async getStrategyPlatformBacktestWatchlists(runId: string): Promise<{ items: BacktestWatchlistItem[] }> {
+        return this.request<{ items: BacktestWatchlistItem[] }>(`/v1/backtests/${runId}/watchlists`)
+    }
+
+    async getStrategyPlatformBacktestMinuteConfirmations(runId: string): Promise<{ items: BacktestMinuteConfirmationItem[] }> {
+        return this.request<{ items: BacktestMinuteConfirmationItem[] }>(`/v1/backtests/${runId}/minute-confirmations`)
+    }
+
+    async getStrategyPlatformBacktestTradeSnapshots(runId: string): Promise<{ items: BacktestTradeSnapshot[] }> {
+        return this.request<{ items: BacktestTradeSnapshot[] }>(`/v1/backtests/${runId}/trade-snapshots`)
+    }
+
+    async getStrategyPlatformBacktestSignals(runId: string): Promise<{ items: BacktestSignalItem[] }> {
+        return this.request<{ items: BacktestSignalItem[] }>(`/v1/backtests/${runId}/signals`)
+    }
+
+    async getStrategyPlatformBacktestPositions(runId: string): Promise<{ items: BacktestPositionItem[] }> {
+        return this.request<{ items: BacktestPositionItem[] }>(`/v1/backtests/${runId}/positions`)
+    }
+
+    async getStrategyPlatformBacktestOrders(runId: string): Promise<{ items: BacktestOrderItem[] }> {
+        return this.request<{ items: BacktestOrderItem[] }>(`/v1/backtests/${runId}/orders`)
+    }
+
+    async createEvolutionExperiment(data: {
+        strategy_id: string
+        objective: string
+        search_space?: Record<string, unknown>
+    }): Promise<EvolutionExperiment> {
+        return this.request<EvolutionExperiment>('/v1/evolution/experiments', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async getEvolutionCandidates(experimentId: string): Promise<{ candidates: EvolutionCandidate[] }> {
+        return this.request<{ candidates: EvolutionCandidate[] }>(`/v1/evolution/experiments/${experimentId}/candidates`)
     }
 
     // Stock Search

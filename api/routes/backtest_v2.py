@@ -17,22 +17,10 @@ import time
 from api.models.strategy_models import StrategyDB, BacktestJobDB, BacktestResultDB
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+
+from api.core.strategy_db import StrategySessionLocal, get_strategy_db
 
 logger = logging.getLogger(__name__)
-
-DB_PATH = "/Users/wolf/Documents/DaiMa/TradingAgents-AShare-main/data/strategy_management.db"
-engine = create_engine(f"sqlite:///{DB_PATH}")
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 
 class BacktestConfig(BaseModel):
     commission_rate: float = Field(default=0.0003, ge=0, le=0.1, description="手续费率")
@@ -195,7 +183,7 @@ def _persist_backtest_result(db: Session, job: BacktestJobDB, result: dict):
 
 
 @router.post("/run", response_model=BacktestJobResponse, summary="创建回测任务")
-async def create_backtest_job(request: BacktestCreateRequest, db: Session = Depends(get_db)):
+async def create_backtest_job(request: BacktestCreateRequest, db: Session = Depends(get_strategy_db)):
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == request.strategy_id).first()
         if not strategy:
@@ -255,7 +243,7 @@ async def list_backtest_jobs(
     days: int = Query(30, ge=1, le=365),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_strategy_db),
 ):
     try:
         query = db.query(BacktestJobDB)
@@ -275,7 +263,7 @@ async def list_backtest_jobs(
 
 
 @router.get("/jobs/{job_id}", response_model=BacktestJobResponse, summary="获取回测任务详情")
-async def get_backtest_job(job_id: str, db: Session = Depends(get_db)):
+async def get_backtest_job(job_id: str, db: Session = Depends(get_strategy_db)):
     try:
         job = db.query(BacktestJobDB).filter(BacktestJobDB.id == job_id).first()
         if not job:
@@ -300,7 +288,7 @@ async def get_backtest_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/jobs/{job_id}/result", summary="获取回测结果详情")
-async def get_backtest_result(job_id: str, db: Session = Depends(get_db)):
+async def get_backtest_result(job_id: str, db: Session = Depends(get_strategy_db)):
     try:
         job = db.query(BacktestJobDB).filter(BacktestJobDB.id == job_id).first()
         if not job:
@@ -327,7 +315,7 @@ async def get_backtest_result(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/jobs/{job_id}/cancel", summary="取消回测任务")
-async def cancel_backtest_job(job_id: str, db: Session = Depends(get_db)):
+async def cancel_backtest_job(job_id: str, db: Session = Depends(get_strategy_db)):
     try:
         job = db.query(BacktestJobDB).filter(BacktestJobDB.id == job_id).first()
         if not job:
@@ -346,7 +334,7 @@ async def cancel_backtest_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/jobs/{job_id}", summary="删除回测任务")
-async def delete_backtest_job(job_id: str, db: Session = Depends(get_db)):
+async def delete_backtest_job(job_id: str, db: Session = Depends(get_strategy_db)):
     try:
         job = db.query(BacktestJobDB).filter(BacktestJobDB.id == job_id).first()
         if not job:
@@ -364,7 +352,7 @@ async def delete_backtest_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/compare", summary="多策略对比")
-async def compare_strategies(job_ids: List[str] = Query(..., min_length=2, max_length=5), db: Session = Depends(get_db)):
+async def compare_strategies(job_ids: List[str] = Query(..., min_length=2, max_length=5), db: Session = Depends(get_strategy_db)):
     try:
         jobs = []
         for job_id in job_ids:
@@ -399,7 +387,7 @@ def run_backtest_sync(job_id: str, kline_data: list):
     import pandas as pd
 
     started_ts = time.time()
-    db = SessionLocal()
+    db = StrategySessionLocal()
     try:
         job = db.query(BacktestJobDB).filter(BacktestJobDB.id == job_id).first()
         if not job:

@@ -5,6 +5,13 @@ docs/
 graph_checkpoints.db
 graph_checkpoints.db-shm
 graph_checkpoints.db-wal
+/app.db
+/tradingagents.db
+/data/*.db
+/data/*.sqlite
+/data/*.sqlite3
+/backups/sqlite_legacy/
+/.sqlite_legacy_backup_path
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -230,6 +237,7 @@ __marimo__/
 eval_results/
 reports/
 results/
+/data/artifacts/
 
 # Private dirs (not open-source for now)
 deploy/

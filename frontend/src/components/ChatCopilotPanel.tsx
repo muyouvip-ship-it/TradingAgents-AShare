@@ -162,6 +162,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
     const {
         chatMessages,
         isAnalyzing,
+        currentSymbol,
         setCurrentJobId,
         setCurrentSymbol,
         setIsAnalyzing,
@@ -552,6 +553,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             [{ role: 'user', content: prompt }],
             true,
             selectedAnalysts,
+            currentSymbol,
         )
 
         if (!response.body) throw new Error('SSE stream unavailable')

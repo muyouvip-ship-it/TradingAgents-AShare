@@ -238,7 +238,7 @@ function TrackingBoardSummary({
                 <MetaCard
                     label="最近更新"
                     value={formatDashboardTime(latestQuoteTime)}
-                    subValue={trackingBoard?.previous_trade_date ? `上一交易日 ${trackingBoard.previous_trade_date}` : '暂无交易日信息'}
+                    subValue={trackingBoard ? `行情日期 ${trackingBoard.market_date || trackingBoard.previous_trade_date}` : '暂无交易日信息'}
                 />
                 <MetaCard
                     label="状态"

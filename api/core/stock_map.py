@@ -5,6 +5,11 @@ from typing import Dict, Optional
 
 from api.core.logging import logger
 
+_FALLBACK_STOCK_MAP: Dict[str, str] = {
+    "贵州茅台": "600519.SH",
+    "宁德时代": "300750.SZ",
+    "平安银行": "000001.SZ",
+}
 _cn_stock_map: Optional[Dict[str, str]] = None
 _cn_stock_reverse_map: Optional[Dict[str, str]] = None
 _cn_stock_map_lock = Lock()
@@ -14,54 +19,35 @@ _STOCK_MAP_TTL = 7 * 86400
 
 def load_cn_stock_map() -> Dict[str, str]:
     global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_loaded_at
-    import time as _time
-
-    now = _time.time()
-    if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
-        _cn_stock_map = None
-        _cn_stock_reverse_map = None
-    if _cn_stock_map is not None:
-        return _cn_stock_map
     with _cn_stock_map_lock:
-        if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) <= _STOCK_MAP_TTL:
-            return _cn_stock_map
-        result: Dict[str, str] = {}
-        try:
-            import akshare as ak
-            from api.core.stock_utils import normalize_symbol
-
-            df = ak.stock_info_a_code_name()
-            for _, row in df.iterrows():
-                name = str(row.get("name", "")).strip()
-                code = str(row.get("code", "")).strip()
-                if name and code:
-                    result[name] = normalize_symbol(code)
-            stock_count = len(result)
-            fund_count = 0
+        if _cn_stock_map is None:
+            stock_map = dict(_FALLBACK_STOCK_MAP)
             try:
-                fund_df = ak.fund_name_em()
-                existing_codes = set(result.values())
-                for _, row in fund_df.iterrows():
-                    code = str(row.get("基金代码", "")).strip()
-                    name = str(row.get("基金简称", "")).strip()
-                    if name and code and len(code) == 6 and code.isdigit():
-                        normalized = normalize_symbol(code)
-                        if normalized not in existing_codes:
-                            result[name] = normalized
-                            existing_codes.add(normalized)
-                fund_count = len(result) - stock_count
-            except Exception as fe:
-                logger.info(f"[StockMap] ETF/fund load skipped: {fe}")
-            _cn_stock_map = result
-            _cn_stock_reverse_map = {code: name for name, code in result.items()}
-            _cn_stock_map_loaded_at = now
-            logger.info(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
-        except Exception as e:
-            logger.info(f"[StockMap] Failed to load: {e}")
-            if _cn_stock_map is None:
-                _cn_stock_map = {}
-                _cn_stock_reverse_map = {}
-    return _cn_stock_map
+                import akshare as ak
+
+                frame = ak.stock_info_a_code_name()
+                if frame is not None and not frame.empty:
+                    for _, row in frame.iterrows():
+                        name = str(row.get("name") or "").strip()
+                        code = str(row.get("code") or "").strip()
+                        if not name or len(code) != 6 or not code.isdigit():
+                            continue
+                        if code.startswith("6"):
+                            symbol = f"{code}.SH"
+                        elif code.startswith(("0", "3")):
+                            symbol = f"{code}.SZ"
+                        elif code.startswith(("4", "8")):
+                            symbol = f"{code}.BJ"
+                        else:
+                            continue
+                        stock_map[name] = symbol
+                logger.info("Stock map loaded from akshare symbols: %s", len(stock_map))
+            except Exception as exc:
+                logger.warning("Stock map akshare load failed, fallback only: %s", exc)
+            _cn_stock_map = stock_map
+            _cn_stock_reverse_map = {code: name for name, code in _cn_stock_map.items()}
+            logger.info("Stock map initialized with fallback symbols: %s", len(_cn_stock_map))
+    return dict(_cn_stock_map)
 
 
 def get_reverse_stock_map() -> Dict[str, str]:

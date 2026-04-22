@@ -9,6 +9,9 @@ import {
     Wallet,
     TrendingUp,
     BarChart3,
+    Bug,
+    Landmark,
+    ShieldCheck,
 } from 'lucide-react'
 
 export interface SidebarNavItem {
@@ -24,7 +27,10 @@ export const navItems: SidebarNavItem[] = [
     { path: '/portfolio', icon: Briefcase, label: '自选 & 定时' },
     { path: '/strategies', icon: TrendingUp, label: '策略管理' },
     { path: '/backtest', icon: BarChart3, label: '策略回测' },
+    { path: '/virtual-warehouse', icon: Landmark, label: '虚拟仓' },
+    { path: '/live-warehouse', icon: ShieldCheck, label: '实盘仓' },
     { path: '/tracking-board', icon: Wallet, label: '跟踪看板' },
+    { path: '/debug/logs', icon: Bug, label: '日志调试' },
     { path: '/feedback', icon: MessageSquare, label: '反馈留言' },
     { path: '/settings', icon: Settings, label: '设置' },
 ]

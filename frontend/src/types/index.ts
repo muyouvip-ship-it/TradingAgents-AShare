@@ -274,6 +274,24 @@ export interface LogEntry {
     agent?: string
 }
 
+export interface RuntimeLogSource {
+    id: string
+    label: string
+    path: string
+    exists: boolean
+    size_bytes: number
+    modified_at?: string | null
+}
+
+export interface RuntimeLogsResponse {
+    source: RuntimeLogSource
+    lines: string[]
+    line_count: number
+    max_lines: number
+    truncated: boolean
+    read_at: string
+}
+
 export interface StockInfo {
     symbol: string
     name: string
@@ -532,6 +550,8 @@ export interface TrackingBoardItem {
     live_market_value?: number | null
     floating_pnl?: number | null
     floating_pnl_pct?: number | null
+    today_pnl?: number | null
+    today_pnl_pct?: number | null
     live_price?: number | null
     day_open?: number | null
     price_change?: number | null
@@ -548,6 +568,7 @@ export interface TrackingBoardItem {
 }
 
 export interface TrackingBoardResponse {
+    market_date?: string
     previous_trade_date: string
     refresh_interval_seconds: number
     items: TrackingBoardItem[]
@@ -687,4 +708,615 @@ export interface DebateMessage {
     content: string
     isVerdict?: boolean
     horizon?: string
+}
+
+export type StrategyPlatformType = 'selection' | 'trading' | 'risk' | 'portfolio'
+export type StrategyPlatformStatus = 'draft' | 'active' | 'paused' | 'archived' | 'candidate'
+
+export interface StrategyDsl {
+    schema_version: string
+    strategy_type: StrategyPlatformType
+    universe: Record<string, unknown>
+    factor_model: Record<string, unknown>
+    entry: Record<string, unknown>
+    exit: Record<string, unknown>
+    position: Record<string, unknown>
+    risk: Record<string, unknown>
+    execution: Record<string, unknown>
+    evolution?: Record<string, unknown>
+}
+
+export interface StrategyVersion {
+    id: string
+    strategy_id: string
+    version: number
+    dsl: StrategyDsl
+    compile_status: 'pending' | 'passed' | 'failed'
+    compiled_hash?: string
+    change_summary?: string
+    created_at: string
+}
+
+export interface StrategyPerformanceSnapshot {
+    total_return: number
+    annual_return?: number
+    sharpe_ratio: number
+    max_drawdown: number
+    win_rate: number
+    calmar_ratio?: number
+}
+
+export interface StrategyDefinition {
+    id: string
+    name: string
+    strategy_type: StrategyPlatformType
+    status: StrategyPlatformStatus
+    description?: string
+    source?: 'manual' | 'llm' | 'evolution' | 'template'
+    current_version_id?: string
+    version: number
+    is_active: boolean
+    run_count: number
+    last_run_time?: string | null
+    created_at: string
+    updated_at: string
+    performance?: StrategyPerformanceSnapshot | null
+    current_version?: StrategyVersion | null
+    tags?: string[]
+    template_id?: string
+    template_name?: string
+    template_parameters?: Record<string, unknown>
+    official_pack_id?: string | null
+    official_pack_name?: string | null
+    official_blueprint_id?: string | null
+    official_tier?: StrategyTier | null
+    official_current_version?: number | null
+    official_latest_version?: number | null
+    official_update_available?: boolean
+}
+
+export interface StrategyListResponseV2 {
+    total: number
+    strategies: StrategyDefinition[]
+}
+
+export type StrategyTier = 'aggressive' | 'stable' | 'defensive'
+
+export interface OfficialStrategyPackItem {
+    blueprint_id: string
+    name: string
+    strategy_type: StrategyPlatformType
+    tier: StrategyTier
+    version: number
+    description: string
+    performance: StrategyPerformanceSnapshot
+    tags: string[]
+    dsl?: StrategyDsl | null
+}
+
+export interface OfficialStrategyPack {
+    id: string
+    name: string
+    strategy_type: StrategyPlatformType
+    description: string
+    tags: string[]
+    items: OfficialStrategyPackItem[]
+}
+
+export interface OfficialStrategyPackListResponse {
+    total: number
+    packs: OfficialStrategyPack[]
+}
+
+export interface OfficialStrategyPackCloneResponse {
+    pack_id: string
+    pack_name: string
+    cloned_count: number
+    strategies: StrategyDefinition[]
+    message: string
+}
+
+export interface StrategyDraftConfirmation {
+    field: string
+    assumed_as: string
+    reason: string
+}
+
+export interface StrategyDraftResponse {
+    name: string
+    strategy_type: StrategyPlatformType
+    intent_summary: string
+    pending_confirmations: StrategyDraftConfirmation[]
+    data_dependencies: string[]
+    risk_notes: string[]
+    dsl: StrategyDsl
+    explanation: string
+    structured_output_schema?: Record<string, unknown>
+    compile_report?: StrategyCompileResponse
+    llm_runtime?: Record<string, unknown>
+}
+
+export interface StrategyCompileResponse {
+    status: 'passed' | 'failed'
+    errors: string[]
+    warnings: string[]
+    required_fields: string[]
+    compiled_targets: string[]
+    factor_count?: number
+    entry_rule_count?: number
+    exit_rule_count?: number
+    runtime_engine?: Record<string, unknown>
+    execution_plan?: Record<string, unknown>
+    timeframes_required?: string[]
+    minute_requirements?: Record<string, unknown>
+    backend_resolution?: Record<string, unknown>
+    pending_confirmations?: Array<Record<string, unknown>>
+    future_function_risks?: Array<Record<string, unknown>>
+    expression_preview?: Record<string, unknown>
+}
+
+export interface BacktestMetrics {
+    total_return: number
+    annual_return: number
+    sharpe_ratio: number
+    max_drawdown: number
+    win_rate: number
+    profit_factor: number
+    volatility: number
+    final_capital: number
+    calmar_ratio?: number
+}
+
+export type BacktestUiMode = 'daily_only' | 'minute_only' | 'daily_select_intraday_trade'
+export type BacktestUniverseScope = 'all' | 'beijing' | 'chinext' | 'main_board' | 'sector' | 'symbols'
+
+export interface BacktestUniverseConfig {
+    scope: BacktestUniverseScope
+    sector?: string
+    symbols?: string[]
+}
+
+export interface BacktestCostConfig {
+    commission_rate?: number
+    min_commission?: number
+    stamp_duty_rate?: number
+    slippage_rate?: number
+}
+
+export interface BacktestMinuteConfig {
+    lazy_load?: boolean
+    execution_granularity?: 'daily' | 'minute'
+    confirm_timeframes?: string[]
+    missing_data_policy?: 'skip' | 'fallback'
+}
+
+export interface StrategyPlatformBacktestRequest {
+    strategy_id: string
+    strategy_version_id?: string
+    symbols?: string[]
+    start_date: string
+    end_date: string
+    initial_capital: number
+    frequency: string
+    benchmark?: string
+    use_minute_confirm?: boolean
+    backtest_mode?: BacktestUiMode
+    universe?: BacktestUniverseConfig
+    cost_config?: BacktestCostConfig
+    minute_config?: BacktestMinuteConfig
+    walk_forward?: Record<string, unknown>
+}
+
+export interface BacktestRun {
+    id: string
+    strategy_id: string
+    strategy_version_id?: string
+    status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+    progress: number
+    start_date: string
+    end_date: string
+    initial_capital: number
+    frequency: 'daily' | 'daily_minute'
+    benchmark: string
+    metrics?: BacktestMetrics
+    result?: {
+        metrics: BacktestMetrics
+        summary: Record<string, unknown>
+        details?: Record<string, unknown>
+        diagnostics?: Record<string, unknown>
+    }
+    artifact_root?: string
+    error_message?: string | null
+    created_at: string
+    started_at?: string | null
+    completed_at?: string | null
+}
+
+export interface BacktestStatusEvent {
+    run_id: string
+    event?: 'status' | 'heartbeat' | 'final' | 'error'
+    status: BacktestRun['status']
+    progress: number
+    stage?: string
+    message?: string
+    sequence?: number
+    timestamp?: string
+    updated_at?: string
+    error_message?: string | null
+    completed_at?: string | null
+}
+
+export interface BacktestCompareRun {
+    run_id: string
+    strategy_id: string
+    strategy_version_id?: string | null
+    status: string
+    frequency: string
+    benchmark: string
+    metrics: Record<string, number>
+    summary?: Record<string, unknown>
+    diagnostics?: Record<string, unknown>
+    artifact_root?: string | null
+    created_at: string
+    completed_at?: string | null
+}
+
+export interface BacktestCompareResponse {
+    run_ids: string[]
+    runs: BacktestCompareRun[]
+    summary: Record<string, { best: { run_id: string; value: number }; worst: { run_id: string; value: number } }>
+}
+
+export interface BacktestTradeRecord {
+    trade_id: string
+    symbol: string
+    name?: string
+    direction: 'buy' | 'sell'
+    price: number
+    quantity: number
+    amount: number
+    timestamp: string
+    pnl?: number
+    reason: string
+    factor_snapshot?: Record<string, number | string | null>
+}
+
+export interface BacktestEquityPoint {
+    date: string
+    equity: number
+    cash: number
+    positions_value: number
+    drawdown?: number
+}
+
+export interface BacktestWatchlistItem {
+    date: string
+    symbol: string
+    factor_score: number
+    rank: number
+    stage: string
+    weekly_trend_pass?: boolean
+}
+
+export interface BacktestMinuteConfirmationItem {
+    date: string
+    symbol: string
+    rank: number
+    timeframe: string
+    confirmed: boolean
+    source: string
+    close?: number | null
+    vwap?: number | null
+    bar_end?: string | null
+    factor_score?: number | null
+}
+
+export interface BacktestTradeSnapshot {
+    trade_id: string
+    symbol: string
+    side: 'buy' | 'sell'
+    timestamp: string
+    factor_vector?: Record<string, number | string | null>
+    rank_features?: Record<string, number | string | null>
+    market_state?: string | null
+    industry_state?: string | null
+    minute_confirm_result?: Record<string, unknown> | null
+    entry_reason?: string | null
+    exit_reason?: string | null
+    future_return_labels?: Record<string, number | string | null>
+}
+
+export interface BacktestSignalItem {
+    date: string
+    symbol: string
+    side: 'buy' | 'sell'
+    reason: string
+    factor_score?: number | null
+}
+
+export interface BacktestPositionItem {
+    date: string
+    symbol: string
+    quantity: number
+    close: number
+    market_value: number
+    avg_price: number
+}
+
+export interface BacktestOrderItem {
+    order_id: string
+    signal_date: string
+    execute_date: string
+    symbol: string
+    side: 'buy' | 'sell'
+    status: 'pending' | 'filled' | 'rejected'
+    reason: string
+    factor_score?: number | null
+    watchlist_rank?: number | null
+    fill_date?: string | null
+    fill_price?: number | null
+    quantity?: number | null
+    amount?: number | null
+    commission?: number | null
+    stamp_duty?: number | null
+    slippage?: number | null
+    reject_reason?: string | null
+}
+
+export interface EvolutionCandidate {
+    id: string
+    experiment_id: string
+    name: string
+    score: number
+    status: 'candidate' | 'accepted' | 'rejected'
+    improvement_summary: string
+    risk_flags: string[]
+    metrics: BacktestMetrics
+    dsl_patch: Record<string, unknown>
+}
+
+export interface EvolutionExperiment {
+    id: string
+    strategy_id: string
+    objective: string
+    status: 'pending' | 'running' | 'completed' | 'failed'
+    progress: number
+    candidates: EvolutionCandidate[]
+    created_at: string
+}
+
+export interface PaperAccount {
+    id: string
+    name: string
+    initial_capital?: number
+    cash: number
+    equity?: number
+    positions?: number
+    status?: string
+    updated_at: string
+}
+
+export interface QmtSyncProfile {
+    id: string
+    user_id: string
+    account_key: string
+    is_active: boolean
+    sync_interval_seconds: number
+    sync_tracking_board: boolean
+    alert_on_disconnect: boolean
+    last_synced_at?: string | null
+    last_status?: string | null
+    last_error?: string | null
+    consecutive_failures: number
+    last_alerted_at?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface VirtualWarehouseConnection {
+    account_key?: string
+    role?: string
+    enabled: boolean
+    provider: string
+    host: string
+    port: number
+    account_id: string
+    account_type: string
+    account_name: string
+    userdata_path?: string
+    connected: boolean
+    message: string
+}
+
+export interface VirtualWarehouseAccount {
+    account_key?: string
+    role?: string
+    broker: string
+    mode: string
+    account_name: string
+    account_id: string
+    security_account_name: string
+    total_asset: number
+    total_pnl: number
+    total_pnl_pct: number
+    today_pnl: number
+    market_value: number
+    available_cash: number
+    position_count: number
+}
+
+export interface VirtualWarehousePosition {
+    symbol: string
+    name: string
+    account_id: string
+    current_position: number
+    available_position: number
+    average_cost: number
+    current_price?: number | null
+    market_value: number
+    total_pnl: number
+    total_pnl_pct?: number | null
+    today_pnl?: number | null
+    today_pnl_pct?: number | null
+    holding_days: number
+    break_even_rise_pct?: number | null
+    position_pct?: number | null
+    previous_close?: number | null
+    quote_time?: string | null
+    quote_source?: string | null
+}
+
+export interface VirtualWarehouseOrder {
+    order_id: string
+    symbol: string
+    name: string
+    side: string
+    status: string
+    price?: number | null
+    quantity?: number | null
+    filled_quantity?: number | null
+    amount?: number | null
+    order_time?: string | null
+    can_cancel?: boolean
+}
+
+export interface VirtualWarehouseTrade {
+    trade_id: string
+    order_id?: string | null
+    symbol: string
+    name: string
+    side: string
+    price?: number | null
+    quantity?: number | null
+    amount?: number | null
+    trade_time?: string | null
+}
+
+export interface VirtualWarehouseOverviewResponse {
+    active_account_key?: string
+    accounts: Array<{
+        account_key: string
+        role: string
+        connection: VirtualWarehouseConnection
+        account: VirtualWarehouseAccount | null
+        summary: {
+            total_asset: number
+            total_pnl: number
+            today_pnl: number
+            market_value: number
+            available_cash: number
+            position_count: number
+        }
+        refresh_interval_seconds: number
+        last_synced_at?: string | null
+        data_source?: string
+        is_stale?: boolean
+    }>
+    connection: VirtualWarehouseConnection
+    account: VirtualWarehouseAccount | null
+    positions: VirtualWarehousePosition[]
+    orders: VirtualWarehouseOrder[]
+    trades: VirtualWarehouseTrade[]
+    summary: {
+        total_asset: number
+        total_pnl: number
+        today_pnl: number
+        market_value: number
+        available_cash: number
+        position_count: number
+    }
+    refresh_interval_seconds: number
+    fetched_at: string
+    last_synced_at?: string | null
+    data_source?: string
+    is_stale?: boolean
+}
+
+export interface VirtualWarehouseDiagnosticItem {
+    account_key: string
+    role: string
+    enabled: boolean
+    account_id: string
+    account_name: string
+    host: string
+    port: number
+    userdata_path: string
+    ready: boolean
+    checks: {
+        enabled: boolean
+        account_id_configured: boolean
+        userdata_path_configured: boolean
+        userdata_path_exists: boolean
+        xtquant_installed: boolean
+        tcp_port_reachable: boolean
+        bridge_configured: boolean
+        bridge_reachable: boolean
+    }
+    warnings: string[]
+    xtquant_message: string
+    tcp_probe: {
+        reachable: boolean
+        message: string
+    }
+    bridge_probe: {
+        configured: boolean
+        reachable: boolean
+        message: string
+    }
+    connect_test: {
+        attempted: boolean
+        connected: boolean
+        message: string
+    }
+}
+
+export interface VirtualWarehouseDiagnosticsResponse {
+    active_account_key?: string
+    run_connect_test: boolean
+    items: VirtualWarehouseDiagnosticItem[]
+    summary: {
+        total: number
+        enabled: number
+        ready: number
+        connected: number
+    }
+    checked_at: string
+}
+
+export interface QmtOrderSubmitRequest {
+    account_key?: string
+    symbol: string
+    side: string
+    quantity: number
+    price?: number | null
+    price_type?: string
+    strategy_name?: string
+    order_remark?: string
+}
+
+export interface QmtOrderSubmitResponse {
+    message: string
+    account_key: string
+    order_result: {
+        success: boolean
+        order_id: string
+        result?: unknown
+        request?: Record<string, unknown>
+        bridge?: Record<string, unknown>
+        raw?: Record<string, unknown>
+    }
+    overview: VirtualWarehouseOverviewResponse
+}
+
+export interface QmtOrderCancelResponse {
+    message: string
+    account_key: string
+    cancel_result: {
+        success: boolean
+        order_id: string
+        result?: unknown
+        bridge?: Record<string, unknown>
+        raw?: Record<string, unknown>
+    }
+    overview: VirtualWarehouseOverviewResponse
 }

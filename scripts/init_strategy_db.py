@@ -11,24 +11,17 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from sqlalchemy import create_engine
-from api.models.strategy_models import init_database, Base
-import os
+from api.core.strategy_db import strategy_engine
+from api.models.strategy_models import Base
 
 
 def main():
     """初始化数据库"""
-    # 使用SQLite数据库（开发环境）
-    db_path = project_root / "data" / "strategy_management.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    engine = create_engine(f"sqlite:///{db_path}")
-
-    print(f"📁 数据库路径: {db_path}")
+    print(f"📁 数据库引擎: {strategy_engine.url.render_as_string(hide_password=True)}")
     print("🔨 创建数据库表...")
 
     # 创建所有表
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(strategy_engine)
 
     print("✅ 数据库初始化完成")
     print("\n创建的表:")

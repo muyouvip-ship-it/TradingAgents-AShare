@@ -2,14 +2,21 @@
 
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from typing import Generator
 
 from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+from api.core.env import load_project_env
+
+load_project_env()
+
 # Database URL - PostgreSQL only
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./app.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./app.db" if "pytest" in sys.modules else "postgresql://localhost/trading_agents"
 
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
@@ -26,10 +33,20 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Base class for models
 Base = declarative_base()
 logger = logging.getLogger(__name__)
+_sqlite_schema_ready = False
+
+
+def _ensure_sqlite_schema_ready() -> None:
+    global _sqlite_schema_ready
+    if not IS_SQLITE or _sqlite_schema_ready:
+        return
+    init_db()
+    _sqlite_schema_ready = True
 
 
 def get_db() -> Generator[Session, None, None]:
     """Get database session (for FastAPI Depends)."""
+    _ensure_sqlite_schema_ready()
     db = SessionLocal()
     try:
         yield db
@@ -49,6 +66,7 @@ class get_db_ctx:
         self.db: Session | None = None
 
     def __enter__(self) -> Session:
+        _ensure_sqlite_schema_ready()
         self.db = SessionLocal()
         return self.db
 
@@ -488,3 +506,75 @@ class ImportedPortfolioPositionDB(Base):
     )
 
 
+class VirtualPositionStateDB(Base):
+    """Track virtual broker positions across syncs for holding-day estimation."""
+
+    __tablename__ = "virtual_position_states"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    broker = Column(String(32), nullable=False, default="qmt")
+    account_id = Column(String(64), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    first_seen_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    last_quantity = Column(Float, nullable=True)
+    last_price = Column(Float, nullable=True)
+    last_market_value = Column(Float, nullable=True)
+    last_payload_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'broker', 'account_id', 'symbol', name='uq_virtual_position_state'),
+    )
+
+
+class QmtSyncProfileDB(Base):
+    """User-level QMT auto sync profile."""
+
+    __tablename__ = "qmt_sync_profiles"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    account_key = Column(String(64), nullable=False)
+    is_active = Column(Boolean, default=False, nullable=False)
+    sync_interval_seconds = Column(Integer, default=30, nullable=False)
+    sync_tracking_board = Column(Boolean, default=True, nullable=False)
+    alert_on_disconnect = Column(Boolean, default=True, nullable=False)
+    last_synced_at = Column(DateTime, nullable=True)
+    last_status = Column(String(32), nullable=True)
+    last_error = Column(Text, nullable=True)
+    consecutive_failures = Column(Integer, default=0, nullable=False)
+    last_alerted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'account_key', name='uq_qmt_sync_profile_user_account'),
+    )
+
+
+class QmtAccountSnapshotDB(Base):
+    """Persist latest warehouse snapshot for each user/account to survive disconnects."""
+
+    __tablename__ = "qmt_account_snapshots"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    account_key = Column(String(64), nullable=False)
+    role = Column(String(32), nullable=True)
+    account_id = Column(String(64), nullable=True)
+    connection_json = Column(JSON, nullable=True)
+    account_json = Column(JSON, nullable=True)
+    positions_json = Column(JSON, nullable=True)
+    orders_json = Column(JSON, nullable=True)
+    trades_json = Column(JSON, nullable=True)
+    summary_json = Column(JSON, nullable=True)
+    fetched_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'account_key', name='uq_qmt_account_snapshot_user_account'),
+    )

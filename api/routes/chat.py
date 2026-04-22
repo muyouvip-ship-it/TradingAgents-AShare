@@ -1,0 +1,777 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from contextlib import suppress
+from datetime import datetime
+from statistics import mean
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy import text
+
+from api.core.progress_tracker import AgentProgressTracker
+from api.database import get_db_ctx
+from api.deps import require_api_user
+from api.schemas.analysis import AnalyzeRequest
+from api.services import report_service
+
+router = APIRouter(prefix="/v1", tags=["Chat"])
+logger = logging.getLogger(__name__)
+
+
+@router.post("/chat/completions")
+async def chat_completions(request: dict = Body(...), current_user=Depends(require_api_user)):
+    from api import main as compat
+
+    text = compat._extract_chat_text(request.get("messages") or [])
+    config = compat._build_runtime_config({}, user_id=current_user.id)
+    symbol, trade_date, horizons, focus_areas, specific_questions, user_context = compat._ai_extract_symbol_and_date(text, config)
+    del horizons, focus_areas, specific_questions, user_context
+    if not symbol:
+        fallback_symbol_raw = str(request.get("symbol") or request.get("current_symbol") or "").strip()
+        if fallback_symbol_raw:
+            candidate = compat.search_cn_stock_by_name(fallback_symbol_raw) or compat.normalize_symbol(fallback_symbol_raw)
+            reverse_map = compat._get_reverse_stock_map()
+            if candidate and (not reverse_map or candidate in reverse_map or candidate.endswith((".SH", ".SZ"))):
+                symbol = candidate
+    if not symbol:
+        raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")
+
+    selected_analysts = _resolve_selected_analysts(
+        requested=request.get("selected_analysts"),
+        user_id=current_user.id,
+    )
+
+    analyze_request = AnalyzeRequest(
+        symbol=symbol,
+        trade_date=trade_date or compat.cn_today_str(),
+        query=text,
+        dry_run=bool(request.get("dry_run")),
+        selected_analysts=selected_analysts,
+    )
+    job_id = f"{datetime.now().timestamp():.0f}".replace(".", "") + symbol.replace(".", "")
+    job_id = job_id[-24:]
+
+    if request.get("stream", True):
+        async def event_stream():
+            tracker = AgentProgressTracker(
+                on_update=lambda snapshot: compat._set_job(
+                    job_id,
+                    progress=snapshot,
+                    current_agent=snapshot.get("current_agent"),
+                    current_stage=snapshot.get("current_stage"),
+                    analysis_stage=snapshot.get("analysis_stage"),
+                )
+            )
+            try:
+                compat._set_job(
+                    job_id,
+                    user_id=current_user.id,
+                    status="pending",
+                    symbol=symbol,
+                    trade_date=analyze_request.trade_date,
+                    current_stage="queued",
+                    analysis_stage="queued",
+                )
+                tracker.mark_stage("ready", "queued")
+                yield _sse_pack("job.ready", {"job_id": job_id, "symbol": symbol})
+                yield _sse_pack("job.created", {"job_id": job_id, "symbol": symbol})
+                await asyncio.sleep(0.05)
+                compat._set_job(job_id, status="running")
+                tracker.mark_stage("running", "initializing")
+                yield _sse_pack("job.running", {"job_id": job_id, "symbol": symbol, "msg": f"开始分析 {symbol}"})
+
+                analysis_task = asyncio.create_task(
+                    _run_analysis_with_fallback(
+                        symbol=symbol,
+                        trade_date=analyze_request.trade_date or compat.cn_today_str(),
+                        query=text,
+                        user_id=current_user.id,
+                        selected_analysts=selected_analysts,
+                        tracker=tracker,
+                        job_id=job_id,
+                    )
+                )
+
+                while True:
+                    if analysis_task.done() and tracker.empty():
+                        break
+                    pending_event = await tracker.next_event()
+                    if pending_event is None:
+                        continue
+                    event_name, data = pending_event
+                    yield _sse_pack(event_name, data)
+
+                result_payload, risk_items, key_metrics, decision = await analysis_task
+
+                tracker.mark_stage("finalizing", "result_persistence")
+                for event_name, data in _finalize_section_events(tracker, result_payload):
+                    yield _sse_pack(event_name, data)
+
+                with get_db_ctx() as db:
+                    report_service.create_report(
+                        db,
+                        symbol=symbol,
+                        trade_date=analyze_request.trade_date or compat.cn_today_str(),
+                        decision=decision,
+                        result_data=result_payload,
+                        user_id=current_user.id,
+                        risk_items=risk_items,
+                        key_metrics=key_metrics,
+                        analyst_traces=list(result_payload.get("analyst_traces") or []),
+                        report_id=job_id,
+                    )
+
+                compat._set_job(
+                    job_id,
+                    status="completed",
+                    decision=decision,
+                    result=result_payload,
+                    symbol=symbol,
+                    trade_date=analyze_request.trade_date,
+                )
+                tracker.mark_stage("completed", "completed")
+                yield _sse_pack(
+                    "job.completed",
+                    {
+                        "job_id": job_id,
+                        "symbol": symbol,
+                        "decision": decision,
+                        "direction": result_payload.get("direction") or "中性",
+                        "result": result_payload,
+                        "risk_items": risk_items,
+                        "key_metrics": key_metrics,
+                        "confidence": _extract_confidence(result_payload.get("final_trade_decision")),
+                        "target_price": result_payload.get("target_price"),
+                        "stop_loss_price": result_payload.get("stop_loss_price"),
+                    },
+                )
+            except Exception as exc:
+                logger.exception("Streaming chat analysis failed for %s", symbol)
+                with suppress(Exception):
+                    compat._set_job(job_id, status="failed", error=str(exc), symbol=symbol, trade_date=analyze_request.trade_date)
+                tracker.mark_stage("failed", "failed")
+                yield _sse_pack("job.failed", {"job_id": job_id, "symbol": symbol, "error": f"智能分析失败：{exc}"})
+            finally:
+                yield "event: done\ndata: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    if request.get("dry_run"):
+        with get_db_ctx() as db:
+            imported_context = compat._build_manual_imported_user_context(db, current_user.id, symbol)
+        result = {
+            "status": "completed",
+            "decision": "DRY_RUN",
+            "job_id": job_id,
+            "symbol": symbol,
+            "query": text,
+            "selected_analysts": analyze_request.selected_analysts,
+            "user_context": imported_context,
+        }
+        compat._set_job(
+            job_id,
+            user_id=current_user.id,
+            status="completed",
+            decision="DRY_RUN",
+            symbol=symbol,
+            trade_date=analyze_request.trade_date,
+            result=result,
+        )
+        return {
+            "id": f"chatcmpl-{job_id}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": request.get("model"),
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": f"已完成分析任务：{job_id}"}}],
+        }
+
+    compat._set_job(
+        job_id,
+        user_id=current_user.id,
+        status="queued",
+        symbol=symbol,
+        trade_date=analyze_request.trade_date,
+        current_stage="queued",
+        analysis_stage="queued",
+        progress={
+            "status": {},
+            "current_agent": None,
+            "current_stage": "queued",
+            "analysis_stage": "queued",
+            "debate": {"name": None, "agent": None, "round": None, "is_verdict": False},
+            "completed_agents": [],
+            "has_streamed_content": False,
+        },
+    )
+    asyncio.create_task(
+        _run_background_analysis_job(
+            job_id=job_id,
+            symbol=symbol,
+            trade_date=analyze_request.trade_date,
+            query=text,
+            user_id=current_user.id,
+            selected_analysts=selected_analysts,
+        )
+    )
+    return {
+        "id": f"chatcmpl-{job_id}",
+        "object": "chat.completion",
+        "created": int(datetime.now().timestamp()),
+        "model": request.get("model"),
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": f"已启动分析任务：{job_id}"}}],
+    }
+
+
+def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_id: str) -> tuple[dict, list[dict], list[dict], str]:
+    code = symbol.split(".", 1)[0]
+    rows = _load_recent_daily_rows(code=code, symbol=symbol)
+
+    closes = [float(row["close"]) for row in rows if row.get("close") is not None]
+    latest_close = closes[0] if closes else None
+    prev_close = closes[1] if len(closes) > 1 else None
+    ma5 = mean(closes[:5]) if len(closes) >= 5 else latest_close
+    ma20 = mean(closes[:20]) if len(closes) >= 20 else latest_close
+    ret5 = ((latest_close / closes[4]) - 1) * 100 if latest_close and len(closes) >= 5 and closes[4] else None
+    day_change = ((latest_close / prev_close) - 1) * 100 if latest_close and prev_close else None
+    latest_turnover = _safe_float(rows[0].get("turnover_rate")) if rows else None
+    latest_mcap = _safe_float(rows[0].get("float_market_cap")) if rows else None
+    latest_profit = _safe_float(rows[0].get("net_profit_ttm")) if rows else None
+
+    if latest_close is None:
+        direction = "中性"
+        decision = "WATCH"
+        confidence = 38
+        market_report = f"## 市场分析\n\n未能读取 {symbol} 的近期日线数据，当前无法做出高置信度判断。建议先检查数据源或稍后再试。"
+        volume_price_report = "## 量价分析\n\n缺少可用行情数据，量价分析暂不可用。"
+    else:
+        bullish = bool(ma20 and latest_close > ma20 and (ret5 or 0) > 0)
+        bearish = bool(ma20 and latest_close < ma20 and (ret5 or 0) < 0)
+        if bullish:
+            direction, decision, confidence = "偏多", "BUY", 68
+        elif bearish:
+            direction, decision, confidence = "偏空", "WATCH", 64
+        else:
+            direction, decision, confidence = "中性", "HOLD", 52
+        market_report = (
+            f"## 市场分析\n\n- 标的：`{symbol}`\n"
+            f"- 分析日期：`{trade_date}`\n"
+            f"- 最新收盘：`{latest_close:.2f}`\n"
+            f"- 单日涨跌：`{(day_change or 0):.2f}%`\n"
+            f"- 近 5 日涨跌：`{(ret5 or 0):.2f}%`\n"
+            f"- MA5 / MA20：`{(ma5 or 0):.2f}` / `{(ma20 or 0):.2f}`\n\n"
+            f"当前依据本地轻量分析结果，趋势判断为 **{direction}**。"
+        )
+        volume_price_report = (
+            "## 量价分析\n\n"
+            f"- 最近换手率：`{latest_turnover:.2f}%`\n" if latest_turnover is not None else "## 量价分析\n\n"
+        ) + (
+            f"- 当前价格相对 MA20 {'上方' if ma20 and latest_close > ma20 else '下方'}\n"
+            f"- 近 5 日动量 {'为正' if (ret5 or 0) > 0 else '为负或走平'}\n"
+        )
+
+    sentiment_report = f"## 舆情分析\n\n当前请求：{query or f'分析 {symbol}'}。\n\n当前版本已恢复请求闭环，但舆情大模型链路暂未接入实时输出，先给出行情侧结论。"
+    news_report = "## 新闻分析\n\n当前未接入实时新闻抓取流，本次结果未纳入突发公告与新闻事件影响。"
+    fundamentals_report = (
+        "## 基本面分析\n\n"
+        f"- 流通市值：`{latest_mcap / 1e8:.2f} 亿` \n" if latest_mcap else "## 基本面分析\n\n"
+    ) + (
+        f"- 近一期净利润 TTM：`{latest_profit / 1e8:.2f} 亿`\n" if latest_profit else "- 当前未读取到净利润 TTM 字段。\n"
+    )
+    macro_report = "## 宏观板块分析\n\n本次先以标的自身行情为主，宏观与板块结论待完整图谱恢复后补齐。"
+    smart_money_report = "## 主力资金分析\n\n当前轻量模式未接入龙虎榜与主力净流入明细，仅保留量价和换手代理判断。"
+    investment_plan = f"## 研究结论\n\n结合当前本地行情特征，建议结论为 **{direction}**，执行动作倾向 **{decision}**。"
+    trader_investment_plan = (
+        "## 交易计划\n\n"
+        f"- 建议动作：`{decision}`\n"
+        f"- 建议跟踪位：`{latest_close:.2f}`\n" if latest_close is not None else "## 交易计划\n\n- 当前无足够数据生成交易计划。\n"
+    )
+    final_trade_decision = (
+        f"方向：{direction}\n"
+        f"动作：{decision}\n"
+        f"置信度：{confidence}%\n"
+        "说明：当前为本地轻量分析结果，用于恢复智能分析闭环和快速排障。"
+    )
+
+    risk_items = [
+        {"name": "实时链路", "level": "medium", "description": "当前为轻量流式分析链路，完整多 Agent 深度分析未完全恢复。"},
+        {"name": "新闻舆情缺口", "level": "medium", "description": "未纳入实时新闻、舆情和公告突发影响。"},
+    ]
+    key_metrics = [
+        {"name": "当前方向", "value": direction, "status": "neutral" if direction == "中性" else ("good" if direction == "偏多" else "bad")},
+        {"name": "执行动作", "value": decision, "status": "neutral" if decision == "HOLD" else ("good" if decision == "BUY" else "bad")},
+        {"name": "近5日涨跌", "value": f"{(ret5 or 0):.2f}%", "status": "good" if (ret5 or 0) > 0 else ("bad" if (ret5 or 0) < 0 else "neutral")},
+    ]
+
+    result_payload = {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "query": query,
+        "decision": decision,
+        "direction": direction,
+        "market_report": market_report,
+        "sentiment_report": sentiment_report,
+        "news_report": news_report,
+        "fundamentals_report": fundamentals_report,
+        "macro_report": macro_report,
+        "smart_money_report": smart_money_report,
+        "volume_price_report": volume_price_report,
+        "investment_plan": investment_plan,
+        "trader_investment_plan": trader_investment_plan,
+        "final_trade_decision": final_trade_decision,
+        "user_context": _build_user_context_snapshot(symbol, user_id),
+    }
+    return result_payload, risk_items, key_metrics, decision
+
+
+async def _run_analysis_with_fallback(
+    symbol: str,
+    trade_date: str,
+    query: str,
+    user_id: str,
+    selected_analysts: list[str],
+    tracker: AgentProgressTracker,
+    job_id: str,
+) -> tuple[dict, list[dict], list[dict], str]:
+    try:
+        return await _run_deep_analysis_pipeline(
+            symbol=symbol,
+            trade_date=trade_date,
+            query=query,
+            user_id=user_id,
+            selected_analysts=selected_analysts,
+            tracker=tracker,
+            job_id=job_id,
+        )
+    except Exception:
+        logger.exception("Deep multi-agent analysis failed for %s", symbol)
+        if tracker.has_streamed_content:
+            raise
+        return _build_lightweight_analysis(
+            symbol=symbol,
+            trade_date=trade_date,
+            query=query,
+            user_id=user_id,
+        )
+
+
+async def _run_background_analysis_job(
+    job_id: str,
+    symbol: str,
+    trade_date: str,
+    query: str,
+    user_id: str,
+    selected_analysts: list[str],
+) -> None:
+    from api import main as compat
+
+    tracker = AgentProgressTracker(
+        emit_events=False,
+        on_update=lambda snapshot: compat._set_job(
+            job_id,
+            progress=snapshot,
+            current_agent=snapshot.get("current_agent"),
+            current_stage=snapshot.get("current_stage"),
+            analysis_stage=snapshot.get("analysis_stage"),
+        ),
+    )
+    compat._set_job(job_id, status="running", symbol=symbol, trade_date=trade_date)
+    tracker.mark_stage("running", "initializing")
+    try:
+        result_payload, risk_items, key_metrics, decision = await _run_analysis_with_fallback(
+            symbol=symbol,
+            trade_date=trade_date,
+            query=query,
+            user_id=user_id,
+            selected_analysts=selected_analysts,
+            tracker=tracker,
+            job_id=job_id,
+        )
+        tracker.mark_stage("finalizing", "result_persistence")
+        with get_db_ctx() as db:
+            report_service.create_report(
+                db,
+                symbol=symbol,
+                trade_date=trade_date,
+                decision=decision,
+                result_data=result_payload,
+                user_id=user_id,
+                risk_items=risk_items,
+                key_metrics=key_metrics,
+                analyst_traces=list(result_payload.get("analyst_traces") or []),
+                report_id=job_id,
+            )
+        compat._set_job(
+            job_id,
+            status="completed",
+            decision=decision,
+            result=result_payload,
+            symbol=symbol,
+            trade_date=trade_date,
+        )
+        tracker.mark_stage("completed", "completed")
+    except Exception as exc:
+        logger.exception("Background chat analysis failed for %s", symbol)
+        compat._set_job(
+            job_id,
+            status="failed",
+            error=f"智能分析失败：{exc}",
+            symbol=symbol,
+            trade_date=trade_date,
+        )
+        tracker.mark_stage("failed", "failed")
+
+
+async def _run_deep_analysis_pipeline(
+    symbol: str,
+    trade_date: str,
+    query: str,
+    user_id: str,
+    selected_analysts: list[str],
+    tracker: AgentProgressTracker,
+    job_id: str,
+) -> tuple[dict, list[dict], list[dict], str]:
+    from api import main as compat
+    from tradingagents.agents.utils.agent_states import current_tracker_var
+    from tradingagents.graph.intent_parser import parse_intent
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    config = compat._build_runtime_config({}, user_id=user_id)
+    merged_user_context = _build_user_context_snapshot(symbol, user_id)
+    graph = TradingAgentsGraph(
+        selected_analysts=selected_analysts,
+        debug=False,
+        config=config,
+    )
+
+    tracker_token = current_tracker_var.set(tracker)
+    try:
+        user_intent = parse_intent(query or f"分析 {symbol}", graph.quick_thinking_llm, fallback_ticker=symbol)
+        user_intent["user_context"] = _merge_user_contexts(
+            merged_user_context,
+            user_intent.get("user_context") or {},
+        )
+
+        await asyncio.to_thread(graph.data_collector.collect, symbol, trade_date)
+        state = graph.propagator.create_initial_state(
+            company_name=symbol,
+            trade_date=trade_date,
+            user_context=user_intent.get("user_context") or {},
+            selected_analysts=selected_analysts,
+            request_source="chat",
+            user_intent=user_intent,
+            horizon="short",
+        )
+        args = graph.propagator.get_graph_args()
+        args["config"]["configurable"] = {"thread_id": f"chat:{job_id}"}
+        final_state = await graph.graph.ainvoke(state, **args)
+    finally:
+        current_tracker_var.reset(tracker_token)
+        with suppress(Exception):
+            graph.data_collector.evict(symbol, trade_date)
+
+    return _build_deep_result_payload(
+        symbol=symbol,
+        trade_date=trade_date,
+        query=query,
+        selected_analysts=selected_analysts,
+        graph=graph,
+        final_state=final_state,
+    )
+
+
+def _build_deep_result_payload(
+    symbol: str,
+    trade_date: str,
+    query: str,
+    selected_analysts: list[str],
+    graph,
+    final_state: dict[str, Any],
+) -> tuple[dict, list[dict], list[dict], str]:
+    final_trade_decision = str(final_state.get("final_trade_decision") or "")
+    decision = str(graph.process_signal(final_trade_decision) or "HOLD")
+    direction = _derive_direction(final_trade_decision, decision, list(final_state.get("analyst_traces") or []))
+    resolved_fields = report_service.resolve_report_fields(final_state)
+
+    result_payload = {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "query": query,
+        "decision": decision,
+        "direction": direction,
+        "analysis_mode": "deep",
+        "selected_analysts": selected_analysts,
+        "market_report": final_state.get("market_report") or "",
+        "sentiment_report": final_state.get("sentiment_report") or "",
+        "news_report": final_state.get("news_report") or "",
+        "fundamentals_report": final_state.get("fundamentals_report") or "",
+        "macro_report": final_state.get("macro_report") or "",
+        "smart_money_report": final_state.get("smart_money_report") or "",
+        "volume_price_report": final_state.get("volume_price_report") or "",
+        "investment_plan": final_state.get("investment_plan") or "",
+        "trader_investment_plan": final_state.get("trader_investment_plan") or "",
+        "final_trade_decision": final_trade_decision,
+        "analyst_traces": list(final_state.get("analyst_traces") or []),
+        "investment_debate_state": final_state.get("investment_debate_state") or {},
+        "risk_debate_state": final_state.get("risk_debate_state") or {},
+        "risk_feedback_state": final_state.get("risk_feedback_state") or {},
+        "instrument_context": final_state.get("instrument_context") or {},
+        "market_context": final_state.get("market_context") or {},
+        "workflow_context": final_state.get("workflow_context") or {},
+        "user_context": final_state.get("user_context") or {},
+        "target_price": resolved_fields.get("target_price"),
+        "stop_loss_price": resolved_fields.get("stop_loss_price"),
+    }
+    risk_items = _build_deep_risk_items(final_state, selected_analysts)
+    key_metrics = _build_deep_key_metrics(final_state, decision, direction, selected_analysts)
+    return result_payload, risk_items, key_metrics, decision
+
+
+def _build_deep_risk_items(final_state: dict[str, Any], selected_analysts: list[str]) -> list[dict[str, Any]]:
+    investment_debate = final_state.get("investment_debate_state") or {}
+    risk_debate = final_state.get("risk_debate_state") or {}
+    risk_feedback = final_state.get("risk_feedback_state") or {}
+    unresolved_investment = len(investment_debate.get("unresolved_claim_ids") or [])
+    unresolved_risk = len(risk_debate.get("unresolved_claim_ids") or [])
+    items = [
+        {
+            "name": "多Agent链路",
+            "level": "low",
+            "description": f"本次启用 {len(selected_analysts)} 个分析师与完整研究/风控链路。",
+        }
+    ]
+    if unresolved_investment:
+        items.append(
+            {
+                "name": "研究分歧",
+                "level": "medium",
+                "description": f"研究辩论仍有 {unresolved_investment} 个未完全收敛观点，建议关注结论中的条件前提。",
+            }
+        )
+    if unresolved_risk or risk_feedback.get("revision_required"):
+        items.append(
+            {
+                "name": "风控约束",
+                "level": "medium",
+                "description": f"风险讨论存在 {unresolved_risk} 个未完全收敛风险点，请结合止损和仓位建议执行。",
+            }
+        )
+    return items
+
+
+def _build_deep_key_metrics(
+    final_state: dict[str, Any],
+    decision: str,
+    direction: str,
+    selected_analysts: list[str],
+) -> list[dict[str, Any]]:
+    confidence = _extract_confidence(final_state.get("final_trade_decision"))
+    traces = list(final_state.get("analyst_traces") or [])
+    return [
+        {
+            "name": "执行动作",
+            "value": decision,
+            "status": "neutral" if decision == "HOLD" else ("good" if decision == "BUY" else "bad"),
+        },
+        {
+            "name": "方向倾向",
+            "value": direction,
+            "status": "neutral" if direction == "中性" else ("good" if direction == "偏多" else "bad"),
+        },
+        {
+            "name": "分析师数量",
+            "value": str(len(selected_analysts)),
+            "status": "good" if len(selected_analysts) >= 4 else "neutral",
+        },
+        {
+            "name": "观点追踪数",
+            "value": str(len(traces)),
+            "status": "neutral",
+        },
+        {
+            "name": "置信度",
+            "value": f"{confidence}%" if confidence is not None else "未提取",
+            "status": "good" if (confidence or 0) >= 70 else ("neutral" if confidence is None or confidence >= 50 else "bad"),
+        },
+    ]
+
+
+def _finalize_section_events(
+    tracker: AgentProgressTracker,
+    result_payload: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
+    for agent_name, section in _section_definitions():
+        content = str(result_payload.get(section) or "").strip()
+        events.extend(tracker.finalize_report(agent_name, section, content))
+    return events
+
+
+def _section_definitions() -> list[tuple[str, str]]:
+    return [
+        ("Market Analyst", "market_report"),
+        ("Social Analyst", "sentiment_report"),
+        ("News Analyst", "news_report"),
+        ("Fundamentals Analyst", "fundamentals_report"),
+        ("Macro Analyst", "macro_report"),
+        ("Smart Money Analyst", "smart_money_report"),
+        ("Volume Price Analyst", "volume_price_report"),
+        ("Research Manager", "investment_plan"),
+        ("Trader", "trader_investment_plan"),
+    ]
+
+
+def _resolve_selected_analysts(requested: Any, user_id: str) -> list[str]:
+    requested_list = [str(item).strip() for item in (requested or []) if str(item).strip()]
+    if requested_list:
+        return requested_list
+    try:
+        import json as _json
+        from api.services import auth_service
+
+        with get_db_ctx() as db:
+            user_cfg = auth_service.get_user_llm_config(db, user_id)
+        parsed = _json.loads(user_cfg.default_analysts) if user_cfg and user_cfg.default_analysts else []
+        resolved = [str(item).strip() for item in parsed if str(item).strip()]
+        if resolved:
+            return resolved
+    except Exception:
+        logger.exception("Failed to resolve default analysts for %s", user_id)
+    return ["market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"]
+
+
+def _merge_user_contexts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if value in (None, "", []):
+            continue
+        merged[key] = value
+    return merged
+
+
+def _derive_direction(final_trade_decision: str, decision: str, analyst_traces: list[dict[str, Any]]) -> str:
+    text = f"{final_trade_decision}\n{decision}".upper()
+    if any(keyword in text for keyword in ("BUY", "增持", "买入", "BULLISH", "看多")):
+        return "偏多"
+    if any(keyword in text for keyword in ("SELL", "减持", "卖出", "BEARISH", "看空")):
+        return "偏空"
+    bullish = 0
+    bearish = 0
+    for trace in analyst_traces:
+        verdict = str(trace.get("verdict") or "").upper()
+        if any(keyword in verdict for keyword in ("BULL", "看多", "偏多", "BUY")):
+            bullish += 1
+        elif any(keyword in verdict for keyword in ("BEAR", "看空", "偏空", "SELL")):
+            bearish += 1
+    if bullish > bearish:
+        return "偏多"
+    if bearish > bullish:
+        return "偏空"
+    return "中性"
+
+
+def _build_user_context_snapshot(symbol: str, user_id: str) -> dict:
+    try:
+        with get_db_ctx() as db:
+            return compat_portfolio_context(db, user_id, symbol)
+    except Exception:
+        logger.exception("Failed to build user context snapshot for %s", symbol)
+        return {}
+
+
+def _load_recent_daily_rows(code: str, symbol: str) -> list[dict]:
+    try:
+        with get_db_ctx() as db:
+            columns = _get_table_columns(db, "stock_daily_kline")
+            required_columns = {"symbol", "trade_date", "close"}
+            if not required_columns.issubset(columns):
+                logger.warning("stock_daily_kline is unavailable or missing required columns: %s", sorted(required_columns - columns))
+                return []
+
+            selected_columns = [
+                column
+                for column in (
+                    "trade_date",
+                    "close",
+                    "volume",
+                    "amount",
+                    "turnover_rate",
+                    "float_market_cap",
+                    "net_profit_ttm",
+                )
+                if column in columns
+            ]
+            rows = db.execute(
+                text(
+                    f"""
+                    SELECT {", ".join(selected_columns)}
+                    FROM stock_daily_kline
+                    WHERE symbol IN (:code, :symbol)
+                    ORDER BY trade_date DESC
+                    LIMIT 30
+                    """
+                ),
+                {"code": code, "symbol": symbol},
+            ).mappings().all()
+            return [dict(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to load recent daily kline for %s", symbol)
+        return []
+
+
+def _get_table_columns(db, table_name: str) -> set[str]:
+    try:
+        dialect_name = db.bind.dialect.name if db.bind is not None else ""
+        if dialect_name == "sqlite":
+            return {row[1] for row in db.execute(text(f"PRAGMA table_info({table_name})")).fetchall()}
+        rows = db.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = :table_name
+                """
+            ),
+            {"table_name": table_name},
+        ).fetchall()
+        return {row[0] for row in rows}
+    except Exception:
+        logger.exception("Failed to inspect table columns for %s", table_name)
+        return set()
+
+
+def compat_portfolio_context(db, user_id: str, symbol: str) -> dict:
+    from api import main as compat
+
+    return compat._build_manual_imported_user_context(db, user_id, symbol)
+
+
+def _safe_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_confidence(text: str | None) -> int | None:
+    if not text:
+        return None
+    for line in str(text).splitlines():
+        if "置信度" in line:
+            digits = "".join(char for char in line if char.isdigit())
+            if digits:
+                return int(digits)
+    return None
+
+
+def _sse_pack(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

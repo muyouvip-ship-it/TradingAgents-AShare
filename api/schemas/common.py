@@ -22,19 +22,23 @@ class UserContextInput(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    pass
+    job_id: str
+    status: str
 
 
 class BatchScheduledTriggerJob(BaseModel):
-    pass
+    job_id: str
+    symbol: Optional[str] = None
 
 
 class BatchScheduledTriggerResponse(BaseModel):
-    pass
+    jobs: List[BatchScheduledTriggerJob] = Field(default_factory=list)
 
 
 class JobStatusResponse(BaseModel):
-    pass
+    job_id: str
+    status: str
+    error: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
@@ -43,88 +47,107 @@ class ChatMessage(BaseModel):
 
 
 class KlineResponse(BaseModel):
-    pass
+    symbol: str = ""
+    items: List[dict] = Field(default_factory=list)
 
 
 class ReportCreateRequest(BaseModel):
-    pass
+    symbol: str
+    trade_date: str
+    decision: Optional[str] = None
+    result_data: Optional[dict] = None
 
 
 class ReportResponse(BaseModel):
-    pass
+    id: str
 
 
 class ReportListResponse(BaseModel):
-    pass
+    reports: List[dict] = Field(default_factory=list)
 
 
 class ReportBatchDeleteRequest(BaseModel):
-    pass
+    report_ids: List[str] = Field(default_factory=list)
 
 
 class ReportBatchDeleteResponse(BaseModel):
-    pass
+    deleted_ids: List[str] = Field(default_factory=list)
+    missing_ids: List[str] = Field(default_factory=list)
 
 
 class LatestReportsBySymbolsRequest(BaseModel):
-    pass
+    symbols: List[str] = Field(default_factory=list)
 
 
 class LatestReportsBySymbolsResponse(BaseModel):
-    pass
+    reports: List[dict] = Field(default_factory=list)
 
 
 class PortfolioOverviewResponse(BaseModel):
-    pass
+    watchlist: List[dict] = Field(default_factory=list)
+    scheduled: List[dict] = Field(default_factory=list)
+    latest_reports: List[dict] = Field(default_factory=list)
+    portfolio_import: dict = Field(default_factory=dict)
 
 
 class WatchlistAddRequest(BaseModel):
-    pass
+    text: str = ""
+    symbol: str = ""
 
 
 class ScheduledBatchIdsRequest(BaseModel):
-    pass
+    item_ids: List[str] = Field(default_factory=list)
 
 
 class ScheduledBatchUpdateRequest(BaseModel):
-    pass
+    item_ids: List[str] = Field(default_factory=list)
+    is_active: Optional[bool] = None
+    horizon: Optional[str] = None
+    trigger_time: Optional[str] = None
 
 
 class AnnouncementItemResponse(BaseModel):
-    pass
+    title: Optional[str] = None
+    content: Optional[str] = None
 
 
 class AnnouncementResponse(BaseModel):
-    pass
+    announcement: Optional[AnnouncementItemResponse] = None
 
 
 class LatestAnnouncementResponse(BaseModel):
-    pass
+    announcement: Optional[AnnouncementItemResponse] = None
 
 
 class BacktestRequest(BaseModel):
-    pass
+    strategy_id: str = ""
+    symbol: str = ""
 
 
 class SponsorItem(BaseModel):
-    pass
+    id: str = ""
+    sponsor_type: str = ""
+    name: str = ""
 
 
 class SponsorsResponse(BaseModel):
-    pass
+    sponsors: List[SponsorItem] = Field(default_factory=list)
 
 
 class FeedbackCreateRequest(BaseModel):
-    pass
+    subject: str = ""
+    content: str = ""
 
 
 class FeedbackItem(BaseModel):
-    pass
+    id: str = ""
+    subject: str = ""
+    content: str = ""
 
 
 class FeedbackListResponse(BaseModel):
-    pass
+    items: List[FeedbackItem] = Field(default_factory=list)
 
 
 class FeedbackUnreadResponse(BaseModel):
-    pass
+    unread_count: int = 0

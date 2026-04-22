@@ -69,6 +69,21 @@ class TestDashboardTrackingApi:
                     trade_points_count=0,
                     last_imported_at=now,
                 ),
+                ImportedPortfolioPositionDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    source="qmt_virtual:paper_sim",
+                    symbol="000001.SZ",
+                    security_name="平安银行",
+                    current_position=10000.0,
+                    available_position=10000.0,
+                    average_cost=10.0,
+                    market_value=100000.0,
+                    current_position_pct=100.0,
+                    trade_points_json=[],
+                    trade_points_count=0,
+                    last_imported_at=now,
+                ),
             ])
             report_service.create_report(
                 db=db,
@@ -141,6 +156,7 @@ class TestDashboardTrackingApi:
         assert len(body["items"]) == 2
 
         by_symbol = {item["symbol"]: item for item in body["items"]}
+        assert "000001.SZ" not in by_symbol
 
         mt = by_symbol["600519.SH"]
         assert mt["live_price"] == 1723.5
@@ -149,6 +165,8 @@ class TestDashboardTrackingApi:
         assert mt["amount"] == 635000000.0
         assert mt["floating_pnl"] == 11750.0
         assert mt["floating_pnl_pct"] == 1.38
+        assert mt["today_pnl"] == 11750.0
+        assert mt["today_pnl_pct"] == 1.38
         assert mt["analysis"]["trade_date"] == "2026-03-30"
         assert mt["analysis"]["is_previous_trade_day"] is True
         assert mt["analysis"]["high_price"] == 1750.0
@@ -157,6 +175,8 @@ class TestDashboardTrackingApi:
 
         catl = by_symbol["300750.SZ"]
         assert catl["day_open"] == 206.1
+        assert catl["today_pnl"] == 220.0
+        assert catl["today_pnl_pct"] == 0.53
         assert catl["analysis"]["trade_date"] == "2026-03-28"
         assert catl["analysis"]["is_previous_trade_day"] is False
         assert catl["analysis"]["high_price"] == 220.0

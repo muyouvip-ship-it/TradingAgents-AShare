@@ -8,8 +8,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from api.database import ImportedPortfolioPositionDB, ReportDB
+from api.services.portfolio_import_service import is_tracking_board_source
 from tradingagents.dataflows.interface import route_to_vendor
-from tradingagents.dataflows.trade_calendar import cn_today_str, previous_cn_trading_day
+from tradingagents.dataflows.trade_calendar import cn_today_str, is_cn_trading_day, previous_cn_trading_day
 
 
 REFRESH_INTERVAL_SECONDS = 20
@@ -21,12 +22,20 @@ def get_tracking_board(db: Session, user_id: str) -> dict[str, Any]:
     rows = _list_imported_position_rows(db, user_id)
     symbols = [row.symbol for row in rows]
     quotes = _fetch_live_quotes(symbols)
+    market_date = _resolve_latest_market_date(quotes)
     reports = _select_reports_for_symbols(db, user_id, symbols, previous_trade_date)
 
     items: list[dict[str, Any]] = []
     for row in rows:
         quote = quotes.get(row.symbol, {})
         live_price = _to_float(quote.get("price"))
+        previous_close = _to_float(quote.get("previous_close"))
+        price_change = _to_float(quote.get("change"))
+        if price_change is None and live_price is not None and previous_close is not None:
+            price_change = round(live_price - previous_close, 4)
+        price_change_pct = _to_float(quote.get("change_pct"))
+        if price_change_pct is None and price_change is not None and previous_close not in (None, 0):
+            price_change_pct = round((price_change / previous_close) * 100, 4)
         current_position = _to_float(row.current_position)
         average_cost = _to_float(row.average_cost)
         live_market_value = (
@@ -44,6 +53,11 @@ def get_tracking_board(db: Session, user_id: str) -> dict[str, Any]:
             if live_price is not None and average_cost not in (None, 0)
             else None
         )
+        today_pnl = (
+            round(price_change * current_position, 2)
+            if price_change is not None and current_position is not None
+            else None
+        )
 
         items.append(
             {
@@ -57,13 +71,15 @@ def get_tracking_board(db: Session, user_id: str) -> dict[str, Any]:
                 "live_market_value": live_market_value,
                 "floating_pnl": floating_pnl,
                 "floating_pnl_pct": floating_pnl_pct,
+                "today_pnl": today_pnl,
+                "today_pnl_pct": price_change_pct,
                 "live_price": live_price,
                 "day_open": _to_float(quote.get("open")),
-                "price_change": _to_float(quote.get("change")),
-                "price_change_pct": _to_float(quote.get("change_pct")),
+                "price_change": price_change,
+                "price_change_pct": price_change_pct,
                 "day_high": _to_float(quote.get("high")),
                 "day_low": _to_float(quote.get("low")),
-                "previous_close": _to_float(quote.get("previous_close")),
+                "previous_close": previous_close,
                 "volume": _to_float(quote.get("volume")),
                 "amount": _to_float(quote.get("amount")),
                 "quote_time": quote.get("quote_time"),
@@ -74,15 +90,31 @@ def get_tracking_board(db: Session, user_id: str) -> dict[str, Any]:
         )
 
     return {
+        "market_date": market_date,
         "previous_trade_date": previous_trade_date,
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
         "items": items,
     }
 
 
+def _resolve_latest_market_date(quotes: dict[str, dict[str, Any]]) -> str:
+    quote_dates = []
+    for quote in quotes.values():
+        quote_time = str(quote.get("quote_time") or "")
+        if re.match(r"^\d{4}-\d{2}-\d{2}", quote_time):
+            quote_dates.append(quote_time[:10])
+    if quote_dates:
+        return max(quote_dates)
+
+    today = cn_today_str()
+    if quotes and is_cn_trading_day(today):
+        return today
+    return previous_cn_trading_day(today)
+
+
 def _list_imported_position_rows(db: Session, user_id: str) -> list[ImportedPortfolioPositionDB]:
-    """Return all imported positions for a user regardless of source."""
-    return (
+    """Return tracking-board positions only, excluding isolated warehouse sources."""
+    rows = (
         db.query(ImportedPortfolioPositionDB)
         .filter(ImportedPortfolioPositionDB.user_id == user_id)
         .order_by(
@@ -92,6 +124,7 @@ def _list_imported_position_rows(db: Session, user_id: str) -> list[ImportedPort
         )
         .all()
     )
+    return [row for row in rows if is_tracking_board_source(row.source)]
 
 
 def _select_reports_for_symbols(

@@ -10,11 +10,15 @@ import Portfolio from './pages/Portfolio'
 import TrackingBoard from './pages/TrackingBoard'
 import Login from './pages/Login'
 import Feedback from './pages/Feedback'
+import DebugLogs from './pages/DebugLogs'
 import Sponsor from './pages/Sponsor'
 import Thanks from './pages/Thanks'
 import StrategiesV2 from './pages/StrategiesV2'
 import StrategyCreate from './pages/StrategyCreate'
 import Backtest from './pages/Backtest'
+import BacktestResult from './pages/BacktestResult'
+import VirtualWarehouse from './pages/VirtualWarehouse'
+import LiveWarehouse from './pages/LiveWarehouse'
 import { useAuthStore } from './stores/authStore'
 
 const ONLINE_HOST = 'app.510168.xyz'
@@ -67,6 +71,10 @@ function App() {
                   <Route path="/strategies/:id" element={<StrategyCreate />} />
                   <Route path="/strategies/:id/edit" element={<StrategyCreate />} />
                   <Route path="/backtest" element={<Backtest />} />
+                  <Route path="/backtest/runs/:runId" element={<BacktestResult />} />
+                  <Route path="/virtual-warehouse" element={<VirtualWarehouse />} />
+                  <Route path="/live-warehouse" element={<LiveWarehouse />} />
+                  <Route path="/debug/logs" element={<DebugLogs />} />
                   <Route path="/settings" element={<Settings />} />
                   <Route path="/feedback" element={<Feedback />} />
                 </Routes>

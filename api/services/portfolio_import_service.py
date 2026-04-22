@@ -22,6 +22,7 @@ from tradingagents.agents.utils.context_utils import normalize_user_context
 logger = logging.getLogger(__name__)
 
 _CODE_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$")
+_WAREHOUSE_SOURCE_PREFIXES = ("qmt_virtual:", "qmt_live:", "warehouse:")
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ def get_import_state(
 
 
 def list_imported_positions(db: Session, user_id: str) -> list[dict[str, Any]]:
-    """List all imported positions for a user, regardless of source."""
+    """List tracking-board positions for a user, excluding warehouse-only sources."""
     rows = (
         db.query(ImportedPortfolioPositionDB)
         .filter(ImportedPortfolioPositionDB.user_id == user_id)
@@ -158,20 +159,23 @@ def list_imported_positions(db: Session, user_id: str) -> list[dict[str, Any]]:
             "last_imported_at": row.last_imported_at.isoformat() if row.last_imported_at else None,
         }
         for row in rows
+        if is_tracking_board_source(row.source)
     ]
 
 
 def build_scheduled_user_context(db: Session, user_id: str, symbol: str) -> dict[str, Any]:
-    """Build user context for a scheduled analysis from any imported source."""
-    row = (
+    """Build user context for scheduled analysis from tracking-board sources only."""
+    rows = (
         db.query(ImportedPortfolioPositionDB)
         .filter(
             ImportedPortfolioPositionDB.user_id == user_id,
             ImportedPortfolioPositionDB.symbol == (symbol or "").strip().upper(),
         )
-        .first()
+        .order_by(ImportedPortfolioPositionDB.updated_at.desc(), ImportedPortfolioPositionDB.last_imported_at.desc())
+        .all()
     )
-    if not row:
+    row = next((item for item in rows if is_tracking_board_source(item.source)), None)
+    if row is None:
         return {}
 
     payload: dict[str, Any] = {
@@ -185,10 +189,13 @@ def build_scheduled_user_context(db: Session, user_id: str, symbol: str) -> dict
 
 
 def clear_imported_portfolio(db: Session, user_id: str) -> None:
-    """Clear all imported positions for a user, regardless of source."""
-    db.query(ImportedPortfolioPositionDB).filter(
+    """Clear tracking-board imported positions without touching isolated warehouse sources."""
+    rows = db.query(ImportedPortfolioPositionDB).filter(
         ImportedPortfolioPositionDB.user_id == user_id,
-    ).delete()
+    ).all()
+    for row in rows:
+        if is_tracking_board_source(row.source):
+            db.delete(row)
     db.commit()
 
 
@@ -224,3 +231,8 @@ def _to_float(value: Any) -> float | None:
 def _latest_imported_at(positions: list[dict[str, Any]]) -> str | None:
     dates = [p["last_imported_at"] for p in positions if p.get("last_imported_at")]
     return max(dates) if dates else None
+
+
+def is_tracking_board_source(source: str | None) -> bool:
+    value = str(source or "manual").strip().lower()
+    return not value.startswith(_WAREHOUSE_SOURCE_PREFIXES)

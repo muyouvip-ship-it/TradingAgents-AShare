@@ -33,7 +33,7 @@ npm install
 创建 `.env` 文件：
 
 ```env
-VITE_API_URL=http://localhost:8000
+VITE_API_URL=http://localhost:8500
 ```
 
 ### 3. 启动开发服务器
@@ -117,7 +117,7 @@ frontend/
 python -m api.main
 ```
 
-后端默认运行在 http://localhost:8000，已在 vite.config.ts 中配置代理。
+后端默认运行在 http://localhost:8500，已在 `vite.config.ts` 中配置代理。
 
 ## 自定义主题
 

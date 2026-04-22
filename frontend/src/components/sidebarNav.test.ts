@@ -15,4 +15,20 @@ describe('sidebarNav', () => {
         })
         expect(trackingBoardIndex).toBeGreaterThan(dashboardIndex)
     })
+
+    it('includes a debug logs entry in the sidebar', () => {
+        const debugIndex = navItems.findIndex(item => item.path === '/debug/logs')
+
+        expect(debugIndex).toBeGreaterThan(0)
+        expect(navItems[debugIndex]).toMatchObject({
+            path: '/debug/logs',
+            label: '日志调试',
+        })
+    })
+
+    it('keeps virtual, live and tracking warehouses as separate entries', () => {
+        expect(navItems.find(item => item.path === '/virtual-warehouse')).toMatchObject({ label: '虚拟仓' })
+        expect(navItems.find(item => item.path === '/live-warehouse')).toMatchObject({ label: '实盘仓' })
+        expect(navItems.find(item => item.path === '/tracking-board')).toMatchObject({ label: '跟踪看板' })
+    })
 })

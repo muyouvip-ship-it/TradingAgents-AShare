@@ -37,3 +37,12 @@ class RequireUser:
 
 require_api_user = RequireUser(allow_api_token=True)
 require_web_user = RequireUser(allow_api_token=False)
+
+
+def optional_web_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme)) -> Optional[UserDB]:
+    if not credentials:
+        return None
+    try:
+        return RequireUser(allow_api_token=False)(credentials)
+    except HTTPException:
+        return None

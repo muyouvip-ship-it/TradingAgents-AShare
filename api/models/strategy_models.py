@@ -7,8 +7,7 @@
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import Column, String, Integer, Boolean, Float, Text, DateTime, Date, JSON, ForeignKey, Enum, Index
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import declarative_base, relationship
 import enum
 import uuid
 
@@ -316,6 +315,73 @@ class TradeRecordDB(Base):
         }
 
 
+class PaperAccountDB(Base):
+    """纸交易账户表"""
+    __tablename__ = "paper_accounts"
+
+    id = Column(String(64), primary_key=True)
+    name = Column(String(200), nullable=False, comment="账户名称")
+    initial_capital = Column(Float, default=1_000_000.0, comment="初始资金")
+    cash = Column(Float, default=1_000_000.0, comment="当前现金")
+    status = Column(String(20), default="active", comment="账户状态")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "initial_capital": self.initial_capital,
+            "cash": self.cash,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PaperOrderDB(Base):
+    """纸交易订单表"""
+    __tablename__ = "paper_orders"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    account_id = Column(String(64), ForeignKey("paper_accounts.id"), nullable=False, comment="纸交易账户ID")
+    strategy_id = Column(String(36), ForeignKey("strategies.id"), nullable=False, comment="策略ID")
+    symbol = Column(String(20), nullable=False, comment="股票代码")
+    side = Column(String(10), nullable=False, comment="买卖方向")
+    quantity = Column(Float, nullable=False, comment="数量")
+    price = Column(Float, nullable=False, comment="价格")
+    commission = Column(Float, default=0.0, comment="手续费")
+    slippage = Column(Float, default=0.0, comment="滑点")
+    stamp_duty = Column(Float, default=0.0, comment="印花税")
+    order_type = Column(String(20), default="strategy_signal", comment="订单类型")
+    status = Column(String(20), default="filled", comment="订单状态")
+    reason = Column(Text, comment="触发原因")
+    executed_at = Column(DateTime, default=datetime.now, comment="成交时间")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+
+    account = relationship("PaperAccountDB")
+    strategy = relationship("StrategyDB")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "account_id": self.account_id,
+            "strategy_id": self.strategy_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "quantity": self.quantity,
+            "price": self.price,
+            "commission": self.commission,
+            "slippage": self.slippage,
+            "stamp_duty": self.stamp_duty,
+            "order_type": self.order_type,
+            "status": self.status,
+            "reason": self.reason,
+            "executed_at": self.executed_at.isoformat() if self.executed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 # ============================================================
 # 股票日K线数据表
 # ============================================================
@@ -450,6 +516,55 @@ class FactorDB(Base):
         }
 
 
+class EvolutionExperimentDB(Base):
+    """策略进化实验表"""
+    __tablename__ = "strategy_evolution_experiments"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    strategy_id = Column(String(36), ForeignKey("strategies.id"), nullable=False, index=True, comment="基础策略ID")
+    objective = Column(String(100), nullable=False, comment="优化目标")
+    status = Column(String(30), default="completed", comment="实验状态")
+    progress = Column(Float, default=1.0, comment="实验进度")
+    search_space = Column(JSON, comment="搜索空间")
+    base_backtest_run_id = Column(String(36), nullable=True, comment="基准回测ID")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    strategy = relationship("StrategyDB")
+    candidates = relationship(
+        "EvolutionCandidateDB",
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        order_by="EvolutionCandidateDB.score.desc()",
+    )
+
+
+class EvolutionCandidateDB(Base):
+    """策略进化候选表"""
+    __tablename__ = "strategy_evolution_candidates"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    experiment_id = Column(
+        String(36),
+        ForeignKey("strategy_evolution_experiments.id"),
+        nullable=False,
+        index=True,
+        comment="实验ID",
+    )
+    name = Column(String(200), nullable=False, comment="候选名称")
+    score = Column(Float, default=0.0, comment="候选评分")
+    status = Column(String(30), default="candidate", comment="候选状态")
+    improvement_summary = Column(Text, comment="改进摘要")
+    risk_flags = Column(JSON, comment="风险标记")
+    metrics = Column(JSON, comment="候选绩效指标")
+    dsl_patch = Column(JSON, comment="DSL 补丁")
+    accepted_at = Column(DateTime, comment="接受时间")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    experiment = relationship("EvolutionExperimentDB", back_populates="candidates")
+
+
 # 数据库初始化函数
 def init_database(engine):
     """初始化数据库表"""
@@ -459,6 +574,6 @@ def init_database(engine):
 
 if __name__ == "__main__":
     # 测试数据库创建
-    from sqlalchemy import create_engine
-    engine = create_engine("sqlite:///strategy_management.db")
-    init_database(engine)
+    from api.core.strategy_db import strategy_engine
+
+    init_database(strategy_engine)

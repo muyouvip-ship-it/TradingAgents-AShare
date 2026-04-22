@@ -66,6 +66,13 @@ def _auth(client: TestClient) -> str:
     return r2.json()["access_token"]
 
 
+def _get_user_id_from_token(token: str) -> str:
+    from api.services import auth_service
+
+    payload = auth_service.decode_access_token(token)
+    return str(payload["sub"])
+
+
 def _auth_unique(client: TestClient) -> str:
     from api.database import UserDB, get_db_ctx, init_db
     from api.services import auth_service
@@ -244,6 +251,114 @@ class TestChatCompletionsEndpoint:
         result = _wait_job(self.client, self.token, job_id)
         assert result["status"] == "completed"
         assert result["decision"] == "DRY_RUN"
+
+    def test_chat_completion_uses_fallback_symbol_from_request(self):
+        """When prompt omits stock text, current page symbol can be used as fallback."""
+        with patch("api.main._ai_extract_symbol_and_date", return_value=(None, None, ["short"], [], [], {})):
+            r = self.client.post("/v1/chat/completions", headers=self.headers, json={
+                "messages": [{"role": "user", "content": "帮我看一下今天还能不能继续拿"}],
+                "symbol": "600519.SH",
+                "stream": False,
+                "dry_run": True,
+            })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"].startswith("chatcmpl-")
+        job_id = body["id"].replace("chatcmpl-", "")
+        result = _wait_job(self.client, self.token, job_id)
+        assert result["status"] == "completed"
+        assert result["result"]["symbol"] == "600519.SH"
+
+    def test_non_stream_chat_completion_runs_background_job(self):
+        """Non-streaming non-dry-run chat starts the real background analysis job."""
+        async def fake_background_job(job_id, symbol, trade_date, query, user_id, selected_analysts):
+            from api import main as compat
+
+            result = {
+                "status": "completed",
+                "decision": "BUY",
+                "job_id": job_id,
+                "symbol": symbol,
+                "trade_date": trade_date,
+                "query": query,
+                "selected_analysts": selected_analysts,
+                "analysis_mode": "deep",
+            }
+            compat._set_job(
+                job_id,
+                user_id=user_id,
+                status="completed",
+                decision="BUY",
+                symbol=symbol,
+                trade_date=trade_date,
+                result=result,
+            )
+
+        with (
+            patch("api.main._ai_extract_symbol_and_date", return_value=("600519.SH", "2024-01-15", ["short"], [], [], {})),
+            patch("api.routes.chat._run_background_analysis_job", side_effect=fake_background_job),
+        ):
+            r = self.client.post("/v1/chat/completions", headers=self.headers, json={
+                "messages": [{"role": "user", "content": "分析600519短线机会"}],
+                "stream": False,
+                "dry_run": False,
+                "selected_analysts": ["market", "news"],
+            })
+        assert r.status_code == 200
+        body = r.json()
+        job_id = body["id"].replace("chatcmpl-", "")
+        result = _wait_job(self.client, self.token, job_id)
+        assert result["status"] == "completed"
+        assert result["decision"] == "BUY"
+        assert result["result"]["analysis_mode"] == "deep"
+        assert result["result"]["selected_analysts"] == ["market", "news"]
+
+    def test_job_status_includes_progress_fields(self):
+        from api import main as compat
+
+        compat._set_job(
+            "job-progress-1",
+            user_id=_get_user_id_from_token(self.token),
+            status="running",
+            current_agent="Market Analyst",
+            current_stage="streaming_report",
+            analysis_stage="market_analysis",
+            progress={
+                "current_agent": "Market Analyst",
+                "current_stage": "streaming_report",
+                "analysis_stage": "market_analysis",
+                "status": {"Market Analyst": "in_progress"},
+                "debate": {"name": None, "agent": None, "round": None, "is_verdict": False},
+                "completed_agents": [],
+                "has_streamed_content": True,
+            },
+        )
+        r = self.client.get("/v1/jobs/job-progress-1", headers=self.headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["current_agent"] == "Market Analyst"
+        assert body["current_stage"] == "streaming_report"
+        assert body["analysis_stage"] == "market_analysis"
+        assert body["progress"]["status"]["Market Analyst"] == "in_progress"
+
+    def test_streaming_chat_completion_emits_job_events(self):
+        with patch("api.main._ai_extract_symbol_and_date", return_value=("600519.SH", "2024-01-15", ["short"], [], [], {})):
+            with self.client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=self.headers,
+                json={
+                    "messages": [{"role": "user", "content": "分析 600519.SH 今天走势"}],
+                    "stream": True,
+                },
+            ) as response:
+                assert response.status_code == 200
+                assert response.headers["content-type"].startswith("text/event-stream")
+                body = "".join(response.iter_text())
+        assert "event: job.created" in body
+        assert "event: job.completed" in body
+        assert "event: job.failed" not in body
+        assert "event: done" in body
 
     def test_requires_auth(self):
         r = self.client.post("/v1/chat/completions", json={

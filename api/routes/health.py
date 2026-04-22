@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict
 
 from fastapi import APIRouter, Body, Depends, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from api.database import VersionStatsDB, get_db
@@ -16,8 +17,8 @@ _VS_RATE_INTERVAL = 3600
 
 
 @router.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
 
 @router.post("/api/version-stats")

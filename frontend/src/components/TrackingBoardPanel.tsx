@@ -64,6 +64,10 @@ export default function TrackingBoardPanel() {
         (sum, item) => sum + (item.floating_pnl ?? 0),
         0,
     )
+    const todayPnlTotal = trackingItems.reduce(
+        (sum, item) => sum + (item.today_pnl ?? 0),
+        0,
+    )
     const lastQuoteTime = useMemo(() => {
         const values = trackingItems
             .map(item => item.quote_time)
@@ -231,7 +235,7 @@ export default function TrackingBoardPanel() {
                         自动刷新：{trackingRefreshSeconds}s
                     </span>
                     <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-700/70">
-                        上一交易日：{trackingBoard?.previous_trade_date || '--'}
+                        最新行情日：{trackingBoard?.market_date || trackingBoard?.previous_trade_date || '--'}
                     </span>
                     <ViewModeSwitch value={viewMode} onChange={setViewMode} />
                 </div>
@@ -337,6 +341,7 @@ export default function TrackingBoardPanel() {
                     trackingError={trackingError}
                     liveMarketValueTotal={liveMarketValueTotal}
                     floatingPnlTotal={floatingPnlTotal}
+                    todayPnlTotal={todayPnlTotal}
                     onAnalyze={symbol => navigate(`/analysis?symbol=${symbol}`)}
                     onOpenReport={reportId => navigate(`/reports?report=${reportId}`)}
                 />
@@ -399,7 +404,7 @@ function SimpleBoardView({
                             <span>当日区间</span>
                             <RangeInfoTooltip variant="simple" />
                         </div>
-                        <div>持仓盈亏%</div>
+                        <div>盈亏</div>
                         <div>成交量 / 成交额</div>
                     </div>
 
@@ -428,6 +433,7 @@ function SimpleTrackingRow({ item }: { item: TrackingBoardItem }) {
         ? 'bg-emerald-500'
         : 'bg-rose-500'
     const holdingChangePct = item.floating_pnl_pct ?? null
+    const todayPnl = item.today_pnl ?? null
     const priceColor = priceChangePct == null
         ? 'text-slate-800 dark:text-slate-200'
         : isUp
@@ -494,15 +500,16 @@ function SimpleTrackingRow({ item }: { item: TrackingBoardItem }) {
             </div>
 
             <div className="self-center">
-                <span className={`inline-flex min-w-[96px] items-center justify-center rounded-full px-3 py-2 text-[16px] font-semibold ${
+                <div className={`inline-flex min-w-[120px] flex-col items-center justify-center rounded-2xl px-3 py-2 text-[13px] font-semibold ${
                     holdingChangePct == null
                         ? 'bg-slate-100 text-slate-400 dark:bg-slate-800 dark:text-slate-500'
                         : holdingChangePct >= 0
                             ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-400'
                             : 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400'
                 }`}>
-                    {formatSignedPercent(holdingChangePct)}
-                </span>
+                    <span>{formatSignedPercent(holdingChangePct)}</span>
+                    <span className="mt-0.5 text-[11px] opacity-80">今 {formatSignedMoney(todayPnl)}</span>
+                </div>
             </div>
 
             <div className="self-center space-y-1 text-[15px] text-slate-700 dark:text-slate-200">
@@ -592,6 +599,7 @@ function DetailedBoardView({
     trackingError,
     liveMarketValueTotal,
     floatingPnlTotal,
+    todayPnlTotal,
     onAnalyze,
     onOpenReport,
 }: {
@@ -600,6 +608,7 @@ function DetailedBoardView({
     trackingError: string | null
     liveMarketValueTotal: number
     floatingPnlTotal: number
+    todayPnlTotal: number
     onAnalyze: (symbol: string) => void
     onOpenReport: (reportId: string) => void
 }) {
@@ -621,7 +630,7 @@ function DetailedBoardView({
                 <BoardStatChip
                     label="浮动盈亏"
                     value={formatSignedMoney(floatingPnlTotal)}
-                    subValue={trackingError ? `最近刷新异常：${trackingError}` : `价格源：${items.filter(item => item.quote_source).length}/${items.length} 已更新`}
+                    subValue={trackingError ? `最近刷新异常：${trackingError}` : `今日盈亏 ${formatSignedMoney(todayPnlTotal)}`}
                     tone={floatingPnlTotal >= 0 ? 'rose' : 'amber'}
                     loading={trackingRefreshing}
                 />
@@ -656,6 +665,8 @@ function DetailedTrackingRow({
 }) {
     const priceChangePct = item.price_change_pct ?? null
     const floatingPnl = item.floating_pnl ?? null
+    const todayPnl = item.today_pnl ?? null
+    const todayPnlPct = item.today_pnl_pct ?? item.price_change_pct ?? null
     const analysis = item.analysis
     const rangeAlert = getModelRangeAlert(item)
     const rangeLabel = analysis?.is_previous_trade_day ? '昨日报告高低位' : `最近报告高低位 · ${analysis?.trade_date || '--'}`
@@ -804,8 +815,12 @@ function DetailedTrackingRow({
                             </div>
                         </div>
                         <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-500 dark:text-slate-400">
+                            <MetricPill label="今日盈亏" value={formatSignedMoney(todayPnl)} />
+                            <MetricPill label="今日涨跌" value={formatSignedPercent(todayPnlPct)} />
                             <MetricPill label="动态市值" value={formatMoney(item.live_market_value ?? item.market_value)} />
                             <MetricPill label="静态市值" value={formatMoney(item.market_value)} />
+                        </div>
+                        <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500 dark:text-slate-400">
                             <MetricPill label="成交额" value={formatAmount(item.amount)} />
                             <MetricPill label="价格源" value={formatQuoteSource(item.quote_source)} />
                         </div>

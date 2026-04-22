@@ -123,6 +123,28 @@ class TestPortfolioImportService:
         state = portfolio_import_service.get_import_state(db, "user-clear")
         assert state["summary"]["positions"] == 0
 
+    def test_qmt_warehouse_sources_are_hidden_from_tracking_board_state(self, db):
+        from api.database import ImportedPortfolioPositionDB
+        from api.services import portfolio_import_service
+
+        now = datetime.now(timezone.utc)
+        db.add(ImportedPortfolioPositionDB(
+            id=uuid4().hex,
+            user_id="user-isolated",
+            source="qmt_virtual:paper_sim",
+            symbol="000001.SZ",
+            security_name="平安银行",
+            current_position=1000,
+            average_cost=10.0,
+            market_value=10000.0,
+            last_imported_at=now,
+        ))
+        db.commit()
+
+        state = portfolio_import_service.get_import_state(db, "user-isolated")
+        assert state["summary"]["positions"] == 0
+        assert portfolio_import_service.build_scheduled_user_context(db, "user-isolated", "000001.SZ") == {}
+
     def test_scheduled_job_uses_imported_position_context(self, db):
         from api.main import _run_scheduled_job
         from api.services import portfolio_import_service

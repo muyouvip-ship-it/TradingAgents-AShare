@@ -12,19 +12,13 @@ sys.path.insert(0, str(project_root))
 
 import asyncio
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 import pandas as pd
 import numpy as np
 
 # 导入模块
+from api.core.strategy_db import StrategySessionLocal
 from api.models.strategy_models import StrategyDB, BacktestJobDB
 from tradingagents.backtest.engine_v2 import BacktestEngine
-
-# 数据库配置
-DB_PATH = project_root / "data" / "strategy_management.db"
-engine = create_engine(f"sqlite:///{DB_PATH}")
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def generate_mock_data(start_date: datetime, end_date: datetime) -> pd.DataFrame:
@@ -66,7 +60,7 @@ def generate_mock_data(start_date: datetime, end_date: datetime) -> pd.DataFrame
 
 async def run_backtest(job_id: str):
     """执行回测任务"""
-    db = SessionLocal()
+    db = StrategySessionLocal()
     
     try:
         # 获取任务信息
@@ -172,7 +166,7 @@ def main():
     print("策略回测测试")
     print("=" * 60)
     
-    db = SessionLocal()
+    db = StrategySessionLocal()
     
     try:
         # 获取所有策略

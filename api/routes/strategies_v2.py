@@ -21,25 +21,11 @@ from api.models.strategy_models import (
     StrategyType,
     StrategyStatus,
 )
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import Session
+
+from api.core.strategy_db import get_strategy_db
 
 logger = logging.getLogger(__name__)
-
-# 数据库配置
-DB_PATH = "/Users/wolf/Documents/DaiMa/TradingAgents-AShare-main/data/strategy_management.db"
-engine = create_engine(f"sqlite:///{DB_PATH}")
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-# 数据库依赖
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 
 # ============ Pydantic 模型定义 ============
 
@@ -140,7 +126,7 @@ router = APIRouter(prefix="/api/v1/strategies", tags=["Strategies"])
 
 
 @router.post("", response_model=StrategyResponse, summary="创建策略")
-async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_db)):
+async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_strategy_db)):
     """
     创建新策略
 
@@ -190,7 +176,7 @@ async def list_strategies(
     search: Optional[str] = Query(None, max_length=100),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_strategy_db),
 ):
     """
     获取策略列表
@@ -241,7 +227,7 @@ async def list_strategies(
 
 
 @router.get("/{strategy_id}", response_model=StrategyResponse, summary="获取策略详情")
-async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
+async def get_strategy(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """获取单个策略的详细信息"""
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -262,7 +248,7 @@ async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
 async def update_strategy(
     strategy_id: str,
     request: StrategyUpdateRequest,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_strategy_db),
 ):
     """
     更新策略信息
@@ -308,7 +294,7 @@ async def update_strategy(
 
 
 @router.delete("/{strategy_id}", summary="删除策略")
-async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
+async def delete_strategy(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """删除策略"""
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -353,7 +339,7 @@ async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{strategy_id}/activate", summary="激活策略")
-async def activate_strategy(strategy_id: str, db: Session = Depends(get_db)):
+async def activate_strategy(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """激活策略（开始运行）"""
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -386,7 +372,7 @@ async def activate_strategy(strategy_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{strategy_id}/deactivate", summary="停用策略")
-async def deactivate_strategy(strategy_id: str, db: Session = Depends(get_db)):
+async def deactivate_strategy(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """停用策略（暂停运行）"""
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -419,7 +405,7 @@ async def deactivate_strategy(strategy_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{strategy_id}/clone", response_model=StrategyResponse, summary="克隆策略")
-async def clone_strategy(strategy_id: str, db: Session = Depends(get_db)):
+async def clone_strategy(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """克隆策略（创建副本）"""
     try:
         original = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -459,7 +445,7 @@ async def clone_strategy(strategy_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{strategy_id}/performance", summary="获取策略绩效")
-async def get_strategy_performance(strategy_id: str, db: Session = Depends(get_db)):
+async def get_strategy_performance(strategy_id: str, db: Session = Depends(get_strategy_db)):
     """获取策略绩效数据"""
     try:
         strategy = db.query(StrategyDB).filter(StrategyDB.id == strategy_id).first()
@@ -507,7 +493,7 @@ async def get_strategy_performance(strategy_id: str, db: Session = Depends(get_d
 # ============ 统计接口 ============
 
 @router.get("/stats/summary", summary="获取策略统计概览")
-async def get_strategy_stats(db: Session = Depends(get_db)):
+async def get_strategy_stats(db: Session = Depends(get_strategy_db)):
     """获取策略统计概览"""
     try:
         total = db.query(StrategyDB).count()

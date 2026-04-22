@@ -3,14 +3,13 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
-
-from sqlalchemy import create_engine
 
 from api.core.settings import settings
+from api.core.strategy_db import strategy_engine
 from api.database import init_db
 from api.job_store import get_job_store
 from api.models.strategy_models import Base
+from api.services import qmt_sync_scheduler_service
 
 
 def _log(msg: str):
@@ -25,10 +24,7 @@ async def lifespan(app):
     init_db()
     _log("Database initialized.")
 
-    # 初始化策略管理数据库
-    db_path = Path(settings.strategy_db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    strategy_engine = create_engine(f"sqlite:///{db_path}")
+    # 初始化策略管理数据库（优先复用 PostgreSQL）
     Base.metadata.create_all(strategy_engine)
     _log("Strategy management database initialized.")
 
@@ -49,5 +45,8 @@ async def lifespan(app):
     _log("Trade calendar pre-loaded.")
     await asyncio.to_thread(load_cn_stock_map)
     _log("Stock map pre-loaded on startup.")
+    await qmt_sync_scheduler_service.start_background_worker()
+    _log("QMT sync background worker started.")
     yield
+    await qmt_sync_scheduler_service.stop_background_worker()
     _log("Shutting down: Cleaning up resources...")

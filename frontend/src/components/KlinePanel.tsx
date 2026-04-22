@@ -5,8 +5,12 @@ import {
     CandlestickSeries,
     ColorType,
     IChartApi,
+    ISeriesMarkersPluginApi,
     ISeriesApi,
     MouseEventParams,
+    SeriesMarker,
+    Time,
+    createSeriesMarkers,
     createChart,
 } from 'lightweight-charts'
 import { Activity, CandlestickChart } from 'lucide-react'
@@ -17,6 +21,12 @@ import { useAnalysisStore } from '@/stores/analysisStore'
 interface KlinePanelProps {
     symbol: string
     onSymbolChange?: (symbol: string) => void
+    markers?: Array<{
+        date: string
+        side: 'buy' | 'sell'
+        text?: string
+        color?: string
+    }>
 }
 
 function toDateText(date: Date): string {
@@ -76,11 +86,12 @@ const INDEX_PRESETS = [
     { symbol: '899050.BJ', label: '北证50' },
 ] as const
 
-export default function KlinePanel({ symbol, onSymbolChange }: KlinePanelProps) {
+export default function KlinePanel({ symbol, onSymbolChange, markers = [] }: KlinePanelProps) {
     const currentAnalysisSymbol = useAnalysisStore((state) => state.currentSymbol)
     const containerRef = useRef<HTMLDivElement | null>(null)
     const chartRef = useRef<IChartApi | null>(null)
     const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+    const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [isDark, setIsDark] = useState(document.documentElement.classList.contains('dark'))
@@ -158,9 +169,11 @@ export default function KlinePanel({ symbol, onSymbolChange }: KlinePanelProps) 
             wickDownColor: '#22c55e',
             borderVisible: false,
         })
+        const seriesMarkers = createSeriesMarkers(series, [])
 
         chartRef.current = chart
         seriesRef.current = series
+        markersRef.current = seriesMarkers
         if (candlesRef.current.length) {
             const existingData: CandlestickData[] = candlesRef.current.flatMap((c) => {
                 const time = toBusinessDay((c.date || '').slice(0, 10))
@@ -212,6 +225,7 @@ export default function KlinePanel({ symbol, onSymbolChange }: KlinePanelProps) 
             chartRef.current?.remove()
             chartRef.current = null
             seriesRef.current = null
+            markersRef.current = null
         }
     }, [isDark])
 
@@ -261,6 +275,22 @@ export default function KlinePanel({ symbol, onSymbolChange }: KlinePanelProps) 
             cancelled = true
         }
     }, [range.end, range.start, symbol])
+
+    useEffect(() => {
+        if (!markersRef.current) return
+        const nextMarkers: SeriesMarker<Time>[] = markers.flatMap((marker) => {
+            const time = toBusinessDay((marker.date || '').slice(0, 10))
+            if (!time) return []
+            return [{
+                time,
+                position: marker.side === 'buy' ? 'belowBar' : 'aboveBar',
+                shape: marker.side === 'buy' ? 'arrowUp' : 'arrowDown',
+                color: marker.color || (marker.side === 'buy' ? '#ef4444' : '#22c55e'),
+                text: marker.text || (marker.side === 'buy' ? '买' : '卖'),
+            }]
+        })
+        markersRef.current.setMarkers(nextMarkers)
+    }, [markers])
 
     const panelCandle = activeCandle ?? (candles.length ? candles[candles.length - 1] : null)
     const panelChange = panelCandle?.change ?? (panelCandle ? panelCandle.close - panelCandle.open : null)
