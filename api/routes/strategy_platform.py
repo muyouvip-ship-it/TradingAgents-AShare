@@ -512,7 +512,7 @@ def _make_strategy(
 
 
 def _first_day_band_dsl() -> StrategyDsl:
-    dsl = _default_dsl("selection").model_dump()
+    dsl = _default_dsl("trading").model_dump()
     dsl["universe"]["include_concepts"] = []
     dsl["universe"]["filters"] = []
     dsl["factor_model"] = {
@@ -530,13 +530,24 @@ def _first_day_band_dsl() -> StrategyDsl:
         ],
         "select": {"top_n": 200, "min_score": 0.5},
     }
-    dsl["entry"] = {"logic": "all", "conditions": []}
-    dsl["exit"] = {"logic": "any", "conditions": []}
+    dsl["entry"] = {
+        "logic": "all",
+        "conditions": [
+            {"type": "cross_above", "timeframe": "1d", "left": "first_day_band", "right": "first_day_band_b1"}
+        ],
+    }
+    dsl["exit"] = {
+        "logic": "any",
+        "conditions": [
+            {"type": "cross_below", "timeframe": "1d", "left": "first_day_band", "right": "first_day_band_b1"}
+        ],
+    }
     dsl["position"]["method"] = "equal_weight"
     dsl["position"]["max_single_position_pct"] = 0.05
     dsl["risk"]["max_positions"] = 20
-    dsl["risk"]["stop_loss_pct"] = 0.06
-    dsl["risk"]["take_profit_pct"] = 0.18
+    dsl["risk"]["stop_loss_pct"] = 0.99
+    dsl["risk"]["take_profit_pct"] = 5.0
+    dsl["risk"]["trailing_stop_pct"] = 1.0
     dsl["evolution"] = {"enabled": True, "method": "trade_snapshot_attribution", "require_user_confirmation": True}
     return StrategyDsl(**dsl)
 
@@ -1042,14 +1053,14 @@ def _seed_strategies() -> list[StrategyDefinition]:
             tags=["A股", "交易策略", "趋势突破", "高收益"],
         ),
         _make_strategy(
-            "首日波段金叉选股策略",
-            "selection",
+            "首日波段交易策略",
+            "trading",
             "draft",
-            "由同花顺波段公式改写：波段线首日上穿 B1 时入选，适合做日线波段启动首日候选池。",
+            "由同花顺波段公式改写：波段线上穿 B1 金叉买入，波段线下穿 B1 死叉卖出。",
             "manual",
             StrategyPerformance(total_return=0.182, annual_return=0.214, sharpe_ratio=1.52, max_drawdown=-0.082, win_rate=0.673, calmar_ratio=2.61),
             dsl=_first_day_band_dsl(),
-            tags=["A股", "同花顺指标", "首日波段", "选股策略"],
+            tags=["A股", "同花顺指标", "首日波段", "交易策略"],
         ),
         _make_strategy(
             "算力高景气优选选股策略",
@@ -1340,10 +1351,28 @@ def _strategy_definition_from_payload(payload: dict[str, Any]) -> StrategyDefini
 
 def _ensure_seed_strategies(db: Session) -> None:
     Base.metadata.create_all(strategy_engine)
-    existing_names = {item.get("name") for item in list_platform_strategies(db)}
+    existing = list_platform_strategies(db)
+    existing_names = {item.get("name") for item in existing}
+    legacy_name = "首日波段金叉选股策略"
     for seed in _seed_strategies():
+        if seed.name == "首日波段交易策略" and legacy_name in existing_names:
+            continue
         if seed.name not in existing_names:
             save_platform_strategy(db, seed.model_dump())
+    target_seed = next((seed for seed in _seed_strategies() if seed.name == "首日波段交易策略"), None)
+    if target_seed is not None:
+        for item in existing:
+            if item.get("name") != legacy_name:
+                continue
+            migrated = target_seed.model_dump()
+            migrated["id"] = item["id"]
+            migrated["created_at"] = item.get("created_at") or migrated["created_at"]
+            migrated["run_count"] = item.get("run_count") or 0
+            migrated["last_run_time"] = item.get("last_run_time")
+            if migrated.get("current_version"):
+                migrated["current_version"]["strategy_id"] = item["id"]
+            migrated["versions"] = [migrated["current_version"]] if migrated.get("current_version") else []
+            save_platform_strategy(db, migrated)
 
 
 @router.get("/v1/factors", response_model=FactorRegistryListResponse)

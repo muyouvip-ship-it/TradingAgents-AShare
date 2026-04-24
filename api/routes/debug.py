@@ -20,6 +20,7 @@ LOG_SOURCES: dict[str, tuple[str, Path]] = {
     "backend": ("后端主日志", PROJECT_ROOT / "backend.log"),
     "backend_runtime": ("后端运行日志", PROJECT_ROOT / "backend.runtime.log"),
     "frontend_runtime": ("前端运行日志", PROJECT_ROOT / "frontend" / "frontend.runtime.log"),
+    "realtime_monitor": ("实时监控日志", PROJECT_ROOT / "realtime_monitor.runtime.log"),
 }
 
 

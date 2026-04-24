@@ -382,6 +382,153 @@ class PaperOrderDB(Base):
         }
 
 
+class RealtimeMonitorDB(Base):
+    """实时监控实例表。"""
+
+    __tablename__ = "realtime_monitors"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(64), index=True, nullable=False, comment="用户ID")
+    name = Column(String(200), nullable=False, comment="监控实例名称")
+    account_key = Column(String(64), index=True, nullable=False, comment="QMT账户Key")
+    account_role = Column(String(20), default="paper", comment="账户角色: paper/live")
+    strategy_id = Column(String(36), ForeignKey("strategies.id"), nullable=False, comment="策略ID")
+    strategy_version_id = Column(String(64), nullable=True, comment="策略版本ID")
+    status = Column(String(20), default="ready", index=True, comment="draft/ready/running/paused/halted/fused/error")
+    execution_mode = Column(String(20), default="auto", comment="auto/monitor_only")
+    auto_trade_enabled = Column(Boolean, default=True, comment="是否允许自动交易")
+    live_trading_enabled = Column(Boolean, default=False, comment="是否允许实盘自动交易")
+    quote_source = Column(String(32), default="qmt", comment="行情来源")
+    monitor_pool_json = Column(JSON, nullable=True, comment="监控池配置与最近解析结果")
+    config_json = Column(JSON, nullable=True, comment="运行配置")
+    risk_config_json = Column(JSON, nullable=True, comment="风控配置")
+    state_json = Column(JSON, nullable=True, comment="运行状态快照")
+    last_heartbeat_at = Column(DateTime, nullable=True, comment="最近心跳")
+    fused_reason = Column(Text, nullable=True, comment="熔断原因")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    strategy = relationship("StrategyDB")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "account_key": self.account_key,
+            "account_role": self.account_role,
+            "strategy_id": self.strategy_id,
+            "strategy_version_id": self.strategy_version_id,
+            "status": self.status,
+            "execution_mode": self.execution_mode,
+            "auto_trade_enabled": bool(self.auto_trade_enabled),
+            "live_trading_enabled": bool(self.live_trading_enabled),
+            "quote_source": self.quote_source,
+            "monitor_pool": self.monitor_pool_json or {},
+            "config": self.config_json or {},
+            "risk_config": self.risk_config_json or {},
+            "state": self.state_json or {},
+            "last_heartbeat_at": self.last_heartbeat_at.isoformat() if self.last_heartbeat_at else None,
+            "fused_reason": self.fused_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class RealtimeEventDB(Base):
+    """实时监控事件表，保留完整事件回放。"""
+
+    __tablename__ = "realtime_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    monitor_id = Column(String(36), ForeignKey("realtime_monitors.id"), index=True, nullable=False, comment="监控实例ID")
+    user_id = Column(String(64), index=True, nullable=False, comment="用户ID")
+    event_type = Column(String(64), index=True, nullable=False, comment="事件类型")
+    account_key = Column(String(64), index=True, nullable=True, comment="账户Key")
+    strategy_id = Column(String(36), index=True, nullable=True, comment="策略ID")
+    strategy_version_id = Column(String(64), nullable=True, comment="策略版本ID")
+    symbol = Column(String(20), index=True, nullable=True, comment="股票代码")
+    trade_time = Column(DateTime, nullable=True, comment="交易时间")
+    payload = Column(JSON, nullable=True, comment="通用事件载荷")
+    signal_payload = Column(JSON, nullable=True, comment="信号载荷")
+    risk_payload = Column(JSON, nullable=True, comment="风控载荷")
+    order_payload = Column(JSON, nullable=True, comment="委托载荷")
+    broker_result = Column(JSON, nullable=True, comment="券商/QMT返回")
+    error_payload = Column(JSON, nullable=True, comment="错误载荷")
+    request_id = Column(String(64), index=True, nullable=True, comment="请求ID")
+    correlation_id = Column(String(64), index=True, nullable=True, comment="关联ID")
+    created_at = Column(DateTime, default=datetime.now, index=True, comment="创建时间")
+
+    monitor = relationship("RealtimeMonitorDB")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "monitor_id": self.monitor_id,
+            "user_id": self.user_id,
+            "event_type": self.event_type,
+            "account_key": self.account_key,
+            "strategy_id": self.strategy_id,
+            "strategy_version_id": self.strategy_version_id,
+            "symbol": self.symbol,
+            "trade_time": self.trade_time.isoformat() if self.trade_time else None,
+            "payload": self.payload or {},
+            "signal_payload": self.signal_payload or {},
+            "risk_payload": self.risk_payload or {},
+            "order_payload": self.order_payload or {},
+            "broker_result": self.broker_result or {},
+            "error_payload": self.error_payload or {},
+            "request_id": self.request_id,
+            "correlation_id": self.correlation_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class RealtimeApprovalDB(Base):
+    """实时监控人工确认任务表。"""
+
+    __tablename__ = "realtime_approvals"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    monitor_id = Column(String(36), ForeignKey("realtime_monitors.id"), index=True, nullable=False, comment="监控实例ID")
+    user_id = Column(String(64), index=True, nullable=False, comment="用户ID")
+    account_key = Column(String(64), index=True, nullable=False, comment="账户Key")
+    strategy_id = Column(String(36), index=True, nullable=True, comment="策略ID")
+    symbol = Column(String(20), index=True, nullable=True, comment="股票代码")
+    side = Column(String(10), nullable=True, comment="方向")
+    status = Column(String(20), default="pending", index=True, comment="pending/approved/rejected/executed")
+    reason = Column(Text, nullable=True, comment="确认原因")
+    order_intent_json = Column(JSON, nullable=True, comment="委托意图")
+    decision_json = Column(JSON, nullable=True, comment="人工决策")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+    decided_at = Column(DateTime, nullable=True, comment="决策时间")
+
+    monitor = relationship("RealtimeMonitorDB")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "monitor_id": self.monitor_id,
+            "user_id": self.user_id,
+            "account_key": self.account_key,
+            "strategy_id": self.strategy_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "status": self.status,
+            "reason": self.reason,
+            "order_intent": self.order_intent_json or {},
+            "decision": self.decision_json or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
+Index("idx_realtime_events_monitor_created", RealtimeEventDB.monitor_id, RealtimeEventDB.created_at)
+Index("idx_realtime_approvals_user_status", RealtimeApprovalDB.user_id, RealtimeApprovalDB.status)
+
+
 # ============================================================
 # 股票日K线数据表
 # ============================================================

@@ -31,6 +31,7 @@ class Settings:
     qmt_userdata_path: str = os.getenv("QMT_USERDATA_PATH", "")
     qmt_refresh_interval_seconds: int = int(os.getenv("QMT_REFRESH_INTERVAL_SECONDS", "10"))
     qmt_default_account_key: str = os.getenv("QMT_DEFAULT_ACCOUNT_KEY", "")
+    qmt_history_account_key: str = os.getenv("QMT_HISTORY_ACCOUNT_KEY", "paper_sim")
     qmt_accounts_json: str = os.getenv("QMT_ACCOUNTS_JSON", "")
     qmt_bridge_base_url: str = os.getenv("QMT_BRIDGE_BASE_URL", "")
     qmt_bridge_token: str = os.getenv("QMT_BRIDGE_TOKEN", "")

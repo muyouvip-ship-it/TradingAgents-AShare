@@ -29,6 +29,9 @@ def import_stock_daily_from_quantclass(db_session, csv_file_path: str) -> dict:
         # 读取CSV文件（量化课堂使用GBK编码，第一行是注释）
         logger.info(f"开始读取CSV文件: {csv_file_path}")
         df = pd.read_csv(csv_file_path, encoding='gbk', skiprows=1)
+        trade_dates = pd.to_datetime(df['交易日期'], errors='coerce').dt.date
+        min_trade_date = trade_dates.min() if not trade_dates.empty else None
+        max_trade_date = trade_dates.max() if not trade_dates.empty else None
         
         logger.info(f"读取到 {len(df)} 行数据，{df['股票代码'].nunique()} 只股票")
         
@@ -174,6 +177,8 @@ def import_stock_daily_from_quantclass(db_session, csv_file_path: str) -> dict:
             'success': True,
             'records_imported': records_imported,
             'stocks_count': df['股票代码'].nunique(),
+            'min_trade_date': min_trade_date,
+            'max_trade_date': max_trade_date,
             'errors': errors[:10]  # 只返回前10个错误
         }
         

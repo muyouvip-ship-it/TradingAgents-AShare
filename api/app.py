@@ -16,8 +16,10 @@ from api.routes.debug import router as debug_router
 from api.routes.health import router as health_router
 from api.routes.jobs import router as jobs_router
 from api.routes.market import router as market_router
+from api.routes.news_eye import router as news_eye_router
 from api.routes.portfolio import router as portfolio_router
 from api.routes.reports import router as reports_router
+from api.routes.realtime import router as realtime_router
 from api.routes.scheduled import router as scheduled_router
 from api.routes.backtest_v2 import router as backtest_v2_router
 from api.routes.strategies_v2 import router as strategies_v2_router
@@ -50,6 +52,7 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(market_router)
+app.include_router(news_eye_router)
 app.include_router(data_download_router)
 app.include_router(debug_router)
 app.include_router(backtest_data_router)
@@ -61,6 +64,7 @@ app.include_router(watchlist_router)
 app.include_router(scheduled_router)
 app.include_router(portfolio_router)
 app.include_router(virtual_warehouse_router)
+app.include_router(realtime_router)
 app.include_router(strategy_platform_router)
 app.include_router(strategies_v2_router)
 app.include_router(backtest_v2_router)

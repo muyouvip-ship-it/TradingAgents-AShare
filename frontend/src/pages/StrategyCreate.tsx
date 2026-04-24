@@ -761,7 +761,7 @@ function buildLocalCompileReport(dsl: StrategyDsl, error?: unknown): StrategyCom
     }
     const timeframe = String(factor.timeframe || '1d')
     timeframes.add(timeframe)
-    if (name === 'first_day_band_cross') {
+    if (name === 'first_day_band_cross' || name === 'first_day_band_dead_cross') {
       requiredFields.add('high')
       requiredFields.add('low')
       requiredFields.add('close')
@@ -831,9 +831,15 @@ function buildLocalCompileReport(dsl: StrategyDsl, error?: unknown): StrategyCom
     pending_confirmations: [],
     future_function_risks: [],
     expression_preview: {
-      polars: factors.map(factor => factor.name === 'first_day_band_cross'
-        ? 'first_day_band_cross := CROSS(EMA(((2*C+H+L)/4-LLV(L,9))/(HHV(H,9)-LLV(L,9))*100,8), B1)'
-        : `${String(factor.name || 'factor')} := local_check_placeholder`),
+      polars: factors.map(factor => {
+        if (factor.name === 'first_day_band_cross') {
+          return 'first_day_band_cross := CROSS(波段, B1)'
+        }
+        if (factor.name === 'first_day_band_dead_cross') {
+          return 'first_day_band_dead_cross := CROSS(B1, 波段)'
+        }
+        return `${String(factor.name || 'factor')} := local_check_placeholder`
+      }),
       duckdb: factors.map(factor => `${String(factor.name || 'factor')} := local_check_placeholder`),
     },
   }

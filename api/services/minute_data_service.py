@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,15 @@ class MinuteAggregationResult:
     missing_symbols: list[str]
     cache_path: str | None = None
     parquet_cache_path: str | None = None
+
+
+@dataclass
+class MinuteSignalResult:
+    timeframe: str
+    trade_date: str
+    items: list[dict[str, Any]]
+    source: str
+    missing_symbols: list[str]
 
 
 def get_minute_cache_root() -> Path:
@@ -78,6 +87,103 @@ def evaluate_intraday_confirmation(
     return result
 
 
+def evaluate_first_day_band_signals(
+    *,
+    symbols: list[str],
+    trade_date: str,
+    timeframe: str = "5m",
+    lookback_days: int = 7,
+) -> MinuteSignalResult:
+    normalized_symbols = _normalize_symbols(symbols)
+    if not normalized_symbols:
+        return MinuteSignalResult(
+            timeframe=timeframe,
+            trade_date=trade_date,
+            items=[],
+            source="postgresql:stock_minute_kline",
+            missing_symbols=[],
+        )
+
+    end_dt = datetime.fromisoformat(str(trade_date))
+    start_dt = (end_dt - timedelta(days=max(lookback_days, 1) + 3)).date().isoformat()
+    frame = _try_load_minute_frame_range(normalized_symbols, start_date=start_dt, end_date=trade_date)
+    source = "postgresql:stock_minute_kline"
+    if frame is None or frame.empty:
+        frame = _generate_synthetic_minute_frame(normalized_symbols, trade_date)
+        source = "synthetic:fallback"
+
+    aggregated = _aggregate_minute_frame(frame, timeframe)
+    if aggregated.empty:
+        return MinuteSignalResult(
+            timeframe=timeframe,
+            trade_date=trade_date,
+            items=[],
+            source=source,
+            missing_symbols=normalized_symbols,
+        )
+
+    aggregated = aggregated.sort_values(["symbol", "bar_end"]).reset_index(drop=True)
+    items: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+
+    for symbol, group in aggregated.groupby("symbol", sort=False):
+        computed = _compute_first_day_band(group.copy())
+        if computed.empty:
+            continue
+        latest = computed.iloc[-1]
+        previous = computed.iloc[-2] if len(computed) > 1 else None
+        band = _safe_float(latest.get("first_day_band"))
+        b1 = _safe_float(latest.get("first_day_band_b1"))
+        prev_band = _safe_float(previous.get("first_day_band")) if previous is not None else None
+        prev_b1 = _safe_float(previous.get("first_day_band_b1")) if previous is not None else None
+        cross_above = bool(
+            band is not None
+            and b1 is not None
+            and (prev_band is None or prev_b1 is None or prev_band <= prev_b1)
+            and band > b1
+        )
+        cross_below = bool(
+            band is not None
+            and b1 is not None
+            and prev_band is not None
+            and prev_b1 is not None
+            and prev_band >= prev_b1
+            and band < b1
+        )
+        signal = "buy" if cross_above else "sell" if cross_below else "hold"
+        items.append(
+            {
+                "symbol": symbol,
+                "bar_start": _safe_iso(latest.get("bar_start")),
+                "bar_end": _safe_iso(latest.get("bar_end")),
+                "open": _safe_float(latest.get("open")),
+                "high": _safe_float(latest.get("high")),
+                "low": _safe_float(latest.get("low")),
+                "close": _safe_float(latest.get("close")),
+                "volume": _safe_float(latest.get("volume")),
+                "amount": _safe_float(latest.get("amount")),
+                "first_day_band": band,
+                "first_day_band_b1": b1,
+                "previous_band": prev_band,
+                "previous_b1": prev_b1,
+                "cross_above": cross_above,
+                "cross_below": cross_below,
+                "signal": signal,
+                "confirmed": signal in {"buy", "sell"},
+            }
+        )
+        seen_symbols.add(symbol)
+
+    missing_symbols = sorted(set(normalized_symbols) - seen_symbols)
+    return MinuteSignalResult(
+        timeframe=timeframe,
+        trade_date=trade_date,
+        items=items,
+        source=source,
+        missing_symbols=missing_symbols,
+    )
+
+
 def _try_load_minute_frame(symbols: list[str], trade_date: str) -> pd.DataFrame | None:
     load_project_env()
     database_url = os.getenv("DATABASE_URL")
@@ -96,6 +202,38 @@ def _try_load_minute_frame(symbols: list[str], trade_date: str) -> pd.DataFrame 
             """
         ).bindparams(bindparam("symbols", expanding=True))
         frame = pd.read_sql_query(statement, engine, params={"symbols": query_symbols, "trade_date": trade_date})
+        if frame.empty:
+            return None
+        frame["symbol"] = frame["symbol"].map(_normalize_symbol)
+        frame["trade_time"] = pd.to_datetime(frame["trade_time"])
+        return frame
+    except Exception:
+        return None
+
+
+def _try_load_minute_frame_range(symbols: list[str], *, start_date: str, end_date: str) -> pd.DataFrame | None:
+    load_project_env()
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url or not symbols:
+        return None
+    try:
+        engine = create_engine(database_url)
+        query_symbols = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+        statement = text(
+            """
+            SELECT symbol, trade_time, open, high, low, close, volume, amount
+            FROM stock_minute_kline
+            WHERE symbol IN :symbols
+              AND DATE(trade_time) >= :start_date
+              AND DATE(trade_time) <= :end_date
+            ORDER BY symbol, trade_time
+            """
+        ).bindparams(bindparam("symbols", expanding=True))
+        frame = pd.read_sql_query(
+            statement,
+            engine,
+            params={"symbols": query_symbols, "start_date": start_date, "end_date": end_date},
+        )
         if frame.empty:
             return None
         frame["symbol"] = frame["symbol"].map(_normalize_symbol)
@@ -167,6 +305,23 @@ def _aggregate_minute_frame(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame
         return pd.DataFrame(columns=["symbol", "bar_start", "bar_end", "open", "high", "low", "close", "volume", "amount", "vwap"])
     result = pd.concat(aggregated_frames, ignore_index=True)
     return result[["symbol", "bar_start", "bar_end", "open", "high", "low", "close", "volume", "amount", "vwap"]]
+
+
+def _compute_first_day_band(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    frame = frame.sort_values("bar_end").reset_index(drop=True)
+    typical = (2 * frame["close"] + frame["high"] + frame["low"]) / 4
+    low_min = frame["low"].rolling(window=9, min_periods=9).min()
+    high_max = frame["high"].rolling(window=9, min_periods=9).max()
+    denominator = (high_max - low_min).replace(0, pd.NA)
+    normalized = ((typical - low_min) / denominator) * 100
+    band = normalized.ewm(span=8, adjust=False, min_periods=8).mean()
+    b1_seed = 0.667 * band.shift(1) + 0.333 * band
+    b1 = b1_seed.ewm(span=2, adjust=False, min_periods=2).mean()
+    frame["first_day_band"] = band
+    frame["first_day_band_b1"] = b1
+    return frame.dropna(subset=["first_day_band", "first_day_band_b1"], how="any")
 
 
 def _select_confirmation_row(group: pd.DataFrame, cross_mask: pd.Series, symbol: str) -> pd.DataFrame:
@@ -241,3 +396,24 @@ def _has_module(name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _safe_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            return str(value)
+    return str(value)

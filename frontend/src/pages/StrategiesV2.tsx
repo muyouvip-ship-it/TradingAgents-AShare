@@ -87,10 +87,10 @@ const fallbackStrategies: StrategyDefinition[] = [
   },
   {
     id: 'demo-first-day-band-cross',
-    name: '首日波段金叉选股策略',
-    strategy_type: 'selection',
+    name: '首日波段交易策略',
+    strategy_type: 'trading',
     status: 'draft',
-    description: '由同花顺波段公式改写：波段线上穿 B1 的首日作为日线波段启动选股信号。',
+    description: '由同花顺波段公式改写：波段线上穿 B1 金叉买入，波段线下穿 B1 死叉卖出。',
     source: 'manual',
     version: 1,
     is_active: false,
@@ -98,7 +98,7 @@ const fallbackStrategies: StrategyDefinition[] = [
     created_at: '2026-04-21T10:00:00+08:00',
     updated_at: '2026-04-21T10:00:00+08:00',
     performance: { total_return: 0.182, annual_return: 0.214, sharpe_ratio: 1.52, max_drawdown: -0.082, win_rate: 0.673, calmar_ratio: 2.61 },
-    tags: ['同花顺指标', '首日波段', '选股策略'],
+    tags: ['同花顺指标', '首日波段', '交易策略'],
   },
   {
     id: 'demo-selection-compute',

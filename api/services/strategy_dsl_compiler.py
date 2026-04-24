@@ -305,8 +305,14 @@ def _compile_conditions(
             minute_timeframes.add(timeframe)
         if condition_type in catalog:
             spec = catalog[condition_type]
-            required_fields.update(spec["required_fields"])
-            minute_fields = [field for field in spec["required_fields"] if field.startswith("minute_")]
+            condition_requirements = list(spec["required_fields"])
+            for side in ("left", "right", "field", "indicator"):
+                value = condition.get(side)
+                if isinstance(value, str) and value and not value.startswith("minute_"):
+                    condition_requirements.append(value)
+            condition_requirements = _unique_keep_order(condition_requirements)
+            required_fields.update(condition_requirements)
+            minute_fields = [field for field in condition_requirements if field.startswith("minute_")]
             if minute_fields and condition_type == "intraday_confirm":
                 for minute_field in minute_fields:
                     if not minute_field.startswith(f"minute_{timeframe}"):
@@ -317,7 +323,7 @@ def _compile_conditions(
                     "rule_key": spec["rule_key"],
                     "timeframe": timeframe,
                     "params": condition,
-                    "data_requirements": spec["required_fields"],
+                    "data_requirements": condition_requirements,
                 }
             )
             if condition_type in allowed_ops:

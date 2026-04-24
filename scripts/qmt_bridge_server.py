@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
+import sys
+import threading
 import time
+import atexit
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -10,6 +19,10 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="QMT Bridge Server", version="1.0.0")
 _SECURITY_NAME_CACHE: dict[str, str] = {}
+_HISTORY_JOBS: dict[str, dict[str, Any]] = {}
+_HISTORY_JOBS_LOCK = threading.Lock()
+_TRADER_CACHE: dict[str, dict[str, Any]] = {}
+_TRADER_CACHE_LOCK = threading.RLock()
 
 
 def _log(message: str) -> None:
@@ -29,6 +42,28 @@ class OrderSubmitRequest(BaseModel):
     order_remark: str | None = None
 
 
+class HistoryMinuteSyncRequest(BaseModel):
+    period: str = Field(default="1m", min_length=1)
+    start_date: str = Field(..., min_length=10)
+    end_date: str = Field(..., min_length=10)
+    sector: str = Field(default="all_a", min_length=1)
+    symbols: list[str] = Field(default_factory=list)
+    output_root: str | None = None
+    file_format: str = Field(default="parquet", pattern="^(parquet|csv)$")
+    import_db: bool = True
+    database_url: str | None = None
+    force: bool = False
+    window_days: int = Field(default=365, ge=1)
+    retry_times: int = Field(default=2, ge=0)
+    retry_sleep: float = Field(default=1.0, ge=0)
+
+
+class MinuteBarsRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    trade_date: str = Field(..., min_length=10)
+    period: str = Field(default="1m", min_length=2)
+
+
 def _bridge_token() -> str:
     return str(os.getenv("QMT_BRIDGE_TOKEN") or "").strip()
 
@@ -42,8 +77,30 @@ def _require_token(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="bridge token invalid")
 
 
+def _bridge_role() -> str:
+    role = str(os.getenv("QMT_BRIDGE_ROLE") or "").strip().lower()
+    if role:
+        return role
+    return "live" if str(os.getenv("QMT_BRIDGE_PORT") or "").strip() == "8711" else "paper"
+
+
+def _bridge_trading_allowed() -> bool:
+    raw = os.getenv("QMT_BRIDGE_ALLOW_TRADING")
+    if raw is not None:
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return _bridge_role() == "paper"
+
+
+def _require_trading_allowed(action: str, account_key: str | None) -> None:
+    role = _bridge_role()
+    if _bridge_trading_allowed() and role == "paper" and str(account_key or "").strip().lower() != "live_real":
+        return
+    _log(f"reject trading action={action} role={role} account_key={account_key} allow={_bridge_trading_allowed()}")
+    raise HTTPException(status_code=403, detail="QMT bridge is readonly for this account; trading is disabled")
+
+
 def _symbol_for_xt(value: str) -> str:
-    symbol = str(value or "").strip().upper()
+    symbol = _normalize_symbol(value)
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
     return symbol
@@ -154,7 +211,7 @@ def _resolve_order_params(side: str, price_type: str, symbol: str) -> tuple[int,
     exchange = symbol.split(".")[-1] if "." in symbol else ""
     price_type_map = {
         "limit": getattr(xtconstant, "FIX_PRICE", 11),
-        "latest": getattr(xtconstant, "LATEST_PRICE", getattr(xtconstant, "FIX_PRICE", 11)),
+        "latest": getattr(xtconstant, "FIX_PRICE", 11),
         "opponent": getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", getattr(xtconstant, "FIX_PRICE", 11)),
         "self_best": getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", getattr(xtconstant, "FIX_PRICE", 11)),
         "best5_cancel": getattr(
@@ -168,7 +225,71 @@ def _resolve_order_params(side: str, price_type: str, symbol: str) -> tuple[int,
     return order_type, price_type_map[price_key]
 
 
-def _create_trader(account_id: str, account_type: str):
+def _query_latest_price(symbol: str) -> float:
+    normalized = _normalize_symbol(symbol)
+
+    def _extract_price(payload: Any) -> float | None:
+        if payload is None:
+            return None
+        if isinstance(payload, (int, float)):
+            price = float(payload)
+            return price if price > 0 else None
+        if isinstance(payload, dict):
+            for key in (
+                "lastPrice",
+                "last_price",
+                "latest",
+                "price",
+                "last",
+                "close",
+                "m_dLastPrice",
+                "m_dClose",
+            ):
+                try:
+                    price = float(payload.get(key))
+                except Exception:
+                    continue
+                if price > 0:
+                    return price
+            for value in payload.values():
+                found = _extract_price(value)
+                if found:
+                    return found
+        if isinstance(payload, (list, tuple)):
+            for value in payload:
+                found = _extract_price(value)
+                if found:
+                    return found
+        for attr in ("iloc",):
+            if hasattr(payload, attr):
+                try:
+                    found = _extract_price(payload.iloc[-1])
+                    if found:
+                        return found
+                except Exception:
+                    pass
+        return None
+
+    try:
+        from xtquant import xtdata
+
+        for stock in (normalized, symbol):
+            ticks = xtdata.get_full_tick([stock]) or {}
+            price = _extract_price(ticks.get(stock) if isinstance(ticks, dict) else ticks)
+            if price:
+                return price
+        get_market_data = getattr(xtdata, "get_market_data", None)
+        if callable(get_market_data):
+            data = get_market_data(field_list=["close"], stock_list=[normalized], period="1d", count=1)
+            price = _extract_price(data)
+            if price:
+                return price
+    except Exception as exc:
+        _log(f"query latest price failed symbol={normalized}: {exc}")
+    raise HTTPException(status_code=400, detail=f"latest price unavailable: {normalized}")
+
+
+def _build_trader(account_id: str, account_type: str):
     try:
         from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
         from xtquant.xttype import StockAccount
@@ -214,6 +335,29 @@ def _create_trader(account_id: str, account_type: str):
     return trader, account
 
 
+def _trader_cache_key(account_id: str, account_type: str) -> str:
+    return f"{str(account_id).strip()}::{str(account_type).strip().upper()}"
+
+
+def _create_trader(account_id: str, account_type: str):
+    key = _trader_cache_key(account_id, account_type)
+    with _TRADER_CACHE_LOCK:
+        cached = _TRADER_CACHE.get(key)
+        if cached:
+            cached["last_used_at"] = time.time()
+            return cached["trader"], cached["account"], cached["lock"], key
+        trader, account = _build_trader(account_id, account_type)
+        entry = {
+            "trader": trader,
+            "account": account,
+            "lock": threading.RLock(),
+            "created_at": time.time(),
+            "last_used_at": time.time(),
+        }
+        _TRADER_CACHE[key] = entry
+        return trader, account, entry["lock"], key
+
+
 def _stop_trader(trader: Any) -> None:
     stop = getattr(trader, "stop", None)
     if callable(stop):
@@ -224,29 +368,52 @@ def _stop_trader(trader: Any) -> None:
             pass
 
 
+def _dispose_trader(cache_key: str | None, trader: Any | None) -> None:
+    if cache_key:
+        with _TRADER_CACHE_LOCK:
+            cached = _TRADER_CACHE.get(cache_key)
+            if cached and cached.get("trader") is trader:
+                _TRADER_CACHE.pop(cache_key, None)
+    if trader is not None:
+        _stop_trader(trader)
+
+
+def _cleanup_all_traders() -> None:
+    with _TRADER_CACHE_LOCK:
+        entries = list(_TRADER_CACHE.values())
+        _TRADER_CACHE.clear()
+    for payload in entries:
+        _stop_trader(payload.get("trader"))
+
+
+atexit.register(_cleanup_all_traders)
+
+
 def _query_snapshot(account_id: str, account_type: str) -> dict[str, Any]:
-    trader, account = _create_trader(account_id, account_type)
+    trader, account, trader_lock, cache_key = _create_trader(account_id, account_type)
 
     positions = None
     asset = None
     orders = None
     trades = None
     try:
-        _log("query stock asset")
-        asset = trader.query_stock_asset(account)
-        _log("query stock positions")
-        if positions in (None, []):
-            positions = trader.query_stock_positions(account)
-        _log("query stock orders")
-        query_stock_orders = getattr(trader, "query_stock_orders", None)
-        if callable(query_stock_orders):
-            orders = query_stock_orders(account)
-        _log("query stock trades")
-        query_stock_trades = getattr(trader, "query_stock_trades", None)
-        if callable(query_stock_trades):
-            trades = query_stock_trades(account)
-    finally:
-        _stop_trader(trader)
+        with trader_lock:
+            _log("query stock asset")
+            asset = trader.query_stock_asset(account)
+            _log("query stock positions")
+            if positions in (None, []):
+                positions = trader.query_stock_positions(account)
+            _log("query stock orders")
+            query_stock_orders = getattr(trader, "query_stock_orders", None)
+            if callable(query_stock_orders):
+                orders = query_stock_orders(account)
+            _log("query stock trades")
+            query_stock_trades = getattr(trader, "query_stock_trades", None)
+            if callable(query_stock_trades):
+                trades = query_stock_trades(account)
+    except Exception:
+        _dispose_trader(cache_key, trader)
+        raise
 
     def normalize(item: Any) -> dict[str, Any]:
         if isinstance(item, dict):
@@ -277,61 +444,441 @@ def _query_snapshot(account_id: str, account_type: str) -> dict[str, Any]:
 def _submit_order(request: OrderSubmitRequest) -> dict[str, Any]:
     symbol = _symbol_for_xt(request.symbol)
     order_type, price_mode = _resolve_order_params(request.side, request.price_type, symbol)
-    if str(request.price_type or "limit").strip().lower() == "limit" and request.price is None:
+    price_key = str(request.price_type or "limit").strip().lower()
+    order_price = request.price
+    if price_key == "latest" and order_price is None:
+        try:
+            order_price = _query_latest_price(symbol)
+            _log(f"resolved latest price symbol={symbol} price={order_price}")
+        except HTTPException as exc:
+            order_type, price_mode = _resolve_order_params(request.side, "opponent", symbol)
+            order_price = 0.0
+            _log(f"latest price unavailable, fallback to opponent price symbol={symbol} detail={exc.detail}")
+    if price_key == "limit" and order_price is None:
         raise HTTPException(status_code=400, detail="limit order requires price")
 
-    trader, account = _create_trader(request.account_id, request.account_type)
+    trader, account, trader_lock, cache_key = _create_trader(request.account_id, request.account_type)
     try:
         order_stock = getattr(trader, "order_stock", None)
         if not callable(order_stock):
             raise HTTPException(status_code=500, detail="xttrader.order_stock unavailable")
         _log(
-            f"submit order symbol={symbol} side={request.side} qty={request.quantity} price={request.price} price_type={request.price_type}"
+            f"submit order symbol={symbol} side={request.side} qty={request.quantity} price={order_price} price_type={request.price_type} price_mode={price_mode}"
         )
-        result = order_stock(
-            account,
-            symbol,
-            order_type,
-            int(request.quantity),
-            price_mode,
-            float(request.price or 0.0),
-            str(request.strategy_name or "CodexQmtBridge"),
-            str(request.order_remark or ""),
-        )
+        holder: dict[str, Any] = {}
+
+        def _call_order_stock() -> None:
+            try:
+                with trader_lock:
+                    holder["result"] = order_stock(
+                        account,
+                        symbol,
+                        order_type,
+                        int(request.quantity),
+                        price_mode,
+                        float(order_price or 0.0),
+                        str(request.strategy_name or "CodexQmtBridge"),
+                        str(request.order_remark or ""),
+                    )
+            except Exception as exc:
+                holder["error"] = exc
+
+        worker = threading.Thread(target=_call_order_stock, daemon=True)
+        worker.start()
+        worker.join(float(os.getenv("QMT_ORDER_TIMEOUT_SECONDS") or "12"))
+        if worker.is_alive():
+            _log(f"submit order timeout symbol={symbol} qty={request.quantity} price_type={request.price_type}")
+            raise HTTPException(status_code=504, detail="xttrader.order_stock timeout; please query orders/trades to confirm")
+        if holder.get("error") is not None:
+            raise holder["error"]
+        result = holder.get("result")
         _log(f"submit order result={result}")
         return {
             "success": True,
             "order_id": str(result),
             "result": result,
-            "request": request.model_dump(),
+            "request": {**request.model_dump(), "resolved_price": order_price, "resolved_price_mode": price_mode},
         }
-    finally:
-        _stop_trader(trader)
+    except Exception:
+        _dispose_trader(cache_key, trader)
+        raise
 
 
 def _cancel_order(account_id: str, account_type: str, order_id: str) -> dict[str, Any]:
-    trader, account = _create_trader(account_id, account_type)
+    trader, account, trader_lock, cache_key = _create_trader(account_id, account_type)
     try:
         cancel_order_stock = getattr(trader, "cancel_order_stock", None)
         if not callable(cancel_order_stock):
             raise HTTPException(status_code=500, detail="xttrader.cancel_order_stock unavailable")
         cancel_arg: Any = int(order_id) if str(order_id).isdigit() else order_id
         _log(f"cancel order order_id={order_id}")
-        result = cancel_order_stock(account, cancel_arg)
+        with trader_lock:
+            result = cancel_order_stock(account, cancel_arg)
         _log(f"cancel order result={result}")
         return {
             "success": True,
             "order_id": str(order_id),
             "result": result,
         }
-    finally:
-        _stop_trader(trader)
+    except Exception:
+        _dispose_trader(cache_key, trader)
+        raise
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _history_script_path() -> Path:
+    return Path(__file__).resolve().parent / "qmt_minute_history_sync.py"
+
+
+def _history_output_root(request: HistoryMinuteSyncRequest) -> str:
+    return str(request.output_root or os.getenv("QMT_MINUTE_OUTPUT_ROOT") or r"D:\QMT\data\minute_history")
+
+
+def _history_database_url(request: HistoryMinuteSyncRequest) -> str:
+    return str(request.database_url or os.getenv("QMT_MINUTE_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+
+
+def _update_history_job(job_id: str, **updates: Any) -> None:
+    with _HISTORY_JOBS_LOCK:
+        job = _HISTORY_JOBS.setdefault(job_id, {})
+        job.update(updates)
+        job["updated_at"] = _now_iso()
+
+
+def _append_history_log(job_id: str, line: str) -> None:
+    with _HISTORY_JOBS_LOCK:
+        job = _HISTORY_JOBS.setdefault(job_id, {})
+        logs = list(job.get("logs") or [])
+        logs.append(line)
+        job["logs"] = logs[-200:]
+        job["updated_at"] = _now_iso()
+
+
+def _handle_history_progress_line(job_id: str, line: str) -> None:
+    universe_match = re.search(r"universe=(\d+)", line)
+    windows_match = re.search(r"windows=(\d+)", line)
+    symbol_match = re.search(r"\((\d+)/(\d+)\)\s+symbol=([A-Z0-9.]+)", line)
+    if universe_match:
+        total = int(universe_match.group(1))
+        _update_history_job(job_id, progress=12, message=f"已解析股票池，共 {total} 只股票", universe=total)
+        return
+    if windows_match:
+        total = int(windows_match.group(1))
+        _update_history_job(job_id, progress=16, message=f"已拆分下载窗口，共 {total} 个时间窗口", windows=total)
+        return
+    if symbol_match:
+        current = int(symbol_match.group(1))
+        total = int(symbol_match.group(2))
+        symbol = symbol_match.group(3)
+        progress = min(88, 20 + int((current / max(total, 1)) * 68))
+        _update_history_job(
+            job_id,
+            progress=progress,
+            message=f"QMT 正在处理第 {current}/{total} 只股票：{symbol}",
+            current_symbol=symbol,
+            current_symbol_index=current,
+            total_symbols=total,
+        )
+        return
+    if "retry symbol=" in line:
+        _update_history_job(job_id, progress=30, message=line.replace("[qmt-minute-sync] ", ""))
+
+
+def _run_history_minute_job(job_id: str, request: HistoryMinuteSyncRequest) -> None:
+    script_path = _history_script_path()
+    if not script_path.exists():
+        _update_history_job(job_id, status="failed", progress=0, message=f"脚本不存在：{script_path}", error=f"script not found: {script_path}", finished_at=_now_iso())
+        return
+
+    database_url = _history_database_url(request)
+    if request.import_db and not database_url:
+        _update_history_job(job_id, status="failed", progress=0, message="缺少 QMT_MINUTE_DATABASE_URL / DATABASE_URL，无法导入数据库", error="database_url is required", finished_at=_now_iso())
+        return
+
+    command = [
+        sys.executable,
+        str(script_path),
+        "--period",
+        request.period,
+        "--start-date",
+        request.start_date,
+        "--end-date",
+        request.end_date,
+        "--output-root",
+        _history_output_root(request),
+        "--format",
+        request.file_format,
+        "--window-days",
+        str(request.window_days),
+        "--retry-times",
+        str(request.retry_times),
+        "--retry-sleep",
+        str(request.retry_sleep),
+    ]
+    if request.symbols:
+        command.extend(["--symbols", *request.symbols])
+    else:
+        command.extend(["--sector", request.sector])
+    if request.import_db:
+        command.extend(["--import-db", "--database-url", database_url])
+    if request.force:
+        command.append("--force")
+
+    _update_history_job(job_id, status="running", progress=10, message="已启动 QMT 历史分钟线脚本，正在解析股票池", command=command, started_at=_now_iso())
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            _append_history_log(job_id, line)
+            _handle_history_progress_line(job_id, line)
+        stderr_text = process.stderr.read().strip()
+        if stderr_text:
+            _append_history_log(job_id, stderr_text)
+        returncode = process.wait()
+        if returncode != 0:
+            message = stderr_text or f"QMT 历史分钟线脚本失败，exit_code={returncode}"
+            _update_history_job(job_id, status="failed", progress=0, message=message[:500], error=message, finished_at=_now_iso())
+            return
+        rows_total = 0
+        logs = _HISTORY_JOBS.get(job_id, {}).get("logs") or []
+        for item in reversed(logs):
+            try:
+                payload = json.loads(item)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and payload.get("type") == "run_finished":
+                rows_total = int(payload.get("imported_rows_total") or payload.get("rows_total") or 0)
+                break
+        _update_history_job(job_id, status="completed", progress=100, message=f"QMT 分钟线同步完成，导入/生成记录约 {rows_total} 条", rows_total=rows_total, finished_at=_now_iso())
+    except Exception as exc:
+        _update_history_job(job_id, status="failed", progress=0, message=f"QMT 历史分钟线任务异常：{exc}", error=str(exc), finished_at=_now_iso())
+
+
+def _download_history_window_light(xtdata: Any, symbol: str, period: str, start_time: str, end_time: str) -> None:
+    downloader = getattr(xtdata, "download_history_data2", None) or getattr(xtdata, "download_history_data", None)
+    if downloader is None:
+        raise RuntimeError("xtdata 未提供 download_history_data / download_history_data2")
+    try:
+        downloader(symbol, period, start_time=start_time, end_time=end_time)
+    except TypeError:
+        downloader(symbol, period, start_time, end_time)
+
+
+def _read_history_window_light(xtdata: Any, symbol: str, period: str, start_time: str, end_time: str):
+    reader = getattr(xtdata, "get_market_data_ex", None) or getattr(xtdata, "get_market_data", None)
+    if reader is None:
+        raise RuntimeError("xtdata 未提供 get_market_data_ex / get_market_data")
+    fields = ["time", "open", "high", "low", "close", "volume", "amount"]
+    try:
+        return reader(
+            field_list=fields,
+            stock_list=[symbol],
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type="none",
+            fill_data=False,
+        )
+    except TypeError:
+        return reader(fields, [symbol], period, start_time, end_time, -1, "none", False)
+
+
+def _extract_symbol_frame_light(payload: Any, symbol: str):
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise RuntimeError(f"缺少 pandas: {exc}") from exc
+
+    if payload is None:
+        return None
+    if isinstance(payload, pd.DataFrame):
+        return payload
+    if isinstance(payload, dict):
+        candidates = [symbol, _normalize_symbol(symbol), symbol.split(".")[0], symbol.lower(), _normalize_symbol(symbol).lower()]
+        for key in candidates:
+            value = payload.get(key)
+            if isinstance(value, pd.DataFrame):
+                return value
+            if isinstance(value, dict):
+                return pd.DataFrame(value)
+            if isinstance(value, list):
+                return pd.DataFrame(value)
+        if len(payload) == 1:
+            only = next(iter(payload.values()))
+            if isinstance(only, pd.DataFrame):
+                return only
+            if isinstance(only, dict):
+                return pd.DataFrame(only)
+            if isinstance(only, list):
+                return pd.DataFrame(only)
+        if any(name in payload for name in ("time", "open", "close")):
+            return pd.DataFrame(payload)
+    if isinstance(payload, list):
+        return pd.DataFrame(payload)
+    return None
+
+
+def _normalize_time_value_light(value: Any) -> datetime | None:
+    try:
+        import pandas as pd
+    except Exception:
+        pd = None
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if pd is not None and isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, (int, float)):
+        number = int(value)
+        digits = len(str(abs(number)))
+        if digits >= 18:
+            return datetime.fromtimestamp(number / 1_000_000_000.0)
+        if digits >= 16:
+            return datetime.fromtimestamp(number / 1_000_000.0)
+        if digits >= 13:
+            return datetime.fromtimestamp(number / 1000.0)
+        if digits >= 10:
+            return datetime.fromtimestamp(number)
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _normalize_history_frame_light(payload: Any, symbol: str):
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise RuntimeError(f"缺少 pandas: {exc}") from exc
+
+    frame = _extract_symbol_frame_light(payload, symbol)
+    if frame is None:
+        return pd.DataFrame(columns=["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"])
+    if not isinstance(frame, pd.DataFrame):
+        frame = pd.DataFrame(frame)
+    data = frame.copy()
+    if "time" not in data.columns:
+        if isinstance(data.index, pd.DatetimeIndex):
+            data = data.reset_index().rename(columns={data.columns[0]: "time"})
+        elif "trade_time" in data.columns:
+            data["time"] = data["trade_time"]
+        elif "datetime" in data.columns:
+            data["time"] = data["datetime"]
+        elif data.index.name:
+            data = data.reset_index().rename(columns={data.index.name: "time"})
+    data = data.rename(columns={
+        "Time": "time",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume",
+        "Amount": "amount",
+    })
+    required = ["time", "open", "high", "low", "close", "volume", "amount"]
+    for column in required:
+        if column not in data.columns:
+            data[column] = None
+    data["trade_time"] = data["time"].map(_normalize_time_value_light)
+    data["symbol"] = _normalize_symbol(symbol)
+    for column in ["open", "high", "low", "close", "volume", "amount"]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["trade_time", "open", "high", "low", "close"], how="any")
+    data["trade_time"] = pd.to_datetime(data["trade_time"]).dt.tz_localize(None)
+    data["volume"] = data["volume"].fillna(0).astype("int64")
+    data["amount"] = data["amount"].fillna(0.0).astype(float)
+    data = data.sort_values("trade_time").drop_duplicates(["symbol", "trade_time"], keep="last")
+    return data[["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
+
+
+def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") -> dict[str, Any]:
+    try:
+        from xtquant import xtdata
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"分钟线能力不可用: {exc}") from exc
+
+    normalized_symbols: list[str] = []
+    seen: set[str] = set()
+    for item in symbols:
+        normalized = _normalize_symbol(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_symbols.append(normalized)
+    if not normalized_symbols:
+        raise HTTPException(status_code=400, detail="symbols is required")
+
+    trade_day = str(trade_date or "").replace("-", "").strip()
+    if len(trade_day) != 8 or not trade_day.isdigit():
+        raise HTTPException(status_code=400, detail="trade_date 格式应为 YYYY-MM-DD")
+    start_time = f"{trade_day}000000"
+    end_time = f"{trade_day}235959"
+
+    items: list[dict[str, Any]] = []
+    symbol_rows: dict[str, int] = {}
+    for symbol in normalized_symbols:
+        try:
+            _download_history_window_light(xtdata, symbol, period, start_time, end_time)
+            raw = _read_history_window_light(xtdata, symbol, period, start_time, end_time)
+            frame = _normalize_history_frame_light(raw, symbol)
+            if frame.empty:
+                symbol_rows[symbol] = 0
+                continue
+            frame_to_dump = frame.copy()
+            frame_to_dump["trade_time"] = frame_to_dump["trade_time"].astype(str)
+            records = frame_to_dump.to_dict("records")
+            symbol_rows[symbol] = len(records)
+            items.extend(records)
+        except Exception as exc:
+            _log(f"query minute bars failed symbol={symbol}: {exc}")
+            symbol_rows[symbol] = 0
+    return {
+        "success": True,
+        "trade_date": trade_date,
+        "period": period,
+        "symbols": normalized_symbols,
+        "items": items,
+        "symbol_rows": symbol_rows,
+        "rows": len(items),
+    }
 
 
 @app.get("/health")
 def health(authorization: str | None = Header(default=None)):
     _require_token(authorization)
-    return {"status": "ok", "bridge": "qmt", "userdata_path": str(os.getenv("QMT_USERDATA_PATH") or "")}
+    return {
+        "status": "ok",
+        "bridge": "qmt",
+        "role": _bridge_role(),
+        "trading_allowed": _bridge_trading_allowed(),
+        "userdata_path": str(os.getenv("QMT_USERDATA_PATH") or ""),
+    }
 
 
 @app.get("/snapshot")
@@ -347,6 +894,8 @@ def snapshot(
         "mode": "http_bridge",
         "account_key": account_key,
         "account_id": account_id,
+        "role": _bridge_role(),
+        "trading_allowed": _bridge_trading_allowed(),
     }
     return payload
 
@@ -354,11 +903,14 @@ def snapshot(
 @app.post("/orders")
 def submit_order(body: OrderSubmitRequest, authorization: str | None = Header(default=None)):
     _require_token(authorization)
+    _require_trading_allowed("submit_order", body.account_key)
     payload = _submit_order(body)
     payload["bridge"] = {
         "mode": "http_bridge",
         "account_key": body.account_key,
         "account_id": body.account_id,
+        "role": _bridge_role(),
+        "trading_allowed": _bridge_trading_allowed(),
     }
     return payload
 
@@ -372,13 +924,53 @@ def cancel_order(
     authorization: str | None = Header(default=None),
 ):
     _require_token(authorization)
+    _require_trading_allowed("cancel_order", account_key)
     payload = _cancel_order(account_id, account_type, order_id)
     payload["bridge"] = {
         "mode": "http_bridge",
         "account_key": account_key,
         "account_id": account_id,
+        "role": _bridge_role(),
+        "trading_allowed": _bridge_trading_allowed(),
     }
     return payload
+
+
+@app.post("/history/minute/sync")
+def start_history_minute_sync(body: HistoryMinuteSyncRequest, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    job_id = uuid4().hex
+    now = _now_iso()
+    with _HISTORY_JOBS_LOCK:
+        _HISTORY_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "progress": 0,
+            "message": "任务已创建",
+            "request": body.model_dump(),
+            "logs": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+    thread = threading.Thread(target=_run_history_minute_job, args=(job_id, body), daemon=True)
+    thread.start()
+    return _HISTORY_JOBS[job_id]
+
+
+@app.post("/market/minute-bars")
+def get_market_minute_bars(body: MinuteBarsRequest, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    return _query_minute_bars(body.symbols, body.trade_date, body.period)
+
+
+@app.get("/history/minute/jobs/{job_id}")
+def get_history_minute_job(job_id: str, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    with _HISTORY_JOBS_LOCK:
+        job = _HISTORY_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="history minute job not found")
+        return dict(job)
 
 
 if __name__ == "__main__":

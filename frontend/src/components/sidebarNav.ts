@@ -3,6 +3,7 @@ import {
     Activity,
     Briefcase,
     FileText,
+    Newspaper,
     LayoutDashboard,
     MessageSquare,
     Settings,
@@ -12,6 +13,8 @@ import {
     Bug,
     Landmark,
     ShieldCheck,
+    Radio,
+    LineChart,
 } from 'lucide-react'
 
 export interface SidebarNavItem {
@@ -22,11 +25,14 @@ export interface SidebarNavItem {
 
 export const navItems: SidebarNavItem[] = [
     { path: '/', icon: LayoutDashboard, label: '控制台' },
+    { path: '/news-eye', icon: Newspaper, label: '资讯之眼' },
+    { path: '/stock-market', icon: LineChart, label: '股票市场' },
     { path: '/analysis', icon: Activity, label: '智能分析' },
     { path: '/reports', icon: FileText, label: '历史报告' },
     { path: '/portfolio', icon: Briefcase, label: '自选 & 定时' },
     { path: '/strategies', icon: TrendingUp, label: '策略管理' },
     { path: '/backtest', icon: BarChart3, label: '策略回测' },
+    { path: '/realtime', icon: Radio, label: '实时监控' },
     { path: '/virtual-warehouse', icon: Landmark, label: '虚拟仓' },
     { path: '/live-warehouse', icon: ShieldCheck, label: '实盘仓' },
     { path: '/tracking-board', icon: Wallet, label: '跟踪看板' },

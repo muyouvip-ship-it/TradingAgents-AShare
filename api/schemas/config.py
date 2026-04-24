@@ -5,6 +5,19 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class QmtAccountConfigPayload(BaseModel):
+    key: str
+    role: str
+    enabled: bool = False
+    host: str = ""
+    port: int = 58610
+    account_id: str = ""
+    account_type: str = "STOCK"
+    account_name: str = ""
+    userdata_path: str = ""
+    bridge_base_url: str = ""
+
+
 class UserRuntimeConfigResponse(BaseModel):
     llm_provider: str
     deep_think_llm: str
@@ -19,6 +32,8 @@ class UserRuntimeConfigResponse(BaseModel):
     email_report_enabled: bool = True
     wecom_report_enabled: bool = True
     default_analysts: List[str] = Field(default_factory=list)
+    qmt_paper_account: QmtAccountConfigPayload
+    qmt_live_account: QmtAccountConfigPayload
 
 
 class UserRuntimeConfigUpdateRequest(BaseModel):
@@ -37,6 +52,8 @@ class UserRuntimeConfigUpdateRequest(BaseModel):
     warmup: bool = True
     force_warmup: bool = False
     default_analysts: Optional[List[str]] = None
+    qmt_paper_account: Optional[QmtAccountConfigPayload] = None
+    qmt_live_account: Optional[QmtAccountConfigPayload] = None
 
 
 class UserRuntimeWarmupRequest(UserRuntimeConfigUpdateRequest):

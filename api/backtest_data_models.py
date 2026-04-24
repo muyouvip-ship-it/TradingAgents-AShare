@@ -47,6 +47,9 @@ class BacktestDataConfigCreate(BaseModel):
     data_source_preference: str = Field("akshare", description="数据源偏好")
     auto_download: bool = Field(False, description="是否自动下载")
     update_frequency: Optional[str] = Field(None, description="更新频率")
+    schedule_time: Optional[str] = Field("18:30", description="每日调度时间，格式 HH:MM")
+    timezone: Optional[str] = Field("Asia/Shanghai", description="调度时区")
+    only_trading_day: bool = Field(True, description="仅交易日执行")
 
 
 class BacktestDataConfig(BaseModel):
@@ -60,9 +63,27 @@ class BacktestDataConfig(BaseModel):
     data_source_preference: str
     auto_download: bool
     update_frequency: Optional[str]
+    schedule_time: Optional[str]
+    timezone: Optional[str]
+    only_trading_day: bool
+    last_run_at: Optional[datetime]
+    last_success_at: Optional[datetime]
     last_updated_at: Optional[datetime]
+    subscription_status: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
+
+
+class BacktestDataSubscriptionStatus(BaseModel):
+    config_id: int
+    auto_download: bool
+    next_run_at: Optional[datetime]
+    now: datetime
+    running_task_count: int
+    latest_task: Optional[Dict[str, Any]] = None
+    watermarks: List[Dict[str, Any]] = Field(default_factory=list)
+    latest_watermark_date: Optional[date] = None
+    intraday_capture: Optional[Dict[str, Any]] = None
 
 
 # 数据统计模型
@@ -73,7 +94,16 @@ class BacktestDataStats(BaseModel):
     date_range_start: Optional[date]
     date_range_end: Optional[date]
     total_records: int
+    symbol_count: Optional[int] = None
+    trading_days: Optional[int] = None
     last_updated_date: Optional[date]
+    last_table_updated_at: Optional[datetime] = None
+    coverage_source: Optional[str] = None
+    db_date_range_start: Optional[date] = None
+    db_date_range_end: Optional[date] = None
+    cache_date_range_start: Optional[date] = None
+    cache_date_range_end: Optional[date] = None
+    cache_last_updated_at: Optional[datetime] = None
     data_quality_score: int
     missing_dates: List[date]
     created_at: datetime

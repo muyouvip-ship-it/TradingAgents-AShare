@@ -55,6 +55,10 @@ def _compute_with_pandas(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
         (data["first_day_band"] > data["first_day_band_b1"])
         & (previous_band <= previous_b1)
     ).fillna(False).astype(float)
+    data["first_day_band_dead_cross"] = (
+        (data["first_day_band"] < data["first_day_band_b1"])
+        & (previous_band >= previous_b1)
+    ).fillna(False).astype(float)
     data["momentum_rank_pct"] = data.groupby("date")["momentum_60d"].rank(pct=True).fillna(0.5)
     data["money_flow_rank_pct"] = data.groupby("date")["money_flow_strength_20d"].rank(pct=True).fillna(0.5)
     data["profit_growth_rank_pct"] = data.groupby("date")["profit_growth_proxy"].rank(pct=True).fillna(0.5)
@@ -125,6 +129,13 @@ def _compute_with_polars(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
                     <= pl.col("first_day_band_b1").shift(1).over("symbol")
                 )
             ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_cross"),
+            (
+                (pl.col("first_day_band") < pl.col("first_day_band_b1"))
+                & (
+                    pl.col("first_day_band").shift(1).over("symbol")
+                    >= pl.col("first_day_band_b1").shift(1).over("symbol")
+                )
+            ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_dead_cross"),
         ]
     )
     data = pl_df.to_pandas()

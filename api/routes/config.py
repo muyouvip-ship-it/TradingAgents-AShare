@@ -68,6 +68,8 @@ def update_runtime_config(
         clear_api_key=updates.clear_api_key,
         clear_wecom_webhook=updates.clear_wecom_webhook,
         default_analysts=updates.default_analysts,
+        qmt_paper_account_config=updates.qmt_paper_account.model_dump() if updates.qmt_paper_account else None,
+        qmt_live_account_config=updates.qmt_live_account.model_dump() if updates.qmt_live_account else None,
     )
     if updates.email_report_enabled is not None:
         persistent_user.email_report_enabled = updates.email_report_enabled

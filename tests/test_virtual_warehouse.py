@@ -1,7 +1,9 @@
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 from uuid import uuid4
 
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, get_db_ctx
+from api.data_downloader import DataDownloader
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
 
 
@@ -586,6 +588,54 @@ def test_qmt_submit_order_route(monkeypatch):
     assert payload["overview"]["orders"][0]["order_id"] == "O9001"
 
 
+def test_qmt_submit_order_rejects_live_account(monkeypatch):
+    client = _get_client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    called = {"submit": False}
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="live_real",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="8886186680",
+                account_type="STOCK",
+                account_name="QMT 实盘仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    def fake_submit(*args, **kwargs):
+        called["submit"] = True
+        return {"success": True}
+
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._submit_qmt_order", fake_submit)
+    response = client.post(
+        "/v1/virtual-warehouse/qmt/orders",
+        headers=headers,
+        json={
+            "account_key": "live_real",
+            "symbol": "000001.SZ",
+            "side": "buy",
+            "quantity": 100,
+            "price": 12.4,
+            "price_type": "limit",
+        },
+    )
+    assert response.status_code == 400
+    assert "实盘仓已启用只读锁定" in response.json()["detail"]
+    assert called["submit"] is False
+
+
 def test_qmt_cancel_order_route(monkeypatch):
     client = _get_client()
     token = _auth(client)
@@ -650,6 +700,118 @@ def test_qmt_cancel_order_route(monkeypatch):
     payload = response.json()
     assert payload["cancel_result"]["order_id"] == "O9001"
     assert payload["overview"]["orders"][0]["status"] == "cancelled"
+
+
+def test_qmt_cancel_order_rejects_live_account(monkeypatch):
+    client = _get_client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    called = {"cancel": False}
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="live_real",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="8886186680",
+                account_type="STOCK",
+                account_name="QMT 实盘仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    def fake_cancel(*args, **kwargs):
+        called["cancel"] = True
+        return {"success": True}
+
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._cancel_qmt_order", fake_cancel)
+    response = client.post(
+        "/v1/virtual-warehouse/qmt/orders/O9001/cancel?account_key=live_real",
+        headers=headers,
+    )
+    assert response.status_code == 400
+    assert "实盘仓已启用只读锁定" in response.json()["detail"]
+    assert called["cancel"] is False
+
+
+def test_qmt_history_bridge_uses_paper_account_key(monkeypatch):
+    monkeypatch.delenv("QMT_HISTORY_BRIDGE_BASE_URL", raising=False)
+    monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "paper_sim")
+    fake_settings = SimpleNamespace(
+        qmt_history_account_key="paper_sim",
+        qmt_accounts=lambda: [
+            {
+                "key": "live_real",
+                "enabled": True,
+                "role": "live",
+                "account_id": "8886186680",
+                "bridge_base_url": "http://192.168.10.1:8711",
+                "bridge_token": "live-token",
+            },
+            {
+                "key": "paper_sim",
+                "enabled": True,
+                "role": "paper",
+                "account_id": "39027628",
+                "bridge_base_url": "http://192.168.10.1:8710",
+                "bridge_token": "paper-token",
+            },
+        ],
+        qmt_accounts_json="[]",
+        qmt_default_account_key="paper_sim",
+        qmt_bridge_base_url="",
+        qmt_bridge_token="",
+        qmt_account_id="",
+    )
+    monkeypatch.setattr("api.data_downloader.settings", fake_settings)
+
+    bridge = DataDownloader._resolve_qmt_history_bridge()
+
+    assert bridge is not None
+    assert bridge["account_key"] == "paper_sim"
+    assert bridge["role"] == "paper"
+    assert bridge["bridge_base_url"].endswith(":8710")
+
+
+def test_qmt_history_bridge_rejects_live_history_key(monkeypatch):
+    monkeypatch.delenv("QMT_HISTORY_BRIDGE_BASE_URL", raising=False)
+    monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "live_real")
+    fake_settings = SimpleNamespace(
+        qmt_history_account_key="paper_sim",
+        qmt_accounts=lambda: [
+            {
+                "key": "live_real",
+                "enabled": True,
+                "role": "live",
+                "account_id": "8886186680",
+                "bridge_base_url": "http://192.168.10.1:8711",
+                "bridge_token": "live-token",
+            }
+        ],
+        qmt_accounts_json="[]",
+        qmt_default_account_key="paper_sim",
+        qmt_bridge_base_url="",
+        qmt_bridge_token="",
+        qmt_account_id="",
+    )
+    monkeypatch.setattr("api.data_downloader.settings", fake_settings)
+
+    assert DataDownloader._resolve_qmt_history_bridge() is None
+
+
+def test_qmt_history_bridge_rejects_explicit_live_port(monkeypatch):
+    monkeypatch.setenv("QMT_HISTORY_BRIDGE_BASE_URL", "http://192.168.10.1:8711")
+    monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "paper_sim")
+
+    assert DataDownloader._resolve_qmt_history_bridge() is None
 
 
 def test_list_paper_accounts_endpoint():

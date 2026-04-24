@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from api.core.runtime_config import build_runtime_config
 from api.database import UserDB
-from api.schemas.config import UserRuntimeConfigResponse, UserRuntimeConfigUpdateRequest
+from api.schemas.config import QmtAccountConfigPayload, UserRuntimeConfigResponse, UserRuntimeConfigUpdateRequest
 from api.services import auth_service
 
 _CONFIG_ALLOWED_KEYS = {
@@ -115,6 +115,7 @@ def config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntime
     user_cfg = auth_service.get_user_llm_config(db, user.id) if user else None
     webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None))
     default_analysts = _DEFAULT_ANALYSTS
+    qmt_configs = auth_service.get_user_qmt_account_configs(db, user.id) if user else auth_service.default_qmt_account_configs()
     if user_cfg and user_cfg.default_analysts:
         try:
             parsed = json.loads(user_cfg.default_analysts)
@@ -136,4 +137,6 @@ def config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntime
         email_report_enabled=user.email_report_enabled if user else True,
         wecom_report_enabled=user.wecom_report_enabled if user else True,
         default_analysts=default_analysts,
+        qmt_paper_account=QmtAccountConfigPayload(**qmt_configs["paper"]),
+        qmt_live_account=QmtAccountConfigPayload(**qmt_configs["live"]),
     )

@@ -318,6 +318,114 @@ export interface KlineResponse {
     start_date: string
     end_date: string
     candles: KlineCandle[]
+    source?: string
+}
+
+export interface ChanlunPoint {
+    date: string
+    price: number
+    type: string
+    side?: 'buy' | 'sell'
+    reason?: string
+}
+
+export interface ChanlunStroke {
+    start_date: string
+    end_date: string
+    start_price: number
+    end_price: number
+    direction: 'up' | 'down'
+}
+
+export interface ChanlunCenter {
+    start_date: string
+    end_date: string
+    low: number
+    high: number
+    mid: number
+}
+
+export interface ChanlunOverlayResponse {
+    symbol: string
+    start_date: string
+    end_date: string
+    source?: string
+    message?: string | null
+    fractals: ChanlunPoint[]
+    bi: ChanlunStroke[]
+    segments: ChanlunStroke[]
+    zhongshu: ChanlunCenter[]
+    buy_sell_points: ChanlunPoint[]
+}
+
+export interface MarketTickerItem {
+    symbol: string
+    name: string
+    price?: number | null
+    change?: number | null
+    change_pct?: number | null
+    volume?: number | null
+    amount?: number | null
+    trade_time?: string | null
+    source?: string | null
+}
+
+export interface MarketSectorItem {
+    sector_name: string
+    change_pct?: number | null
+    net_inflow?: number | null
+    member_count?: number | null
+    amount?: number | null
+    source?: string | null
+}
+
+export interface MarketOverviewResponse {
+    indices: MarketTickerItem[]
+    top_gainers: MarketTickerItem[]
+    top_losers: MarketTickerItem[]
+    sector_gainers: MarketSectorItem[]
+    sector_losers: MarketSectorItem[]
+    sector_fund_inflows: MarketSectorItem[]
+    sector_fund_outflows: MarketSectorItem[]
+    updated_at: string
+    source?: string
+    fallback?: boolean
+}
+
+export interface NewsEyeSymbolTag {
+    symbol: string
+    name: string
+}
+
+export interface NewsEyeItem {
+    id: string
+    content: string
+    published_at: string
+    source: string
+    url?: string | null
+    sentiment: 'positive' | 'negative' | 'neutral' | string
+    positive_sectors: string[]
+    negative_sectors: string[]
+    positive_symbols: NewsEyeSymbolTag[]
+    negative_symbols: NewsEyeSymbolTag[]
+    related_symbols: NewsEyeSymbolTag[]
+    fetched_at?: string | null
+}
+
+export interface NewsEyeListResponse {
+    items: NewsEyeItem[]
+    total: number
+    updated_at: string
+    source?: string
+    fallback?: boolean
+}
+
+export interface NewsEyeRefreshResponse {
+    saved: number
+    source: string
+    fallback: boolean
+    message?: string
+    updated_at: string
 }
 
 // Structured extraction types
@@ -475,6 +583,11 @@ export interface ScheduledBatchTriggerResponse {
 export interface StockSearchResult {
     symbol: string
     name: string
+    market?: string
+    exchange?: string
+    current_price?: number | null
+    change_pct?: number | null
+    source?: string
 }
 
 export interface ImportedPortfolioPosition {
@@ -589,6 +702,8 @@ export interface RuntimeConfig {
     email_report_enabled?: boolean
     wecom_report_enabled?: boolean
     default_analysts?: string[]
+    qmt_paper_account: RuntimeQmtAccountConfig
+    qmt_live_account: RuntimeQmtAccountConfig
 }
 
 export interface RuntimeConfigUpdateResponse {
@@ -613,8 +728,23 @@ export interface RuntimeConfigUpdate {
     email_report_enabled?: boolean
     wecom_report_enabled?: boolean
     default_analysts?: string[]
+    qmt_paper_account?: RuntimeQmtAccountConfig
+    qmt_live_account?: RuntimeQmtAccountConfig
     warmup?: boolean
     force_warmup?: boolean
+}
+
+export interface RuntimeQmtAccountConfig {
+    key: string
+    role: 'paper' | 'live'
+    enabled: boolean
+    host: string
+    port: number
+    account_id: string
+    account_type: string
+    account_name: string
+    userdata_path: string
+    bridge_base_url: string
 }
 
 export interface RuntimeWarmupRequest extends RuntimeConfigUpdate {
@@ -967,6 +1097,69 @@ export interface BacktestCompareResponse {
     summary: Record<string, { best: { run_id: string; value: number }; worst: { run_id: string; value: number } }>
 }
 
+export interface BacktestDataTaskSummary {
+    id: number
+    task_type: string
+    data_source?: string | null
+    status: string
+    progress: number
+    total_records: number
+    downloaded_records: number
+    trigger_mode?: string | null
+    date_range_start?: string | null
+    date_range_end?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+    completed_at?: string | null
+    error_message?: string | null
+}
+
+export interface BacktestDataWatermark {
+    data_type: string
+    data_source?: string | null
+    scope_key: string
+    last_data_date?: string | null
+    last_run_started_at?: string | null
+    last_success_at?: string | null
+    last_status?: string | null
+    last_error?: string | null
+    updated_at?: string | null
+}
+
+export interface BacktestDataSubscriptionStatus {
+    config_id: number
+    auto_download: boolean
+    timezone?: string
+    next_run_at?: string | null
+    now: string
+    running_task_count: number
+    latest_task?: BacktestDataTaskSummary | null
+    watermarks: BacktestDataWatermark[]
+    latest_watermark_date?: string | null
+    intraday_capture?: BacktestDataWatermark | null
+}
+
+export interface BacktestDataConfigItem {
+    id: number
+    user_id: string
+    config_name: string
+    enabled_data_types: string[]
+    default_date_range_days: number
+    default_symbols: string[]
+    data_source_preference: string
+    auto_download: boolean
+    update_frequency?: string | null
+    schedule_time?: string | null
+    timezone?: string | null
+    only_trading_day: boolean
+    last_run_at?: string | null
+    last_success_at?: string | null
+    last_updated_at?: string | null
+    created_at: string
+    updated_at: string
+    subscription_status?: BacktestDataSubscriptionStatus | null
+}
+
 export interface BacktestTradeRecord {
     trade_id: string
     symbol: string
@@ -1292,11 +1485,13 @@ export interface QmtOrderSubmitRequest {
     price_type?: string
     strategy_name?: string
     order_remark?: string
+    include_overview?: boolean
 }
 
 export interface QmtOrderSubmitResponse {
     message: string
     account_key: string
+    request_id?: string
     order_result: {
         success: boolean
         order_id: string
@@ -1305,12 +1500,13 @@ export interface QmtOrderSubmitResponse {
         bridge?: Record<string, unknown>
         raw?: Record<string, unknown>
     }
-    overview: VirtualWarehouseOverviewResponse
+    overview?: VirtualWarehouseOverviewResponse | null
 }
 
 export interface QmtOrderCancelResponse {
     message: string
     account_key: string
+    request_id?: string
     cancel_result: {
         success: boolean
         order_id: string
@@ -1319,4 +1515,146 @@ export interface QmtOrderCancelResponse {
         raw?: Record<string, unknown>
     }
     overview: VirtualWarehouseOverviewResponse
+}
+
+export interface QmtBulkSellTaskItem {
+    symbol: string
+    name?: string | null
+    quantity: number
+    status: string
+    order_id?: string | null
+    message?: string | null
+}
+
+export interface QmtBulkSellTask {
+    id: string
+    task_type: string
+    account_key: string
+    account_id: string
+    account_name: string
+    status: string
+    strategy_name: string
+    total: number
+    processed: number
+    success_count: number
+    failure_count: number
+    current_symbol?: string | null
+    current_name?: string | null
+    recent_failures: string[]
+    items: QmtBulkSellTaskItem[]
+    overview?: VirtualWarehouseOverviewResponse | null
+    version: number
+    created_at: string
+    updated_at: string
+    completed_at?: string | null
+    request_id?: string
+}
+
+export type RealtimeMonitorStatus = 'draft' | 'ready' | 'running' | 'paused' | 'halted' | 'fused' | 'error'
+export type RealtimeExecutionMode = 'auto' | 'monitor_only'
+
+export interface RealtimeMonitorCreateRequest {
+    name?: string
+    account_key: string
+    strategy_id: string
+    strategy_version_id?: string
+    execution_mode?: RealtimeExecutionMode
+    live_trading_enabled?: boolean
+    live_confirmed?: boolean
+    monitor_pool?: Record<string, unknown>
+    config?: Record<string, unknown>
+    risk_config?: Record<string, unknown>
+}
+
+export interface RealtimeMonitor {
+    id: string
+    user_id: string
+    name: string
+    account_key: string
+    account_role: 'paper' | 'live' | string
+    strategy_id: string
+    strategy_version_id?: string | null
+    status: RealtimeMonitorStatus
+    execution_mode: RealtimeExecutionMode | string
+    auto_trade_enabled: boolean
+    live_trading_enabled: boolean
+    quote_source: string
+    monitor_pool: Record<string, unknown>
+    config: Record<string, unknown>
+    risk_config: Record<string, unknown>
+    state: {
+        compiled_status?: string
+        timeframes_required?: string[]
+        minute_requirements?: Record<string, unknown>
+        latest_cycle?: string | null
+        last_updated_at?: string
+        execution_tracker_summary?: {
+            pending_orders?: number
+            tracked_orders?: number
+            tracked_trades?: number
+            tracked_positions?: number
+        }
+        stats?: {
+            signals?: number
+            orders?: number
+            rejections?: number
+            approvals?: number
+        }
+    }
+    circuit_breaker?: {
+        active: boolean
+        reason?: string | null
+        last_heartbeat_at?: string | null
+    }
+    last_heartbeat_at?: string | null
+    fused_reason?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface RealtimeEvent {
+    id: string
+    monitor_id: string
+    user_id: string
+    event_type: string
+    account_key?: string | null
+    strategy_id?: string | null
+    strategy_version_id?: string | null
+    symbol?: string | null
+    trade_time?: string | null
+    payload: Record<string, unknown>
+    signal_payload: Record<string, unknown>
+    risk_payload: Record<string, unknown>
+    order_payload: Record<string, unknown>
+    broker_result: Record<string, unknown>
+    error_payload: Record<string, unknown>
+    request_id?: string | null
+    correlation_id?: string | null
+    created_at?: string | null
+}
+
+export interface RealtimeApprovalTask {
+    id: string
+    monitor_id: string
+    user_id: string
+    account_key: string
+    strategy_id?: string | null
+    symbol?: string | null
+    side?: string | null
+    status: 'pending' | 'approved' | 'rejected' | 'executed'
+    reason?: string | null
+    order_intent: Record<string, unknown>
+    decision: Record<string, unknown>
+    created_at?: string | null
+    updated_at?: string | null
+    decided_at?: string | null
+}
+
+export interface RealtimeMonitorPositionsResponse {
+    monitor_id: string
+    account_key: string
+    positions: VirtualWarehousePosition[]
+    account?: VirtualWarehouseAccount | null
+    connection?: VirtualWarehouseConnection | null
+    fetched_at?: string | null
 }

@@ -256,6 +256,25 @@ FACTOR_REGISTRY: dict[str, dict[str, Any]] = {
         "polars_expr": "band_cross := cross_above(ema((((2*close+high+low)/4 - rolling_min(low,9)) / nullif(rolling_max(high,9)-rolling_min(low,9),0)) * 100, 8), ema(0.667*lag(band,1)+0.333*band, 2))",
         "duckdb_sql": "case when band > b1 and lag(band) over(partition by symbol order by date) <= lag(b1) over(partition by symbol order by date) then 1 else 0 end",
     },
+    "first_day_band_dead_cross": {
+        "name": "first_day_band_dead_cross",
+        "display_name": "首日波段死叉",
+        "category": "indicator",
+        "description": "由同花顺波段公式改写：波段线下穿 B1 的首日作为日线波段离场信号。",
+        "formula": "CROSS(EMA(0.667*REF(band,1)+0.333*band,2), EMA(((2*close+high+low)/4-LLV(low,9))/(HHV(high,9)-LLV(low,9))*100,8))",
+        "source_column": "first_day_band_dead_cross",
+        "required_fields": ["close", "high", "low"],
+        "transforms_supported": ["raw", "rank_pct"],
+        "default_transform": "raw",
+        "default_direction": "higher_better",
+        "window": 11,
+        "rank_scope": "symbol_series",
+        "backend_support": ["polars", "duckdb", "pandas_fallback"],
+        "timeframes": ["1d"],
+        "tags": ["同花顺", "波段", "死叉", "离场"],
+        "polars_expr": "band_dead_cross := cross_below(ema((((2*close+high+low)/4 - rolling_min(low,9)) / nullif(rolling_max(high,9)-rolling_min(low,9),0)) * 100, 8), ema(0.667*lag(band,1)+0.333*band, 2))",
+        "duckdb_sql": "case when band < b1 and lag(band) over(partition by symbol order by date) >= lag(b1) over(partition by symbol order by date) then 1 else 0 end",
+    },
 }
 
 

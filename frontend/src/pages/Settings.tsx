@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign } from 'lucide-react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign, AlertCircle, CheckCircle, Radio, Play, Clock3 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { RuntimeWarmupResult, UserToken } from '@/types'
+import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus } from '@/types'
 
 type ProviderPreset = {
     id: string
@@ -38,8 +39,34 @@ function inferPreset(llmProvider: string, backendUrl: string): string {
     return normalizedProvider || 'openai'
 }
 
+function createDefaultQmtForm(role: 'paper' | 'live'): RuntimeQmtAccountConfig {
+    return {
+        key: role === 'live' ? 'live_real' : 'paper_sim',
+        role,
+        enabled: false,
+        host: '192.168.10.1',
+        port: 58610,
+        account_id: '',
+        account_type: 'STOCK',
+        account_name: role === 'live' ? 'QMT 实盘账户' : 'QMT 虚拟账户',
+        userdata_path: '',
+        bridge_base_url: '',
+    }
+}
+
+type SettingsSection = 'analysis' | 'backtest' | 'qmt' | 'system'
+
+const SETTINGS_SECTIONS = [
+    { id: 'analysis' as const, label: '模型与分析', description: '模型接入、默认分析与推送', icon: Database },
+    { id: 'backtest' as const, label: '回测数据', description: '数据源、订阅、缓存与质量检查', icon: BarChart3 },
+    { id: 'qmt' as const, label: '虚拟仓与实盘仓', description: '配置虚拟仓和实盘仓的账号、目录与连接', icon: Radio },
+    { id: 'system' as const, label: '系统调试', description: '令牌管理与日志调试入口', icon: Key },
+]
+
 export default function Settings() {
+    const navigate = useNavigate()
     const { user } = useAuthStore()
+    const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSection>('analysis')
     const [defaultAnalysts, setDefaultAnalysts] = useState(['market', 'social', 'news', 'fundamentals', 'macro', 'smart_money', 'volume_price'])
     const [customPrompt, setCustomPrompt] = useState('')
     const [llmApiKey, setLlmApiKey] = useState('')
@@ -87,11 +114,29 @@ export default function Settings() {
     const [selectedDataTypes, setSelectedDataTypes] = useState<string[]>(['daily_kline'])
     const [dataSource, setDataSource] = useState('quantclass')  // 默认量化课堂
     const [autoUpdate, setAutoUpdate] = useState(true)  // 默认每日自动更新
+    const [updateFrequency, setUpdateFrequency] = useState('daily')
+    const [scheduleTime, setScheduleTime] = useState('18:30')
+    const [subscriptionTimezone, setSubscriptionTimezone] = useState('Asia/Shanghai')
+    const [onlyTradingDay, setOnlyTradingDay] = useState(true)
     const [downloading, setDownloading] = useState(false)
     const [downloadProgress, setDownloadProgress] = useState(0)
     const [dataStats, setDataStats] = useState<any[]>([])  // 已下载数据统计
     const [dataTasks, setDataTasks] = useState<any[]>([])  // 下载任务列表
+    const [qualityCheckingType, setQualityCheckingType] = useState<string | null>(null)
+    const [qualityCheckResults, setQualityCheckResults] = useState<Record<string, any>>({})
     const [loadingStats, setLoadingStats] = useState(false)
+    const [dailyCacheSyncing, setDailyCacheSyncing] = useState(false)
+    const [subscriptionActionMessage, setSubscriptionActionMessage] = useState<string | null>(null)
+    const [backtestConfig, setBacktestConfig] = useState<BacktestDataConfigItem | null>(null)
+    const [subscriptionStatus, setSubscriptionStatus] = useState<BacktestDataSubscriptionStatus | null>(null)
+    const [subscriptionRunning, setSubscriptionRunning] = useState(false)
+    const [qmtOverview, setQmtOverview] = useState<VirtualWarehouseOverviewResponse | null>(null)
+    const [qmtDiagnostics, setQmtDiagnostics] = useState<VirtualWarehouseDiagnosticsResponse | null>(null)
+    const [qmtStatusLoading, setQmtStatusLoading] = useState(false)
+    const [paperQmtForm, setPaperQmtForm] = useState<RuntimeQmtAccountConfig>(createDefaultQmtForm('paper'))
+    const [liveQmtForm, setLiveQmtForm] = useState<RuntimeQmtAccountConfig>(createDefaultQmtForm('live'))
+    const [activeDownloadTaskIds, setActiveDownloadTaskIds] = useState<number[]>([])
+    const [subscriptionTaskIds, setSubscriptionTaskIds] = useState<number[]>([])
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)  // 轮询定时器（使用ref避免重新渲染）
 
     const selectedPreset = useMemo(
@@ -128,26 +173,32 @@ export default function Settings() {
         } catch {}
     }, [])
 
+    const applyRuntimeConfig = (cfg: RuntimeConfig) => {
+        setProviderPreset(inferPreset(cfg.llm_provider, cfg.backend_url))
+        setCustomBaseUrl(cfg.backend_url || '')
+        setDeepThinkLlm(cfg.deep_think_llm)
+        setQuickThinkLlm(cfg.quick_think_llm)
+        setMaxDebateRounds(cfg.max_debate_rounds)
+        setMaxRiskRounds(cfg.max_risk_discuss_rounds)
+        setHasStoredApiKey(!!cfg.has_api_key)
+        setHasStoredWebhook(!!cfg.has_wecom_webhook)
+        setStoredWebhookDisplay(cfg.wecom_webhook_display || '')
+        setServerFallbackEnabled(!!cfg.server_fallback_enabled)
+        setEmailReportEnabled(cfg.email_report_enabled !== false)
+        setWecomReportEnabled(cfg.wecom_report_enabled !== false)
+        if (Array.isArray(cfg.default_analysts) && cfg.default_analysts.length > 0) {
+            setDefaultAnalysts(cfg.default_analysts)
+        }
+        setPaperQmtForm(cfg.qmt_paper_account || createDefaultQmtForm('paper'))
+        setLiveQmtForm(cfg.qmt_live_account || createDefaultQmtForm('live'))
+    }
+
     useEffect(() => {
         setConfigLoading(true)
         setConfigError(null)
         api.getConfig()
             .then(cfg => {
-                setProviderPreset(inferPreset(cfg.llm_provider, cfg.backend_url))
-                setCustomBaseUrl(cfg.backend_url || '')
-                setDeepThinkLlm(cfg.deep_think_llm)
-                setQuickThinkLlm(cfg.quick_think_llm)
-                setMaxDebateRounds(cfg.max_debate_rounds)
-                setMaxRiskRounds(cfg.max_risk_discuss_rounds)
-                setHasStoredApiKey(!!cfg.has_api_key)
-                setHasStoredWebhook(!!cfg.has_wecom_webhook)
-                setStoredWebhookDisplay(cfg.wecom_webhook_display || '')
-                setServerFallbackEnabled(!!cfg.server_fallback_enabled)
-                setEmailReportEnabled(cfg.email_report_enabled !== false)
-                setWecomReportEnabled(cfg.wecom_report_enabled !== false)
-                if (Array.isArray(cfg.default_analysts) && cfg.default_analysts.length > 0) {
-                    setDefaultAnalysts(cfg.default_analysts)
-                }
+                applyRuntimeConfig(cfg)
             })
             .catch(err => {
                 setConfigError(err instanceof Error ? err.message : '无法连接到后端')
@@ -159,6 +210,7 @@ export default function Settings() {
         
         // 加载回测数据统计和配置
         loadBacktestDataInfo()
+        loadQmtStatus()
         
         // 清理函数：组件卸载时停止轮询
         return () => {
@@ -180,42 +232,216 @@ export default function Settings() {
         }
     }
 
-    // 加载回测数据信息
+    const loadQmtStatus = async () => {
+        setQmtStatusLoading(true)
+        try {
+            const [overview, diagnostics] = await Promise.all([
+                api.getQmtVirtualWarehouseOverview(),
+                api.getQmtVirtualWarehouseDiagnostics(undefined, true),
+            ])
+            setQmtOverview(overview)
+            setQmtDiagnostics(diagnostics)
+        } catch (err) {
+            console.error('加载 QMT 状态失败:', err)
+            setQmtOverview(null)
+            setQmtDiagnostics(null)
+        } finally {
+            setQmtStatusLoading(false)
+        }
+    }
+
+    const loadBacktestConfigSnapshot = async (options?: { syncForm?: boolean }) => {
+        const syncForm = options?.syncForm !== false
+        const configResponse = await api.getBacktestDataConfigs()
+        const configs = Array.isArray(configResponse?.configs) ? configResponse.configs : []
+        const activeConfig = configs[0]
+        setBacktestConfig(activeConfig || null)
+        setSubscriptionStatus(activeConfig?.subscription_status || null)
+        if (activeConfig && syncForm) {
+            const days = Number(activeConfig.default_date_range_days || 365)
+            const end = new Date()
+            const start = new Date()
+            start.setDate(end.getDate() - Math.max(days - 1, 0))
+            setSelectedDataTypes(Array.isArray(activeConfig.enabled_data_types) && activeConfig.enabled_data_types.length > 0 ? activeConfig.enabled_data_types : ['daily_kline'])
+            setDataSource(activeConfig.data_source_preference || 'quantclass')
+            setAutoUpdate(Boolean(activeConfig.auto_download))
+            setUpdateFrequency(activeConfig.update_frequency || 'daily')
+            setScheduleTime(activeConfig.schedule_time || '18:30')
+            setSubscriptionTimezone(activeConfig.timezone || 'Asia/Shanghai')
+            setOnlyTradingDay(activeConfig.only_trading_day !== false)
+            setDateRange({
+                start: start.toISOString().split('T')[0],
+                end: end.toISOString().split('T')[0],
+            })
+        }
+        return activeConfig || null
+    }
+
+    const loadBacktestTaskList = async () => {
+        const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
+        if (tasksResponse && Array.isArray(tasksResponse.tasks)) {
+            setDataTasks(tasksResponse.tasks)
+            return tasksResponse.tasks
+        }
+        if (Array.isArray(tasksResponse)) {
+            setDataTasks(tasksResponse)
+            return tasksResponse
+        }
+        console.warn('tasks API返回数据格式异常:', tasksResponse)
+        setDataTasks([])
+        return []
+    }
+
+    const loadBacktestStats = async () => {
+        const statsResponse = await api.request<{stats?: any[], total?: number}>('/v1/backtest-data/stats')
+        const rawStats = statsResponse && Array.isArray(statsResponse.stats)
+            ? statsResponse.stats
+            : Array.isArray(statsResponse)
+                ? statsResponse
+                : []
+        if (rawStats.length > 0) {
+            const deduped = Array.from(
+                new Map(
+                    rawStats
+                        .filter((item) => Number(item?.total_records || 0) > 0)
+                        .map((item) => [String(item?.data_type || ''), item]),
+                ).values(),
+            )
+            setDataStats(deduped)
+            return deduped
+        }
+        setDataStats([])
+        return []
+    }
+
     const loadBacktestDataInfo = async () => {
         setLoadingStats(true)
         try {
-            // 调用实际API获取数据统计（使用api服务自动添加认证token）
-            const statsResponse = await api.request<{stats?: any[], total?: number}>('/v1/backtest-data/stats')
-            // API返回的是 {stats: [...], total: ...} 格式
-            if (statsResponse && Array.isArray(statsResponse.stats)) {
-                setDataStats(statsResponse.stats)
-            } else if (Array.isArray(statsResponse)) {
-                // 兼容直接返回数组的情况
-                setDataStats(statsResponse)
-            } else {
-                console.warn('stats API返回数据格式异常:', statsResponse)
-                setDataStats([])
-            }
-            
-            // 调用实际API获取任务列表
-            const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
-            // API返回的是 {tasks: [...], total: ...} 格式
-            if (tasksResponse && Array.isArray(tasksResponse.tasks)) {
-                setDataTasks(tasksResponse.tasks)
-            } else if (Array.isArray(tasksResponse)) {
-                // 兼容直接返回数组的情况
-                setDataTasks(tasksResponse)
-            } else {
-                console.warn('tasks API返回数据格式异常:', tasksResponse)
-                setDataTasks([])
-            }
+            await Promise.all([
+                loadBacktestConfigSnapshot({ syncForm: true }),
+                loadBacktestStats(),
+                loadBacktestTaskList(),
+            ])
         } catch (err) {
             console.error('加载回测数据信息失败:', err)
-            // 发生错误时设置为空数组
             setDataStats([])
             setDataTasks([])
         } finally {
             setLoadingStats(false)
+        }
+    }
+
+    const formatDateTime = (value?: string | null) => {
+        if (!value) return '--'
+        const date = new Date(value)
+        if (Number.isNaN(date.getTime())) return value
+        return date.toLocaleString('zh-CN', { hour12: false })
+    }
+
+    const getQualityCheckParams = (dataType: string) => {
+        if (dataType === 'minute_kline') return { tableName: 'stock_minute_kline', queryType: 'minute_kline' }
+        if (dataType === 'index_data') return { tableName: 'index_daily_data', queryType: 'index_data' }
+        return { tableName: 'stock_daily_kline', queryType: 'daily_kline' }
+    }
+
+    const handleCheckQuality = async (dataType: string) => {
+        const { tableName, queryType } = getQualityCheckParams(dataType)
+        setQualityCheckingType(dataType)
+        try {
+            const result = await api.request(`/v1/backtest-data/quality-check/${tableName}?data_type=${queryType}`)
+            setQualityCheckResults(prev => ({ ...prev, [dataType]: result }))
+        } catch (err) {
+            console.error('完整性检查失败:', err)
+            alert(err instanceof Error ? err.message : '完整性检查失败')
+        } finally {
+            setQualityCheckingType(null)
+        }
+    }
+
+    const handleSyncDailyCache = async () => {
+        setDailyCacheSyncing(true)
+        try {
+            const result = await api.request<{
+                message?: string
+                synced?: boolean
+                sync_range?: { start_date?: string; end_date?: string }
+                quality?: { valid?: boolean; issues?: string[] }
+            }>('/v1/backtest-data/daily-kline/cache-sync', {
+                method: 'POST',
+                body: JSON.stringify({}),
+            })
+            await Promise.all([
+                loadBacktestConfigSnapshot({ syncForm: false }),
+                loadBacktestStats(),
+                loadBacktestTaskList(),
+            ])
+            const range = result.sync_range?.start_date && result.sync_range?.end_date
+                ? `\n同步区间：${result.sync_range.start_date} ~ ${result.sync_range.end_date}`
+                : ''
+            const issues = result.quality?.issues?.length
+                ? `\n仍需关注：${result.quality.issues.slice(0, 2).join('；')}`
+                : ''
+            alert(`${result.message || '日K缓存同步完成'}${range}${issues}`)
+        } catch (err) {
+            console.error('同步日K缓存失败:', err)
+            alert(err instanceof Error ? err.message : '同步日K缓存失败')
+        } finally {
+            setDailyCacheSyncing(false)
+        }
+    }
+
+    const persistBacktestDataConfig = async (): Promise<BacktestDataConfigItem> => {
+        const config = await api.request<BacktestDataConfigItem>('/v1/backtest-data/configs', {
+            method: 'POST',
+            body: JSON.stringify({
+                data_types: selectedDataTypes,
+                date_range_start: dateRange.start,
+                date_range_end: dateRange.end,
+                data_source: dataSource,
+                auto_update: autoUpdate,
+                update_frequency: updateFrequency,
+                schedule_time: scheduleTime,
+                timezone: subscriptionTimezone,
+                only_trading_day: onlyTradingDay,
+            }),
+        })
+        setBacktestConfig(config)
+        setSubscriptionStatus(config.subscription_status || null)
+        return config
+    }
+
+    const handleRunSubscriptionNow = async () => {
+        setSubscriptionRunning(true)
+        setSubscriptionActionMessage(`正在触发订阅执行... ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`)
+        try {
+            let configId = backtestConfig?.id
+            if (!configId) {
+                setSubscriptionActionMessage('正在保存当前回测数据配置...')
+                const savedConfig = await persistBacktestDataConfig()
+                configId = savedConfig?.id
+            }
+            if (!configId) {
+                throw new Error('回测数据配置保存失败，无法执行订阅')
+            }
+
+            const result = await api.runBacktestDataSubscriptionNow(configId)
+            if (Array.isArray(result.task_ids) && result.task_ids.length > 0) {
+                setSubscriptionTaskIds(result.task_ids)
+                startTaskPolling(result.task_ids, 'subscription')
+            }
+            await Promise.all([
+                loadBacktestConfigSnapshot({ syncForm: false }),
+                loadBacktestTaskList(),
+            ])
+            const detail = Array.isArray(result.task_ids) && result.task_ids.length > 0
+                ? `已创建 ${result.task_ids.length} 个增量任务（${result.task_ids.join(', ')}）`
+                : '当前没有新的增量任务'
+            setSubscriptionActionMessage(`${result.message}；${detail}`)
+        } catch (err) {
+            console.error('立即执行订阅失败:', err)
+            setSubscriptionActionMessage(err instanceof Error ? err.message : '立即执行订阅失败')
+        } finally {
+            setSubscriptionRunning(false)
         }
     }
 
@@ -225,6 +451,19 @@ export default function Settings() {
             alert('请选择至少一种数据类型')
             return
         }
+
+        let requestDataTypes = [...selectedDataTypes]
+        if (dataSource === 'qmt') {
+            if (!requestDataTypes.includes('minute_kline')) {
+                alert('QMT 数据源当前只支持股票 1 分钟 K 线下载，请先勾选“股票1分钟K线”。')
+                return
+            }
+            const incompatibleTypes = requestDataTypes.filter(type => type !== 'minute_kline')
+            if (incompatibleTypes.length > 0) {
+                alert(`QMT 当前只用于 1 分钟 K 线下载，已自动忽略：${incompatibleTypes.map(getDataTypeName).join('、')}`)
+                requestDataTypes = ['minute_kline']
+            }
+        }
         
         setDownloading(true)
         setDownloadProgress(0)
@@ -232,25 +471,30 @@ export default function Settings() {
         try {
             // 调用实际API批量下载（使用api服务自动添加认证token）
             // 默认下载全部股票（不传symbols参数）
-            const result = await api.request<{created_tasks?: number}>('/v1/backtest-data/batch-download', {
+            const result = await api.request<{task_ids?: number[]; total_tasks?: number}>('/v1/backtest-data/batch-download', {
                 method: 'POST',
                 body: JSON.stringify({
-                    data_types: selectedDataTypes,
+                    data_types: requestDataTypes,
                     date_range_start: dateRange.start,
                     date_range_end: dateRange.end,
                     data_source: dataSource
                 })
             })
             console.log('下载任务创建成功:', result)
+            const createdTaskIds = Array.isArray(result.task_ids) ? result.task_ids : []
+            setActiveDownloadTaskIds(createdTaskIds)
             
             // 显示成功消息
-            alert(`成功创建 ${result.created_tasks || selectedDataTypes.length} 个下载任务`)
+            setSubscriptionActionMessage(`已创建 ${result.total_tasks || requestDataTypes.length} 个下载任务`)
             
             // 重新加载数据
-            loadBacktestDataInfo()
+            Promise.all([
+                loadBacktestConfigSnapshot({ syncForm: false }),
+                loadBacktestTaskList(),
+            ])
             
             // 启动任务状态轮询
-            startTaskPolling()
+            startTaskPolling(createdTaskIds, 'download')
             
         } catch (err) {
             console.error('下载数据失败:', err)
@@ -262,14 +506,17 @@ export default function Settings() {
     }
 
     // 启动任务状态轮询
-    const startTaskPolling = () => {
+    const startTaskPolling = (taskIds: number[] = [], mode: 'download' | 'subscription' = 'download') => {
         // 清除已有的定时器
         if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current)
         }
         
-        // 立即执行一次
-        loadBacktestDataInfo()
+        // 立即执行一次轻量刷新
+        Promise.all([
+            loadBacktestConfigSnapshot({ syncForm: false }),
+            loadBacktestTaskList(),
+        ])
         
         // 每2秒轮询一次任务状态
         const interval = setInterval(async () => {
@@ -284,17 +531,39 @@ export default function Settings() {
                 
                 if (tasksData.length > 0) {
                     setDataTasks(tasksData)
+
+                    const scopedTasks = taskIds.length > 0
+                        ? tasksData.filter(task => taskIds.includes(task.id))
+                        : tasksData
+
+                    const runningTasks = scopedTasks.filter(task => task.status === 'running' || task.status === 'pending')
+                    if (runningTasks.length > 0) {
+                        const avgProgress = runningTasks.reduce((sum, task) => sum + (task.progress || 0), 0) / runningTasks.length
+                        setDownloadProgress(Math.round(avgProgress))
+                    }
                     
                     // 检查是否所有任务都已完成
-                    const allCompleted = tasksData.every(task => 
-                        task.status === 'completed' || task.status === 'failed'
+                    const allCompleted = scopedTasks.length > 0 && scopedTasks.every(task => 
+                        task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
                     )
                     
                     if (allCompleted) {
                         // 所有任务完成，停止轮询并刷新统计数据
                         clearInterval(interval)
                         pollingIntervalRef.current = null
-                        loadBacktestDataInfo()
+                        if (mode === 'download') {
+                            setActiveDownloadTaskIds([])
+                        } else {
+                            const completedSummary = scopedTasks
+                                .map(task => `#${task.id} ${getDataTypeName(task.task_type)} ${getTaskStatusLabel(task.status)}，${task.downloaded_records || task.total_records || 0} 条`)
+                                .join('；')
+                            setSubscriptionActionMessage(`订阅执行完成：${completedSummary}`)
+                        }
+                        Promise.all([
+                            loadBacktestConfigSnapshot({ syncForm: false }),
+                            loadBacktestTaskList(),
+                            mode === 'subscription' ? loadBacktestStats() : Promise.resolve([]),
+                        ])
                     }
                 }
             } catch (err) {
@@ -309,7 +578,7 @@ export default function Settings() {
     // 数据源兼容性映射
     const DATA_SOURCE_COMPATIBILITY: Record<string, string[]> = {
         'daily_kline': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
-        'minute_kline': ['akshare'],  // 量化课堂不支持1分钟K线
+        'minute_kline': ['qmt', 'akshare'],  // QMT 优先，AKShare 作为兜底
         'index_data': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
         'chip_data': ['quantclass'],  // 只有量化课堂支持
         'financial_data': ['quantclass'],  // 只有量化课堂支持
@@ -319,6 +588,7 @@ export default function Settings() {
     // 数据源名称映射
     const DATA_SOURCE_NAMES: Record<string, string> = {
         'quantclass': '量化课堂',
+        'qmt': 'QMT',
         'akshare': 'AKShare',
         'baostock': 'Baostock',
         'tushare': 'Tushare',
@@ -355,6 +625,38 @@ export default function Settings() {
         return names[type] || type
     }
 
+    const dataSourceLabel = (source?: string) => {
+        if (!source) return '未指定'
+        return DATA_SOURCE_NAMES[source] || source.toUpperCase()
+    }
+
+    const getTaskStatusLabel = (status?: string) => {
+        if (status === 'pending') return '等待中'
+        if (status === 'running') return '执行中'
+        if (status === 'completed') return '已完成'
+        if (status === 'failed') return '失败'
+        if (status === 'cancelled') return '已取消'
+        return status || '--'
+    }
+
+    const showQmtHint = selectedDataTypes.includes('minute_kline') || dataSource === 'qmt'
+    const qmtConnection = qmtOverview?.connection
+    const qmtConnected = Boolean(qmtConnection?.connected)
+    const qmtAccounts = qmtOverview?.accounts || []
+    const qmtDiagnosticsMap = useMemo(
+        () => Object.fromEntries((qmtDiagnostics?.items || []).map(item => [item.account_key, item])),
+        [qmtDiagnostics],
+    )
+    const paperQmtAccount = qmtAccounts.find(account => account.role === 'paper') || null
+    const liveQmtAccount = qmtAccounts.find(account => account.role === 'live') || null
+    const visibleRunningTasks = (activeDownloadTaskIds.length > 0
+        ? dataTasks.filter(task => activeDownloadTaskIds.includes(task.id))
+        : dataTasks
+    ).filter(t => t.status === 'running' || t.status === 'pending')
+    const visibleSubscriptionTasks = subscriptionTaskIds.length > 0
+        ? dataTasks.filter(task => subscriptionTaskIds.includes(task.id))
+        : (subscriptionStatus?.latest_task ? [subscriptionStatus.latest_task] : [])
+
     // 获取数据类型图标
     const getDataTypeIcon = (type: string) => {
         const icons: Record<string, any> = {
@@ -366,6 +668,155 @@ export default function Settings() {
             'research_reports': FileText
         }
         return icons[type] || BarChart3
+    }
+
+    const formatCurrency = (value?: number | null) => {
+        const numeric = Number(value || 0)
+        return numeric.toLocaleString('zh-CN', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+        })
+    }
+
+    const renderQmtAccountConfigCard = (
+        title: string,
+        role: 'paper' | 'live',
+        actionLabel: string,
+        actionPath: string,
+        description: string,
+    ) => {
+        const form = role === 'paper' ? paperQmtForm : liveQmtForm
+        const account = role === 'paper' ? paperQmtAccount : liveQmtAccount
+        const diagnostics = account ? qmtDiagnosticsMap[account.account_key] : (qmtDiagnostics?.items || []).find(item => item.role === role)
+        const connected = Boolean(account?.connection.connected || diagnostics?.connect_test.connected)
+        const ready = Boolean(diagnostics?.ready)
+        const badgeClass = connected
+            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+            : ready
+                ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+                : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+        const badgeText = connected ? '已连接' : ready ? '待连接' : '未配置'
+        const accountName = account?.account?.account_name || account?.connection.account_name || diagnostics?.account_name || form.account_name || '--'
+        const accountId = account?.connection.account_id || diagnostics?.account_id || form.account_id || '--'
+        const host = account?.connection.host || diagnostics?.host || form.host || '--'
+        const port = account?.connection.port || diagnostics?.port || form.port || '--'
+        const userDataPath = diagnostics?.userdata_path || account?.connection.userdata_path || form.userdata_path || '--'
+        const bridgeConfigured = diagnostics?.checks.bridge_configured ? '已配置' : '未配置'
+        const directoryState = diagnostics?.checks.userdata_path_configured
+            ? diagnostics?.checks.userdata_path_exists
+                ? '目录有效'
+                : '目录不存在'
+            : '未配置目录'
+        const warningText = diagnostics?.warnings?.length ? diagnostics.warnings.join('；') : ''
+
+        return (
+            <div className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
+                <div className="flex items-start justify-between gap-3">
+                    <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</div>
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{description}</div>
+                    </div>
+                    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass}`}>{badgeText}</span>
+                </div>
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40 sm:col-span-2">
+                        <div className="flex items-center justify-between gap-3">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">启用当前账户</div>
+                            <input
+                                type="checkbox"
+                                checked={form.enabled}
+                                onChange={(event) => updateQmtForm(role, { enabled: event.target.checked })}
+                                className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                            />
+                        </div>
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">账户名称</div>
+                        <input
+                            value={form.account_name}
+                            onChange={(event) => updateQmtForm(role, { account_name: event.target.value })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder={role === 'live' ? '例如：QMT 实盘账户' : '例如：QMT 虚拟账户'}
+                        />
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">当前：{accountName}</div>
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">证券账号</div>
+                        <input
+                            value={form.account_id}
+                            onChange={(event) => updateQmtForm(role, { account_id: event.target.value })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder="输入 QMT 证券账号"
+                        />
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">当前：{accountId}</div>
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">QMT 主机地址</div>
+                        <input
+                            value={form.host}
+                            onChange={(event) => updateQmtForm(role, { host: event.target.value })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder="例如：192.168.10.1"
+                        />
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">QMT 端口</div>
+                        <input
+                            value={String(form.port || '')}
+                            onChange={(event) => updateQmtForm(role, { port: Number(event.target.value || 0) })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder="58610"
+                            inputMode="numeric"
+                        />
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">当前：{host}:{port}</div>
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40 sm:col-span-2">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">用户目录</div>
+                        <input
+                            value={form.userdata_path}
+                            onChange={(event) => updateQmtForm(role, { userdata_path: event.target.value })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder="例如：D:\\国金QMT交易端模拟\\userdata_mini"
+                        />
+                        <div className="mt-1 break-all text-xs text-slate-500 dark:text-slate-400">状态：{directoryState} ｜ 当前：{userDataPath}</div>
+                    </label>
+                    <label className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950/40 sm:col-span-2">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">Bridge 地址（可选）</div>
+                        <input
+                            value={form.bridge_base_url}
+                            onChange={(event) => updateQmtForm(role, { bridge_base_url: event.target.value })}
+                            className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            placeholder="例如：http://192.168.10.1:8710"
+                        />
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">Bridge：{bridgeConfigured}</div>
+                    </label>
+                </div>
+
+                <div className="mt-3 grid gap-2 text-xs text-slate-500 dark:text-slate-400 sm:grid-cols-2">
+                    <div>xtquant：{diagnostics?.checks.xtquant_installed ? '已安装' : '未安装 / 未检测'}</div>
+                    <div>端口探测：{diagnostics?.tcp_probe.message || `${host}:${port}`}</div>
+                    <div>连接测试：{diagnostics?.connect_test.message || account?.connection.message || '--'}</div>
+                    <div>最近同步：{formatDateTime(account?.last_synced_at || qmtOverview?.last_synced_at || qmtOverview?.fetched_at)}</div>
+                </div>
+
+                {warningText ? (
+                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
+                        告警：{warningText}
+                    </div>
+                ) : null}
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                        type="button"
+                        onClick={() => navigate(actionPath)}
+                        className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                        {actionLabel}
+                    </button>
+                </div>
+            </div>
+        )
     }
 
     const handleCreateToken = async (e: React.FormEvent) => {
@@ -408,6 +859,27 @@ export default function Settings() {
         localStorage.setItem('ta-custom-prompt', customPrompt)
     }
 
+    const sanitizeQmtForm = (form: RuntimeQmtAccountConfig, role: 'paper' | 'live'): RuntimeQmtAccountConfig => ({
+        ...form,
+        key: (form.key || (role === 'live' ? 'live_real' : 'paper_sim')).trim() || (role === 'live' ? 'live_real' : 'paper_sim'),
+        role,
+        host: (form.host || '').trim(),
+        port: Number(form.port) > 0 ? Number(form.port) : 58610,
+        account_id: (form.account_id || '').trim(),
+        account_type: (form.account_type || 'STOCK').trim() || 'STOCK',
+        account_name: (form.account_name || '').trim(),
+        userdata_path: (form.userdata_path || '').trim(),
+        bridge_base_url: (form.bridge_base_url || '').trim(),
+    })
+
+    const updateQmtForm = (
+        role: 'paper' | 'live',
+        patch: Partial<RuntimeQmtAccountConfig> | ((prev: RuntimeQmtAccountConfig) => RuntimeQmtAccountConfig),
+    ) => {
+        const setter = role === 'paper' ? setPaperQmtForm : setLiveQmtForm
+        setter(prev => typeof patch === 'function' ? patch(prev) : ({ ...prev, ...patch }))
+    }
+
     const buildRuntimeConfigPayload = (options?: { includeEmail?: boolean; includeWecom?: boolean }) => ({
         llm_provider: effectiveProvider,
         backend_url: effectiveBaseUrl || undefined,
@@ -422,6 +894,8 @@ export default function Settings() {
         } : {}),
         ...(options?.includeEmail ? { email_report_enabled: emailReportEnabled } : {}),
         default_analysts: defaultAnalysts,
+        qmt_paper_account: sanitizeQmtForm(paperQmtForm, 'paper'),
+        qmt_live_account: sanitizeQmtForm(liveQmtForm, 'live'),
     })
 
     const showSavedMessage = (message: string) => {
@@ -442,10 +916,31 @@ export default function Settings() {
         setHasStoredWebhook(!!response.current.has_wecom_webhook)
         setStoredWebhookDisplay(response.current.wecom_webhook_display || '')
         setWecomReportEnabled(response.current.wecom_report_enabled !== false)
+        setPaperQmtForm(response.current.qmt_paper_account || createDefaultQmtForm('paper'))
+        setLiveQmtForm(response.current.qmt_live_account || createDefaultQmtForm('live'))
         setLlmApiKey('')
         setWecomWebhook('')
         showSavedMessage(response.warmup?.message || successMessage)
         return response
+    }
+
+    const handleSaveQmtConfig = async () => {
+        setSaving(true)
+        try {
+            const response = await api.updateConfig({
+                qmt_paper_account: sanitizeQmtForm(paperQmtForm, 'paper'),
+                qmt_live_account: sanitizeQmtForm(liveQmtForm, 'live'),
+                warmup: false,
+                force_warmup: false,
+            })
+            applyRuntimeConfig(response.current)
+            await loadQmtStatus()
+            showSavedMessage('QMT 账号与目录配置已保存')
+        } catch (err) {
+            alert(err instanceof Error ? err.message : '保存 QMT 配置失败')
+        } finally {
+            setSaving(false)
+        }
     }
 
     const handleSaveAll = async () => {
@@ -462,9 +957,14 @@ export default function Settings() {
                     date_range_start: dateRange.start,
                     date_range_end: dateRange.end,
                     data_source: dataSource,
-                    auto_update: autoUpdate
+                    auto_update: autoUpdate,
+                    update_frequency: updateFrequency,
+                    schedule_time: scheduleTime,
+                    timezone: subscriptionTimezone,
+                    only_trading_day: onlyTradingDay,
                 })
             })
+            await loadBacktestDataInfo()
             
             showSavedMessage('全部设置已保存（包含回测数据配置）')
         } catch (err) {
@@ -554,9 +1054,39 @@ export default function Settings() {
         <div className="space-y-6">
             <div>
                 <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">系统设置</h1>
-                <p className="text-slate-500 dark:text-slate-400 mt-1">配置当前账户的分析参数与模型</p>
+                <p className="text-slate-500 dark:text-slate-400 mt-1">按模块管理模型、回测数据、QMT 账户与系统调试能力</p>
             </div>
 
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {SETTINGS_SECTIONS.map((section) => {
+                    const Icon = section.icon
+                    const active = activeSettingsSection === section.id
+                    return (
+                        <button
+                            key={section.id}
+                            type="button"
+                            onClick={() => setActiveSettingsSection(section.id)}
+                            className={`rounded-2xl border px-4 py-4 text-left transition ${
+                                active
+                                    ? 'border-blue-500 bg-blue-50 shadow-sm dark:border-blue-400 dark:bg-blue-500/10'
+                                    : 'border-slate-200 bg-white hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900/60 dark:hover:border-slate-700'
+                            }`}
+                        >
+                            <div className="flex items-center gap-2">
+                                <Icon className={`h-4 w-4 ${active ? 'text-blue-600 dark:text-blue-300' : 'text-slate-500 dark:text-slate-400'}`} />
+                                <div className={`text-sm font-semibold ${active ? 'text-blue-700 dark:text-blue-200' : 'text-slate-900 dark:text-slate-100'}`}>
+                                    {section.label}
+                                </div>
+                            </div>
+                            <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                                {section.description}
+                            </div>
+                        </button>
+                    )
+                })}
+            </div>
+
+            {activeSettingsSection === 'analysis' && (
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Database className="w-5 h-5 text-purple-500" />
@@ -730,7 +1260,9 @@ export default function Settings() {
                     </div>
                 </div>
             </div>
+            )}
 
+            {activeSettingsSection === 'analysis' && (
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Database className="w-5 h-5 text-green-500" />
@@ -813,7 +1345,9 @@ export default function Settings() {
                     />
                 </div>
             </div>
+            )}
 
+            {activeSettingsSection === 'system' && (
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Key className="w-5 h-5 text-amber-500" />
@@ -901,7 +1435,9 @@ export default function Settings() {
                     <p className="text-[10px] text-amber-500">已达到 Token 创建上限（10个）</p>
                 )}
             </div>
+            )}
 
+            {activeSettingsSection === 'analysis' && (
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Mail className="w-5 h-5 text-blue-500" />
@@ -996,8 +1532,10 @@ export default function Settings() {
                     )}
                 </div>
             </div>
+            )}
 
             {/* 回测数据配置 */}
+            {activeSettingsSection === 'backtest' && (
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Database className="w-5 h-5 text-blue-500" />
@@ -1074,6 +1612,7 @@ export default function Settings() {
                             className="input w-full"
                         >
                             <option value="quantclass">量化课堂（推荐）- 快速、高质量</option>
+                            <option value="qmt">QMT（本机 / 桥接分钟线）</option>
                             <option value="akshare">AKShare（免费无限制）</option>
                             <option value="baostock">Baostock（免费）</option>
                             <option value="tushare">Tushare（需要API Token）</option>
@@ -1081,12 +1620,50 @@ export default function Settings() {
                         </select>
                     </div>
 
-                    {/* 每日自动更新开关 */}
+                    {showQmtHint && (
+                        <div className={`rounded-lg border px-4 py-3 ${
+                            qmtConnected
+                                ? 'border-emerald-200 bg-emerald-50 dark:border-emerald-900/60 dark:bg-emerald-950/20'
+                                : 'border-amber-200 bg-amber-50 dark:border-amber-900/60 dark:bg-amber-950/20'
+                        }`}>
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                        {qmtConnected ? <CheckCircle className="w-4 h-4 text-emerald-500" /> : <AlertCircle className="w-4 h-4 text-amber-500" />}
+                                        <span>QMT 分钟线状态</span>
+                                        {qmtStatusLoading && <Loader2 className="w-4 h-4 animate-spin text-slate-400" />}
+                                    </div>
+                                    <p className={`mt-1 text-sm ${qmtConnected ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'}`}>
+                                        {qmtConnection?.message || '尚未获取到 QMT 连接状态'}
+                                    </p>
+                                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
+                                        <span>账户：{qmtConnection?.account_name || '--'}</span>
+                                        <span>账号：{qmtConnection?.account_id || '--'}</span>
+                                        <span>主机：{qmtConnection?.host || '--'}:{qmtConnection?.port || '--'}</span>
+                                        <span>提供方：{qmtConnection?.provider || 'xtquant'}</span>
+                                    </div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={loadQmtStatus}
+                                    className="btn-secondary inline-flex items-center gap-2 whitespace-nowrap"
+                                >
+                                    <Radio className="w-4 h-4" />
+                                    刷新状态
+                                </button>
+                            </div>
+                            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                                选择 QMT 后，后端会调用现有 `qmt_minute_history_sync.py` 真链路导入 `stock_minute_kline`；若当前环境没有 `xtquant/xtdata`，任务会直接报错提示。
+                            </p>
+                        </div>
+                    )}
+
+                    {/* 数据订阅开关 */}
                     <div className="flex items-center justify-between">
                         <div>
-                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">每日自动更新</div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">数据订阅</div>
                             <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">
-                                每日自动下载最新数据
+                                到点后自动从数据源增量补齐最新数据
                             </div>
                         </div>
                         <button
@@ -1102,8 +1679,216 @@ export default function Settings() {
                         </button>
                     </div>
 
+                    <div className="grid gap-3 md:grid-cols-3">
+                        <div>
+                            <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">执行频率</label>
+                            <select
+                                value={updateFrequency}
+                                onChange={(e) => setUpdateFrequency(e.target.value)}
+                                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                            >
+                                <option value="daily">每日</option>
+                                <option value="weekly">每周</option>
+                                <option value="monthly">每月</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">执行时间</label>
+                            <input
+                                type="time"
+                                value={scheduleTime}
+                                onChange={(e) => setScheduleTime(e.target.value)}
+                                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                            />
+                        </div>
+                        <div>
+                            <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">时区</label>
+                            <input
+                                value={subscriptionTimezone}
+                                onChange={(e) => setSubscriptionTimezone(e.target.value)}
+                                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="flex items-center justify-between rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+                        <div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">仅交易日执行</div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">
+                                按 A 股交易日历跳过周末和节假日
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setOnlyTradingDay(!onlyTradingDay)}
+                            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                onlyTradingDay ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-600'
+                            }`}
+                        >
+                            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                onlyTradingDay ? 'translate-x-6' : 'translate-x-1'
+                            }`} />
+                        </button>
+                    </div>
+
+                    <div className="rounded-2xl bg-slate-50 px-4 py-3 text-xs text-slate-500 dark:bg-slate-950 dark:text-slate-400">
+                        当前订阅规则：{autoUpdate ? `${updateFrequency === 'daily' ? '每日' : updateFrequency === 'weekly' ? '每周' : '每月'} ${scheduleTime}（${subscriptionTimezone}）自动增量更新` : '未启用自动订阅'}
+                        {onlyTradingDay ? '，仅交易日执行。' : '，自然日执行。'}
+                    </div>
+
+                    <div className="grid gap-3 md:grid-cols-4">
+                        <div className="rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">上次执行</div>
+                            <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                {formatDateTime(backtestConfig?.last_run_at)}
+                            </div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">上次成功</div>
+                            <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                {formatDateTime(backtestConfig?.last_success_at)}
+                            </div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">下次执行</div>
+                            <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                {formatDateTime(subscriptionStatus?.next_run_at)}
+                            </div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">最新水位</div>
+                            <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                {subscriptionStatus?.latest_watermark_date || '--'}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 px-4 py-4 dark:border-slate-700">
+                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                            <div>
+                                <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                    <Clock3 className="h-4 w-4 text-indigo-500" />
+                                    订阅执行状态
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    运行中任务 {subscriptionStatus?.running_task_count ?? 0} 个
+                                    {subscriptionStatus?.latest_task ? `，最近任务 #${subscriptionStatus.latest_task.id}（${subscriptionStatus.latest_task.status}）` : '，暂无任务'}
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={handleRunSubscriptionNow}
+                                disabled={subscriptionRunning}
+                                className="btn-secondary inline-flex items-center gap-2 whitespace-nowrap"
+                            >
+                                {subscriptionRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                                立即执行一次订阅
+                            </button>
+                        </div>
+                        {subscriptionActionMessage && (
+                            <div className="mt-3 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-700 dark:border-indigo-900/40 dark:bg-indigo-950/20 dark:text-indigo-300">
+                                {subscriptionActionMessage}
+                            </div>
+                        )}
+                        {visibleSubscriptionTasks.length > 0 && (
+                            <div className="mt-3 space-y-2">
+                                {visibleSubscriptionTasks.slice(0, 3).map((task) => {
+                                    const progress = Number(task.progress || 0)
+                                    const isActive = task.status === 'pending' || task.status === 'running'
+                                    return (
+                                        <div
+                                            key={`subscription-task-${task.id}`}
+                                            className="rounded-xl border border-slate-200 bg-white px-3 py-3 text-xs dark:border-slate-800 dark:bg-slate-950"
+                                        >
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                <div className="font-medium text-slate-800 dark:text-slate-100">
+                                                    本次订阅任务 #{task.id} · {getDataTypeName(task.task_type)}
+                                                </div>
+                                                <div className={`rounded-full px-2 py-0.5 ${
+                                                    task.status === 'completed'
+                                                        ? 'bg-green-100 text-green-700 dark:bg-green-950/40 dark:text-green-300'
+                                                        : task.status === 'failed'
+                                                            ? 'bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300'
+                                                            : 'bg-blue-100 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300'
+                                                }`}>
+                                                    {getTaskStatusLabel(task.status)}
+                                                </div>
+                                            </div>
+                                            <div className="mt-2 grid gap-2 text-slate-500 dark:text-slate-400 md:grid-cols-4">
+                                                <div>区间：{task.date_range_start || '--'} ~ {task.date_range_end || '--'}</div>
+                                                <div>数据源：{dataSourceLabel(task.data_source)}</div>
+                                                <div>记录：{Number(task.downloaded_records || task.total_records || 0).toLocaleString()} 条</div>
+                                                <div>完成：{formatDateTime(task.completed_at)}</div>
+                                            </div>
+                                            <div className="mt-2">
+                                                <div className="mb-1 flex justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                                                    <span>{isActive ? '实时进度' : '最终进度'}</span>
+                                                    <span>{progress}%</span>
+                                                </div>
+                                                <div className="h-2 rounded-full bg-slate-200 dark:bg-slate-800">
+                                                    <div
+                                                        className={`h-2 rounded-full transition-all duration-300 ${
+                                                            task.status === 'failed' ? 'bg-red-500' : task.status === 'completed' ? 'bg-green-500' : 'bg-blue-500'
+                                                        }`}
+                                                        style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+                                            {task.error_message && (
+                                                <div className="mt-2 rounded-lg bg-slate-50 px-2 py-1 text-slate-500 dark:bg-slate-900 dark:text-slate-400">
+                                                    {task.error_message}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )
+                                })}
+                            </div>
+                        )}
+                        <div className="mt-4 grid gap-3 md:grid-cols-2">
+                            <div className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950">
+                                <div className="text-xs font-medium text-slate-600 dark:text-slate-300">增量水位</div>
+                                <div className="mt-2 space-y-2">
+                                    {(subscriptionStatus?.watermarks || []).slice(0, 4).map((item) => (
+                                        <div key={`${item.data_type}-${item.scope_key}`} className="rounded-lg border border-slate-200 px-3 py-2 text-xs dark:border-slate-800">
+                                            <div className="flex items-center justify-between gap-3">
+                                                <span className="font-medium text-slate-700 dark:text-slate-200">{item.data_type}</span>
+                                                <span className="text-slate-500 dark:text-slate-400">{item.last_status || '--'}</span>
+                                            </div>
+                                            <div className="mt-1 text-slate-500 dark:text-slate-400">
+                                                数据源：{item.data_source || '--'} ｜ 最新日期：{item.last_data_date || '--'}
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {(!subscriptionStatus?.watermarks || subscriptionStatus.watermarks.length === 0) && (
+                                        <div className="text-xs text-slate-500 dark:text-slate-400">暂无增量水位，首次执行后会自动生成。</div>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950">
+                                <div className="text-xs font-medium text-slate-600 dark:text-slate-300">盘中 1 分钟采集</div>
+                                <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                                    状态：{subscriptionStatus?.intraday_capture?.last_status || '未启动'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    最近执行：{formatDateTime(subscriptionStatus?.intraday_capture?.last_run_started_at)}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    最近成功：{formatDateTime(subscriptionStatus?.intraday_capture?.last_success_at)}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    说明：默认采集“配置股票池 + 自选股 + QMT 历史账户持仓”，并写入 `stock_minute_kline`。
+                                </div>
+                                {subscriptionStatus?.intraday_capture?.last_error && (
+                                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-300">
+                                        {subscriptionStatus.intraday_capture.last_error}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
                     {/* 下载按钮 */}
-                    <div className="pt-2">
+                    <div className="grid gap-3 pt-2 md:grid-cols-2">
                         <button
                             onClick={handleDownloadData}
                             disabled={downloading || selectedDataTypes.length === 0}
@@ -1121,13 +1906,13 @@ export default function Settings() {
                                 </>
                             )}
                         </button>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 text-center">
-                            将下载所选日期范围内的全部股票数据
-                        </p>
+                        <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-3 text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                            将下载所选日期范围内的全部股票数据；自动订阅只补最新增量，不会每次全量重下。
+                        </div>
                     </div>
 
                     {/* 下载进度展示 */}
-                    {dataTasks.filter(t => t.status === 'running' || t.status === 'pending').length > 0 && (
+                    {visibleRunningTasks.length > 0 && (
                         <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700">
                             <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2">
                                 <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
@@ -1135,11 +1920,11 @@ export default function Settings() {
                             </h3>
                             
                             <div className="space-y-3">
-                                {dataTasks
-                                    .filter(t => t.status === 'running' || t.status === 'pending')
+                                {visibleRunningTasks
                                     .map((task, index) => {
                                         const Icon = getDataTypeIcon(task.task_type)
                                         const progress = task.progress || 0
+                                        const isQmtMinuteTask = task.task_type === 'minute_kline' && task.data_source === 'qmt'
                                         
                                         return (
                                             <div 
@@ -1171,7 +1956,13 @@ export default function Settings() {
                                                 <div className="mb-2">
                                                     <div className="flex justify-between text-xs text-slate-600 dark:text-slate-400 mb-1">
                                                         <span>进度: {progress}%</span>
-                                                        <span>{task.downloaded_records || 0} 条记录</span>
+                                                        <span>
+                                                            {isQmtMinuteTask
+                                                                ? (task.status === 'completed'
+                                                                    ? `${task.downloaded_records || 0} 条记录`
+                                                                    : 'QMT 导库执行中，记录数完成后回填')
+                                                                : `${task.downloaded_records || 0} 条记录`}
+                                                        </span>
                                                     </div>
                                                     <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
                                                         <div 
@@ -1182,8 +1973,16 @@ export default function Settings() {
                                                 </div>
                                                 
                                                 {/* 任务信息 */}
-                                                <div className="text-xs text-slate-500 dark:text-slate-400">
-                                                    创建时间: {new Date(task.created_at).toLocaleString('zh-CN')}
+                                                <div className="space-y-1 text-xs text-slate-500 dark:text-slate-400">
+                                                    <div className="flex flex-wrap gap-x-4 gap-y-1">
+                                                        <span>数据源：{dataSourceLabel(task.data_source)}</span>
+                                                        <span>创建时间：{new Date(task.created_at).toLocaleString('zh-CN')}</span>
+                                                    </div>
+                                                    {task.error_message && (
+                                                        <div className="rounded bg-white/70 px-2 py-1 text-slate-600 dark:bg-slate-900/40 dark:text-slate-300">
+                                                            {task.error_message}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </div>
                                         )
@@ -1194,10 +1993,21 @@ export default function Settings() {
 
                     {/* 已下载数据展示 */}
                     <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-700">
-                        <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2">
-                            <BarChart3 className="w-4 h-4 text-blue-500" />
-                            已下载数据
-                        </h3>
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                            <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2">
+                                <BarChart3 className="w-4 h-4 text-blue-500" />
+                                已下载数据
+                            </h3>
+                            <button
+                                type="button"
+                                onClick={handleSyncDailyCache}
+                                disabled={dailyCacheSyncing}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-700 transition hover:bg-blue-50 disabled:opacity-60 dark:border-blue-900/50 dark:text-blue-300 dark:hover:bg-blue-950/30"
+                            >
+                                {dailyCacheSyncing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
+                                {dailyCacheSyncing ? '同步中...' : '同步日K缓存'}
+                            </button>
+                        </div>
                         
                         {dataStats.length === 0 ? (
                             <div className="text-center py-8 text-slate-500 dark:text-slate-400">
@@ -1211,6 +2021,7 @@ export default function Settings() {
                                     const Icon = getDataTypeIcon(stat.data_type)
                                     const isComplete = stat.data_quality_score >= 90
                                     const hasIssues = stat.data_quality_score < 80
+                                    const qualityResult = qualityCheckResults[stat.data_type]
                                     
                                     return (
                                         <div 
@@ -1230,14 +2041,24 @@ export default function Settings() {
                                                         {getDataTypeName(stat.data_type)}
                                                     </span>
                                                 </div>
-                                                <div className={`px-2 py-1 rounded text-xs font-medium ${
-                                                    isComplete 
-                                                        ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' 
-                                                        : hasIssues 
-                                                            ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
-                                                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
-                                                }`}>
-                                                    {isComplete ? '✓ 完整' : hasIssues ? '⚠ 部分缺失' : '○ 一般'}
+                                                <div className="flex items-center gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleCheckQuality(stat.data_type)}
+                                                        disabled={qualityCheckingType === stat.data_type}
+                                                        className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                                                    >
+                                                        {qualityCheckingType === stat.data_type ? '检查中...' : '检查完整性'}
+                                                    </button>
+                                                    <div className={`px-2 py-1 rounded text-xs font-medium ${
+                                                        isComplete 
+                                                            ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' 
+                                                            : hasIssues 
+                                                                ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+                                                                : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
+                                                    }`}>
+                                                        {isComplete ? '✓ 完整' : hasIssues ? '⚠ 部分缺失' : '○ 一般'}
+                                                    </div>
                                                 </div>
                                             </div>
                                             
@@ -1261,6 +2082,21 @@ export default function Settings() {
                                                     </div>
                                                 </div>
                                                 <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">覆盖交易日</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                                                        {stat.trading_days || 0} 天
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                                <div>
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">最近更新时间</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100 text-xs">
+                                                        {formatDateTime(stat.last_table_updated_at || stat.updated_at)}
+                                                    </div>
+                                                </div>
+                                                <div>
                                                     <div className="text-slate-500 dark:text-slate-400 text-xs">质量评分</div>
                                                     <div className={`font-semibold ${
                                                         isComplete ? 'text-green-600 dark:text-green-400' :
@@ -1270,11 +2106,33 @@ export default function Settings() {
                                                         {stat.data_quality_score || 0}/100
                                                     </div>
                                                 </div>
+                                                <div className="col-span-2">
+                                                    <div className="text-slate-500 dark:text-slate-400 text-xs">深度校验结果</div>
+                                                    <div className="font-semibold text-slate-900 dark:text-slate-100 text-xs">
+                                                        {qualityResult
+                                                            ? (qualityResult.valid ? '通过' : `发现 ${qualityResult.issues?.length || 0} 个问题`)
+                                                            : '未执行'}
+                                                    </div>
+                                                </div>
                                             </div>
-                                            
-                                            {stat.last_updated && (
-                                                <div className="mt-2 pt-2 border-t border-slate-100 dark:border-slate-700 text-xs text-slate-500 dark:text-slate-400">
-                                                    最后更新: {stat.last_updated}
+
+                                            {qualityResult && (
+                                                <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${
+                                                    qualityResult.valid
+                                                        ? 'border-green-200 bg-green-50 text-green-700 dark:border-green-900/40 dark:bg-green-950/20 dark:text-green-300'
+                                                        : 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300'
+                                                }`}>
+                                                    {qualityResult.valid ? (
+                                                        <div>
+                                                            校验通过：覆盖 {qualityResult.stats?.unique_symbols || 0} 个标的，{qualityResult.stats?.trading_days || 0} 个交易日。
+                                                        </div>
+                                                    ) : (
+                                                        <div className="space-y-1">
+                                                            {(qualityResult.issues || []).slice(0, 4).map((issue: string, issueIndex: number) => (
+                                                                <div key={issueIndex}>- {issue}</div>
+                                                            ))}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             )}
                                         </div>
@@ -1286,6 +2144,149 @@ export default function Settings() {
 
                 </div>
             </div>
+            )}
+
+            {activeSettingsSection === 'qmt' && (
+                <>
+                    <div className="card space-y-4">
+                        <div className="flex items-center gap-2">
+                            <Radio className="w-5 h-5 text-indigo-500" />
+                            <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">虚拟仓与实盘仓配置</h2>
+                            {qmtStatusLoading && <Loader2 className="ml-auto w-4 h-4 animate-spin text-slate-400" />}
+                        </div>
+                        <div className="text-sm text-slate-500 dark:text-slate-400">
+                            这里展示当前运行中的 QMT 账户与目录配置状态，按虚拟仓和实盘仓分开展示，便于核对账号、桥接地址、用户目录和连接健康度。
+                        </div>
+
+                        <div className="grid gap-3 md:grid-cols-4">
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">连接状态</div>
+                                <div className={`mt-2 text-sm font-semibold ${qmtConnected ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'}`}>
+                                    {qmtConnected ? '已连接' : '未连接'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {qmtConnection?.host || '--'}:{qmtConnection?.port || '--'}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">当前账户</div>
+                                <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {qmtConnection?.account_name || qmtConnection?.account_id || '--'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {qmtConnection?.account_type || '--'} ｜ {qmtConnection?.provider || 'QMT'}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">总资产</div>
+                                <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    ¥{formatCurrency(qmtOverview?.summary?.total_asset)}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    可用资金：¥{formatCurrency(qmtOverview?.summary?.available_cash)}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">最近同步</div>
+                                <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {formatDateTime(qmtOverview?.last_synced_at || qmtOverview?.fetched_at)}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    持仓数：{qmtOverview?.summary?.position_count || 0}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={handleSaveQmtConfig}
+                                disabled={saving}
+                                className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700 disabled:opacity-60"
+                            >
+                                {saving ? '保存中...' : '保存账号配置'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={loadQmtStatus}
+                                disabled={qmtStatusLoading}
+                                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                            >
+                                刷新配置状态
+                            </button>
+                        </div>
+
+                        <div className="grid gap-4 xl:grid-cols-2">
+                            {renderQmtAccountConfigCard(
+                                '虚拟仓账号与目录',
+                                'paper',
+                                '打开虚拟仓',
+                                '/virtual-warehouse',
+                                '用于模拟联调与纸面交易，可写入委托。',
+                            )}
+                            {renderQmtAccountConfigCard(
+                                '实盘仓账号与目录',
+                                'live',
+                                '打开实盘仓',
+                                '/live-warehouse',
+                                '用于实盘只读查看与状态校验，默认禁止交易。',
+                            )}
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">辅助入口</div>
+                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">设置页只保留配置核对，详细日志和运行明细进入专页查看。</div>
+                            <div className="mt-4 grid gap-3 md:grid-cols-2">
+                                <button
+                                    type="button"
+                                    onClick={() => navigate('/debug/logs')}
+                                    className="rounded-xl border border-slate-200 px-4 py-3 text-left transition hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-900/60"
+                                >
+                                    <div className="text-sm font-medium text-slate-900 dark:text-slate-100">打开日志调试</div>
+                                    <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">实时查看后端、QMT 与订阅任务日志。</div>
+                                </button>
+                                <div className="rounded-xl border border-dashed border-slate-200 px-4 py-3 dark:border-slate-800">
+                                    <div className="text-sm font-medium text-slate-900 dark:text-slate-100">当前模式说明</div>
+                                    <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                        本页用于展示运行中配置状态；若后续要支持直接修改账号和目录，需要额外增加配置保存接口。
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {activeSettingsSection === 'system' && (
+                <div className="card space-y-4">
+                    <div className="flex items-center gap-2">
+                        <AlertCircle className="w-5 h-5 text-slate-500" />
+                        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">调试与排查入口</h2>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-3">
+                        <button type="button" onClick={() => navigate('/debug/logs')} className="rounded-2xl border border-slate-200 px-4 py-4 text-left transition hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-900/60">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">实时日志</div>
+                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">查看程序运行日志、错误堆栈和流式输出。</div>
+                        </button>
+                        <button type="button" onClick={() => navigate('/feedback')} className="rounded-2xl border border-slate-200 px-4 py-4 text-left transition hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-900/60">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">问题反馈</div>
+                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">记录页面异常、体验问题和功能优化建议。</div>
+                        </button>
+                        <div className="rounded-2xl border border-slate-200 px-4 py-4 dark:border-slate-800">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">状态摘要</div>
+                            <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                                当前令牌数：{tokens.length} 个
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                QMT 状态：{qmtConnected ? '已连接' : '未连接'}
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                最近同步：{formatDateTime(qmtOverview?.last_synced_at || qmtOverview?.fetched_at)}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             <div className="flex items-center gap-4">
                 <button onClick={handleSaveAll} disabled={saveAllSaving} className="btn-primary inline-flex items-center gap-2">

@@ -23,6 +23,11 @@ class DataSourceMonitor:
             'daily_limit': 188,
             'description': '快速、高质量数据源'
         },
+        'qmt': {
+            'name': 'QMT',
+            'daily_limit': None,
+            'description': '本机 / 桥接 xtquant 历史分钟线数据源'
+        },
         'akshare': {
             'name': 'AKShare',
             'daily_limit': None,  # 无限制
@@ -32,6 +37,7 @@ class DataSourceMonitor:
 
     def __init__(self):
         self.stats = self._load_stats()
+        self._ensure_source_keys()
 
     def _load_stats(self) -> Dict:
         """加载统计数据"""
@@ -50,6 +56,12 @@ class DataSourceMonitor:
                 'total_records': 0,
                 'errors': 0
             },
+            'qmt': {
+                'daily_usage': {},
+                'total_downloads': 0,
+                'total_records': 0,
+                'errors': 0
+            },
             'akshare': {
                 'daily_usage': {},
                 'total_downloads': 0,
@@ -57,6 +69,16 @@ class DataSourceMonitor:
                 'errors': 0
             }
         }
+
+    def _ensure_source_keys(self):
+        for source in self.DATA_SOURCES:
+            if source not in self.stats:
+                self.stats[source] = {
+                    'daily_usage': {},
+                    'total_downloads': 0,
+                    'total_records': 0,
+                    'errors': 0
+                }
 
     def _save_stats(self):
         """保存统计数据"""

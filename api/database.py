@@ -82,6 +82,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_backtest_data_schema()
 
 
 def _ensure_report_schema() -> None:
@@ -152,11 +153,242 @@ def _ensure_user_schema() -> None:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN wecom_webhook_encrypted TEXT"))
             if "default_analysts" not in llm_columns:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN default_analysts TEXT"))
+            if "qmt_paper_account_config" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN qmt_paper_account_config TEXT"))
+            if "qmt_live_account_config" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN qmt_live_account_config TEXT"))
     except Exception as e:
         logger.error("Failed to ensure user schema: %s", e)
 
     _migrate_tokens_to_hashed()
     _migrate_api_keys_reencrypt()
+
+
+def _ensure_backtest_data_schema() -> None:
+    """Ensure backtest subscription/config/task tables exist and contain required columns."""
+    try:
+        with engine.begin() as conn:
+            if IS_SQLITE:
+                array_type = "TEXT"
+                json_default = "'[]'"
+                create_tasks = f"""
+                    CREATE TABLE IF NOT EXISTS backtest_data_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id VARCHAR(36) NOT NULL,
+                        task_type VARCHAR(50) NOT NULL,
+                        data_source VARCHAR(100),
+                        date_range_start DATE NOT NULL,
+                        date_range_end DATE NOT NULL,
+                        symbols {array_type},
+                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        progress INTEGER DEFAULT 0,
+                        total_records INTEGER DEFAULT 0,
+                        downloaded_records INTEGER DEFAULT 0,
+                        error_message TEXT,
+                        subscription_config_id INTEGER,
+                        trigger_mode VARCHAR(20) DEFAULT 'manual',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP
+                    )
+                """
+                create_configs = f"""
+                    CREATE TABLE IF NOT EXISTS backtest_data_configs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id VARCHAR(36) NOT NULL,
+                        config_name VARCHAR(100) NOT NULL,
+                        enabled_data_types {array_type} NOT NULL DEFAULT {json_default},
+                        default_date_range_days INTEGER DEFAULT 365,
+                        default_symbols {array_type} DEFAULT {json_default},
+                        data_source_preference VARCHAR(100) DEFAULT 'akshare',
+                        auto_download BOOLEAN DEFAULT FALSE,
+                        update_frequency VARCHAR(20),
+                        schedule_time VARCHAR(8) DEFAULT '18:30',
+                        timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
+                        only_trading_day BOOLEAN DEFAULT 1,
+                        last_run_at TIMESTAMP,
+                        last_success_at TIMESTAMP,
+                        last_updated_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                create_stats = f"""
+                    CREATE TABLE IF NOT EXISTS backtest_data_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        data_type VARCHAR(50) NOT NULL,
+                        symbol VARCHAR(20),
+                        date_range_start DATE,
+                        date_range_end DATE,
+                        total_records BIGINT DEFAULT 0,
+                        last_updated_date DATE,
+                        data_quality_score INTEGER DEFAULT 100,
+                        missing_dates {array_type},
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                create_watermarks = """
+                    CREATE TABLE IF NOT EXISTS backtest_data_watermarks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id VARCHAR(36) NOT NULL,
+                        config_id INTEGER,
+                        data_type VARCHAR(50) NOT NULL,
+                        data_source VARCHAR(100),
+                        scope_key TEXT NOT NULL,
+                        last_data_date DATE,
+                        last_run_started_at TIMESTAMP,
+                        last_success_at TIMESTAMP,
+                        last_status VARCHAR(20),
+                        last_error TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+            else:
+                create_tasks = """
+                    CREATE TABLE IF NOT EXISTS backtest_data_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(36) NOT NULL,
+                        task_type VARCHAR(50) NOT NULL,
+                        data_source VARCHAR(100),
+                        date_range_start DATE NOT NULL,
+                        date_range_end DATE NOT NULL,
+                        symbols TEXT[],
+                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        progress INTEGER DEFAULT 0,
+                        total_records INTEGER DEFAULT 0,
+                        downloaded_records INTEGER DEFAULT 0,
+                        error_message TEXT,
+                        subscription_config_id INTEGER,
+                        trigger_mode VARCHAR(20) DEFAULT 'manual',
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        completed_at TIMESTAMP
+                    )
+                """
+                create_configs = """
+                    CREATE TABLE IF NOT EXISTS backtest_data_configs (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(36) NOT NULL,
+                        config_name VARCHAR(100) NOT NULL,
+                        enabled_data_types TEXT[] NOT NULL DEFAULT '{}',
+                        default_date_range_days INTEGER DEFAULT 365,
+                        default_symbols TEXT[] DEFAULT '{}',
+                        data_source_preference VARCHAR(100) DEFAULT 'akshare',
+                        auto_download BOOLEAN DEFAULT FALSE,
+                        update_frequency VARCHAR(20),
+                        schedule_time VARCHAR(8) DEFAULT '18:30',
+                        timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
+                        only_trading_day BOOLEAN DEFAULT TRUE,
+                        last_run_at TIMESTAMP,
+                        last_success_at TIMESTAMP,
+                        last_updated_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        CONSTRAINT unique_user_config_name UNIQUE (user_id, config_name)
+                    )
+                """
+                create_stats = """
+                    CREATE TABLE IF NOT EXISTS backtest_data_stats (
+                        id SERIAL PRIMARY KEY,
+                        data_type VARCHAR(50) NOT NULL,
+                        symbol VARCHAR(20),
+                        date_range_start DATE,
+                        date_range_end DATE,
+                        total_records BIGINT DEFAULT 0,
+                        last_updated_date DATE,
+                        data_quality_score INTEGER DEFAULT 100,
+                        missing_dates DATE[],
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        CONSTRAINT unique_data_stats UNIQUE (data_type, symbol)
+                    )
+                """
+                create_watermarks = """
+                    CREATE TABLE IF NOT EXISTS backtest_data_watermarks (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(36) NOT NULL,
+                        config_id INTEGER,
+                        data_type VARCHAR(50) NOT NULL,
+                        data_source VARCHAR(100),
+                        scope_key TEXT NOT NULL,
+                        last_data_date DATE,
+                        last_run_started_at TIMESTAMP,
+                        last_success_at TIMESTAMP,
+                        last_status VARCHAR(20),
+                        last_error TEXT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        CONSTRAINT uq_backtest_watermark UNIQUE (user_id, config_id, data_type, data_source, scope_key)
+                    )
+                """
+
+            conn.execute(text(create_tasks))
+            conn.execute(text(create_configs))
+            conn.execute(text(create_stats))
+            conn.execute(text(create_watermarks))
+
+            if IS_SQLITE:
+                task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_tasks)"))}
+                config_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_configs)"))}
+                watermark_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_watermarks)"))}
+            else:
+                task_columns = {
+                    row[0] for row in conn.execute(text("""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'backtest_data_tasks' AND table_schema = 'public'
+                    """))
+                }
+                config_columns = {
+                    row[0] for row in conn.execute(text("""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'backtest_data_configs' AND table_schema = 'public'
+                    """))
+                }
+                watermark_columns = {
+                    row[0] for row in conn.execute(text("""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'backtest_data_watermarks' AND table_schema = 'public'
+                    """))
+                }
+
+            if "subscription_config_id" not in task_columns:
+                conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN subscription_config_id INTEGER"))
+            if "trigger_mode" not in task_columns:
+                conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN trigger_mode VARCHAR(20) DEFAULT 'manual'"))
+
+            if "schedule_time" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN schedule_time VARCHAR(8) DEFAULT '18:30'"))
+            if "timezone" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN timezone VARCHAR(64) DEFAULT 'Asia/Shanghai'"))
+            if "only_trading_day" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN only_trading_day BOOLEAN DEFAULT TRUE"))
+            if "last_run_at" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN last_run_at TIMESTAMP"))
+            if "last_success_at" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN last_success_at TIMESTAMP"))
+
+            if "scope_key" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN scope_key TEXT DEFAULT 'all'"))
+            if "last_data_date" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_data_date DATE"))
+            if "last_run_started_at" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_run_started_at TIMESTAMP"))
+            if "last_success_at" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_success_at TIMESTAMP"))
+            if "last_status" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_status VARCHAR(20)"))
+            if "last_error" not in watermark_columns:
+                conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_error TEXT"))
+
+            if not IS_SQLITE:
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_user_id ON backtest_data_tasks(user_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_status ON backtest_data_tasks(status)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_configs_user_id ON backtest_data_configs(user_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_watermarks_lookup ON backtest_data_watermarks(user_id, config_id, data_type)"))
+    except Exception as e:
+        logger.error("Failed to ensure backtest data schema: %s", e)
 
 
 def _migrate_tokens_to_hashed() -> None:
@@ -383,6 +615,8 @@ class UserLLMConfigDB(Base):
     api_key_encrypted = Column(Text, nullable=True)
     wecom_webhook_encrypted = Column(Text, nullable=True)
     default_analysts = Column(Text, nullable=True)  # JSON list, e.g. '["market","social",...]'
+    qmt_paper_account_config = Column(Text, nullable=True)
+    qmt_live_account_config = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

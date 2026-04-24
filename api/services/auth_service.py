@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -15,6 +16,7 @@ import jwt
 from jwt.exceptions import PyJWTError as JWTError
 from sqlalchemy.orm import Session
 
+from api.core.settings import settings
 from api.database import EmailVerificationCodeDB, UserDB, UserLLMConfigDB
 
 
@@ -240,6 +242,94 @@ def get_user_llm_config(db: Session, user_id: str) -> Optional[UserLLMConfigDB]:
     return db.query(UserLLMConfigDB).filter(UserLLMConfigDB.user_id == user_id).first()
 
 
+def _parse_json_text(value: Optional[str]) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def normalize_qmt_account_config(payload: Optional[dict[str, Any]], *, role: str, defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    base = dict(defaults or {})
+    source = dict(payload or {})
+    target_role = "live" if str(role or "").strip().lower() == "live" else "paper"
+    key_default = "live_real" if target_role == "live" else "paper_sim"
+
+    port_value = source.get("port", base.get("port", 58610))
+    try:
+        port = int(port_value or 58610)
+    except Exception:
+        port = 58610
+
+    return {
+        "key": str(source.get("key") or base.get("key") or key_default).strip() or key_default,
+        "role": target_role,
+        "enabled": bool(source.get("enabled", base.get("enabled", False))),
+        "host": str(source.get("host") or base.get("host") or settings.qmt_host).strip() or settings.qmt_host,
+        "port": port,
+        "account_id": str(source.get("account_id") or base.get("account_id") or "").strip(),
+        "account_type": str(source.get("account_type") or base.get("account_type") or "STOCK").strip() or "STOCK",
+        "account_name": str(source.get("account_name") or base.get("account_name") or ("QMT 实盘账户" if target_role == "live" else "QMT 虚拟账户")).strip() or ("QMT 实盘账户" if target_role == "live" else "QMT 虚拟账户"),
+        "userdata_path": str(source.get("userdata_path") or base.get("userdata_path") or "").strip(),
+        "bridge_base_url": str(source.get("bridge_base_url") or base.get("bridge_base_url") or "").strip(),
+    }
+
+
+def default_qmt_account_configs() -> dict[str, dict[str, Any]]:
+    defaults: dict[str, dict[str, Any]] = {
+        "paper": normalize_qmt_account_config(
+            {
+                "key": "paper_sim",
+                "role": "paper",
+                "enabled": False,
+                "host": settings.qmt_host,
+                "port": settings.qmt_port,
+                "account_id": settings.qmt_account_id,
+                "account_type": settings.qmt_account_type,
+                "account_name": settings.qmt_account_name or "QMT 虚拟账户",
+                "userdata_path": settings.qmt_userdata_path,
+                "bridge_base_url": settings.qmt_bridge_base_url,
+            },
+            role="paper",
+        ),
+        "live": normalize_qmt_account_config(
+            {
+                "key": "live_real",
+                "role": "live",
+                "enabled": False,
+                "host": settings.qmt_host,
+                "port": settings.qmt_port,
+                "account_id": "",
+                "account_type": settings.qmt_account_type,
+                "account_name": "QMT 实盘账户",
+                "userdata_path": "",
+                "bridge_base_url": "",
+            },
+            role="live",
+        ),
+    }
+    for raw in settings.qmt_accounts():
+        role = "live" if str(raw.get("role") or "").strip().lower() == "live" else "paper"
+        defaults[role] = normalize_qmt_account_config(raw, role=role, defaults=defaults.get(role))
+    return defaults
+
+
+def get_user_qmt_account_configs(db: Session, user_id: str) -> dict[str, dict[str, Any]]:
+    defaults = default_qmt_account_configs()
+    row = get_user_llm_config(db, user_id)
+    if not row:
+        return defaults
+    paper_raw = _parse_json_text(getattr(row, "qmt_paper_account_config", None))
+    live_raw = _parse_json_text(getattr(row, "qmt_live_account_config", None))
+    return {
+        "paper": normalize_qmt_account_config(paper_raw, role="paper", defaults=defaults["paper"]),
+        "live": normalize_qmt_account_config(live_raw, role="live", defaults=defaults["live"]),
+    }
+
+
 def upsert_user_llm_config(
     db: Session,
     user_id: str,
@@ -255,6 +345,8 @@ def upsert_user_llm_config(
     clear_api_key: bool = False,
     clear_wecom_webhook: bool = False,
     default_analysts: Optional[list] = None,
+    qmt_paper_account_config: Optional[dict[str, Any]] = None,
+    qmt_live_account_config: Optional[dict[str, Any]] = None,
 ) -> UserLLMConfigDB:
     row = get_user_llm_config(db, user_id)
     now = _utcnow()
@@ -286,8 +378,18 @@ def upsert_user_llm_config(
         row.wecom_webhook_encrypted = encrypt_secret(wecom_webhook_url)
 
     if default_analysts is not None:
-        import json
         row.default_analysts = json.dumps(default_analysts)
+    defaults = default_qmt_account_configs()
+    if qmt_paper_account_config is not None:
+        row.qmt_paper_account_config = json.dumps(
+            normalize_qmt_account_config(qmt_paper_account_config, role="paper", defaults=defaults["paper"]),
+            ensure_ascii=False,
+        )
+    if qmt_live_account_config is not None:
+        row.qmt_live_account_config = json.dumps(
+            normalize_qmt_account_config(qmt_live_account_config, role="live", defaults=defaults["live"]),
+            ensure_ascii=False,
+        )
 
     row.updated_at = now
     db.commit()

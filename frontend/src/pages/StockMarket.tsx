@@ -1,0 +1,341 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Loader2, RefreshCw, Search, TrendingDown, TrendingUp } from 'lucide-react'
+
+import KlinePanel from '@/components/KlinePanel'
+import { api } from '@/services/api'
+import type { MarketOverviewResponse, MarketSectorItem, MarketTickerItem, StockSearchResult } from '@/types'
+
+function formatDateTime(value?: string | null) {
+  if (!value) return '--'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatNumber(value?: number | null, digits = 2) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '--'
+  return number.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+function formatPercent(value?: number | null) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '--'
+  return `${number >= 0 ? '+' : ''}${formatNumber(number)}%`
+}
+
+function formatMoneyFlow(value?: number | null) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '--'
+  const abs = Math.abs(number)
+  if (abs >= 1e8) return `${number >= 0 ? '+' : '-'}${formatNumber(abs / 1e8)}亿`
+  if (abs >= 1e4) return `${number >= 0 ? '+' : '-'}${formatNumber(abs / 1e4)}万`
+  return `${number >= 0 ? '+' : ''}${formatNumber(number)}`
+}
+
+function createFallbackOverview(): MarketOverviewResponse {
+  return {
+    indices: [
+      { symbol: '000001.SH', name: '上证指数', price: null, change_pct: null, source: 'fallback' },
+      { symbol: '399001.SZ', name: '深证成指', price: null, change_pct: null, source: 'fallback' },
+      { symbol: '399006.SZ', name: '创业板指', price: null, change_pct: null, source: 'fallback' },
+    ],
+    top_gainers: [],
+    top_losers: [],
+    sector_gainers: [],
+    sector_losers: [],
+    sector_fund_inflows: [],
+    sector_fund_outflows: [],
+    updated_at: new Date().toISOString(),
+    source: 'frontend_fallback',
+    fallback: true,
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function MarketListCard({
+  title,
+  items = [],
+  onSelect,
+  isSector = false,
+  valueMode = 'change',
+}: {
+  title: string
+  items?: MarketTickerItem[] | MarketSectorItem[]
+  onSelect?: (symbol: string) => void
+  isSector?: boolean
+  valueMode?: 'change' | 'flow'
+}) {
+  return (
+    <div className="card">
+      <div className="mb-4 flex items-center justify-between">
+        <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
+      </div>
+      <div className="space-y-2">
+        {items.length === 0 && (
+          <div className="rounded-xl bg-slate-50 px-3 py-6 text-center text-sm text-slate-500 dark:bg-slate-900/40 dark:text-slate-400">
+            暂无数据
+          </div>
+        )}
+        {items.map((item, index) => {
+          const value = valueMode === 'flow'
+            ? Number((item as MarketSectorItem).net_inflow || 0)
+            : Number((item as MarketTickerItem | MarketSectorItem).change_pct || 0)
+          const isPositive = value >= 0
+          return (
+            <button
+              key={`${title}-${index}-${isSector ? (item as MarketSectorItem).sector_name : (item as MarketTickerItem).symbol}`}
+              type="button"
+              onClick={() => !isSector && onSelect?.((item as MarketTickerItem).symbol)}
+              className={`flex w-full items-center justify-between rounded-xl px-3 py-3 text-left transition ${
+                isSector
+                  ? 'bg-slate-50 dark:bg-slate-900/40'
+                  : 'bg-slate-50 hover:bg-slate-100 dark:bg-slate-900/40 dark:hover:bg-slate-800'
+              }`}
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                  {isSector ? (item as MarketSectorItem).sector_name : (item as MarketTickerItem).name}
+                </div>
+                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {isSector
+                    ? valueMode === 'flow'
+                      ? `${formatPercent((item as MarketSectorItem).change_pct)} ｜ ${(item as MarketSectorItem).source?.includes('akshare') ? '资金流' : '板块'}`
+                      : `${(item as MarketSectorItem).member_count || 0} 只成分股`
+                    : `${(item as MarketTickerItem).symbol} ｜ ${formatNumber((item as MarketTickerItem).price)}`}
+                </div>
+              </div>
+              <div className={`shrink-0 text-sm font-semibold ${isPositive ? 'text-red-500' : 'text-emerald-500'}`}>
+                {valueMode === 'flow'
+                  ? formatMoneyFlow((item as MarketSectorItem).net_inflow)
+                  : formatPercent((item as MarketTickerItem | MarketSectorItem).change_pct)}
+              </div>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+export default function StockMarket() {
+  const [overview, setOverview] = useState<MarketOverviewResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selectedSymbol, setSelectedSymbol] = useState('000001.SH')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<StockSearchResult[]>([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [showDropdown, setShowDropdown] = useState(false)
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const loadOverview = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
+    try {
+      const response = await withTimeout(api.getMarketOverview(20), 8000, '市场全景接口响应超时，请检查后端行情服务')
+      setOverview(response)
+      setError(null)
+    } catch (err) {
+      setOverview((current) => current || createFallbackOverview())
+      setError(err instanceof Error ? err.message : '加载股票市场失败')
+    } finally {
+      if (!silent) setLoading(false)
+    }
+  }, [])
+
+  const refreshOverview = useCallback(async () => {
+    setRefreshing(true)
+    await loadOverview(true)
+    setRefreshing(false)
+  }, [loadOverview])
+
+  useEffect(() => {
+    void loadOverview()
+  }, [loadOverview])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshOverview()
+    }, 20000)
+    return () => window.clearInterval(timer)
+  }, [refreshOverview])
+
+  useEffect(() => {
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
+    const q = searchQuery.trim()
+    if (!q) {
+      setSearchResults([])
+      return
+    }
+    searchTimerRef.current = setTimeout(async () => {
+      try {
+        setSearchLoading(true)
+        const response = await api.searchStocks(q)
+        setSearchResults(response.results || [])
+        setShowDropdown(true)
+      } catch {
+        setSearchResults([])
+      } finally {
+        setSearchLoading(false)
+      }
+    }, 250)
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
+    }
+  }, [searchQuery])
+
+  const selectedName = useMemo(() => {
+    const indices = overview?.indices || []
+    const topGainers = overview?.top_gainers || []
+    const topLosers = overview?.top_losers || []
+    const inIndex = indices.find(item => item.symbol === selectedSymbol)?.name
+    if (inIndex) return inIndex
+    const inLists = [...topGainers, ...topLosers].find(item => item.symbol === selectedSymbol)?.name
+    if (inLists) return inLists
+    const inSearch = searchResults.find(item => item.symbol === selectedSymbol)?.name
+    return inSearch || selectedSymbol
+  }, [overview?.indices, overview?.top_gainers, overview?.top_losers, searchResults, selectedSymbol])
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">股票市场</h1>
+          <p className="mt-1 text-slate-500 dark:text-slate-400">
+            查看三大指数、涨跌榜、板块热度和股票搜索，默认每 20 秒自动刷新。
+          </p>
+        </div>
+        <div className="flex flex-col gap-3 md:flex-row md:items-center">
+          <div className="relative min-w-[300px]">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onFocus={() => setShowDropdown(true)}
+              placeholder="搜索股票代码或名称"
+              className="input w-full pl-10 pr-10"
+            />
+            {searchLoading && <Loader2 className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-slate-400" />}
+            {showDropdown && searchResults.length > 0 && (
+              <div className="absolute z-20 mt-2 w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-lg dark:border-slate-700 dark:bg-slate-900">
+                {searchResults.map(result => (
+                  <button
+                    key={result.symbol}
+                    type="button"
+                    onClick={() => {
+                      setSelectedSymbol(result.symbol)
+                      setSearchQuery(`${result.name} ${result.symbol}`)
+                      setShowDropdown(false)
+                    }}
+                    className="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-slate-50 dark:hover:bg-slate-800"
+                  >
+                    <div>
+                      <div className="text-sm font-medium text-slate-900 dark:text-slate-100">{result.name}</div>
+                      <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{result.symbol}</div>
+                    </div>
+                    <div className={`text-xs font-medium ${Number(result.change_pct || 0) >= 0 ? 'text-red-500' : 'text-emerald-500'}`}>
+                      {formatPercent(result.change_pct)}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => void refreshOverview()}
+            disabled={refreshing}
+            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            手动刷新
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
+          {error}
+        </div>
+      )}
+
+      {loading || !overview ? (
+        <div className="card flex min-h-[320px] items-center justify-center text-slate-500 dark:text-slate-400">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          正在加载市场全景...
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-4 xl:grid-cols-3">
+            {(overview.indices || []).map((item) => {
+              const positive = Number(item.change_pct || 0) >= 0
+              return (
+                <button
+                  key={item.symbol}
+                  type="button"
+                  onClick={() => setSelectedSymbol(item.symbol)}
+                  className="card text-left transition hover:border-blue-300 hover:shadow-sm dark:hover:border-blue-700"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-slate-500 dark:text-slate-400">{item.name}</div>
+                      <div className="mt-2 text-2xl font-bold text-slate-900 dark:text-slate-100">{formatNumber(item.price)}</div>
+                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">{item.symbol}</div>
+                    </div>
+                    <div className={`rounded-full px-3 py-1 text-sm font-semibold ${positive ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300' : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'}`}>
+                      {formatPercent(item.change_pct)}
+                    </div>
+                  </div>
+                  <div className="mt-4 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                    <span>{positive ? <TrendingUp className="inline h-3.5 w-3.5 text-red-500" /> : <TrendingDown className="inline h-3.5 w-3.5 text-emerald-500" />} 日内波动</span>
+                    <span>{formatDateTime(item.trade_time)}</span>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="grid gap-4 2xl:grid-cols-[1.3fr,1fr]">
+            <div className="space-y-4">
+              <div className="card">
+                <div className="mb-3 flex items-center justify-between">
+                  <div>
+                    <div className="text-base font-semibold text-slate-900 dark:text-slate-100">K 线详情</div>
+                    <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{selectedName} ｜ {selectedSymbol}</div>
+                  </div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">行情更新：{formatDateTime(overview.updated_at)}</div>
+                </div>
+                <div className="h-[620px]">
+                  <KlinePanel symbol={selectedSymbol} onSymbolChange={setSelectedSymbol} />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <MarketListCard title="个股涨幅榜" items={overview.top_gainers || []} onSelect={setSelectedSymbol} />
+              <MarketListCard title="个股跌幅榜" items={overview.top_losers || []} onSelect={setSelectedSymbol} />
+              <MarketListCard title="板块涨幅榜" items={overview.sector_gainers || []} isSector />
+              <MarketListCard title="板块跌幅榜" items={overview.sector_losers || []} isSector />
+              <MarketListCard title="板块资金流入榜" items={overview.sector_fund_inflows || []} isSector valueMode="flow" />
+              <MarketListCard title="板块资金流出榜" items={overview.sector_fund_outflows || []} isSector valueMode="flow" />
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

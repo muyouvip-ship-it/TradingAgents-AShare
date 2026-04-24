@@ -78,6 +78,13 @@ def run_strategy_backtest(
     raw_data, data_source = _load_daily_kline(symbols, warmup_start_date, end_date)
     feature_frame, compute_backend = compute_daily_features(raw_data, compiled)
     feature_frame = _trim_feature_frame_to_backtest_window(feature_frame, start_date, end_date)
+    _raise_if_backtest_window_has_no_market_data(
+        raw_data=raw_data,
+        feature_frame=feature_frame,
+        start_date=start_date,
+        end_date=end_date,
+        strategy_name=strategy_name,
+    )
     walk_forward = walk_forward or {}
     walk_forward_enabled = bool(walk_forward.get("enabled"))
     walk_forward_report: dict[str, Any] | None = None
@@ -179,6 +186,41 @@ def run_strategy_backtest(
         compiled_strategy=compiled.to_response_payload(),
         artifact_root=artifact_root,
     )
+
+
+def _raise_if_backtest_window_has_no_market_data(
+    *,
+    raw_data: pd.DataFrame,
+    feature_frame: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    strategy_name: str,
+) -> None:
+    if not feature_frame.empty:
+        return
+    requested_start = pd.to_datetime(start_date).date()
+    requested_end = pd.to_datetime(end_date).date()
+    if raw_data.empty:
+        raise ValueError(
+            f"回测失败：策略“{strategy_name}”在 {start_date} 至 {end_date} 没有可用日线数据，请先补齐日 K 数据。"
+        )
+
+    date_column = "date" if "date" in raw_data.columns else "trade_date" if "trade_date" in raw_data.columns else None
+    if date_column is None:
+        raise ValueError(
+            f"回测失败：策略“{strategy_name}”的数据源缺少日期列，无法确认回测窗口。"
+        )
+
+    available_min = pd.to_datetime(raw_data[date_column]).min().date()
+    available_max = pd.to_datetime(raw_data[date_column]).max().date()
+    if available_max < requested_start:
+        raise ValueError(
+            f"回测失败：当前日线缓存最新只到 {available_max.isoformat()}，但你请求的开始日期是 {requested_start.isoformat()}。"
+        )
+    if available_min > requested_end:
+        raise ValueError(
+            f"回测失败：当前日线缓存最早从 {available_min.isoformat()} 开始，但你请求的结束日期是 {requested_end.isoformat()}。"
+        )
 
 
 def build_evolution_candidates(
@@ -288,6 +330,16 @@ def _load_daily_kline(symbols: list[str], start_date: str, end_date: str) -> tup
     )
     if parquet_frame is not None and not parquet_frame.empty:
         normalized = _normalize_daily_frame(parquet_frame)
+        normalized_max_date = pd.to_datetime(normalized["date"]).dt.date.max() if "date" in normalized.columns and not normalized.empty else None
+        requested_end_date = pd.to_datetime(end_date).date()
+        if normalized_max_date and normalized_max_date < requested_end_date:
+            tail_start_date = (normalized_max_date + timedelta(days=1)).isoformat()
+            db_tail = _try_load_daily_kline_from_db(symbols, tail_start_date, end_date)
+            if db_tail is not None and not db_tail.empty:
+                merged = pd.concat([normalized, db_tail], ignore_index=True)
+                merged = _normalize_daily_frame(merged)
+                write_daily_kline_parquet_cache(db_tail)
+                return _enrich_daily_kline_metadata(merged, end_date), "duckdb:parquet+postgresql_tail:stock_daily_kline"
         return _enrich_daily_kline_metadata(normalized, end_date), "duckdb:parquet:stock_daily_kline"
     db_frame = _try_load_daily_kline_from_db(symbols, start_date, end_date)
     if db_frame is not None and not db_frame.empty:
@@ -754,7 +806,17 @@ def _entry_mask(daily: pd.DataFrame, compiled: CompiledStrategy, *, include_minu
         elif rule_key == "lazy_minute_confirm":
             mask = mask & (daily["momentum_20d"] >= 0)
         elif rule_key == "cross_above":
-            mask = mask & (daily["close"] >= daily["ma5"])
+            params = rule.get("params") or {}
+            left = str(params.get("left") or "close")
+            right = str(params.get("right") or "ma5")
+            if left == "first_day_band" and right == "first_day_band_b1" and "first_day_band_cross" in daily.columns:
+                mask = mask & (pd.to_numeric(daily["first_day_band_cross"], errors="coerce").fillna(0.0) > 0)
+            elif left in daily.columns and right in daily.columns:
+                mask = mask & (pd.to_numeric(daily[left], errors="coerce") >= pd.to_numeric(daily[right], errors="coerce"))
+            elif right in daily.columns:
+                mask = mask & (daily["close"] >= pd.to_numeric(daily[right], errors="coerce"))
+            else:
+                mask = mask & (daily["close"] >= daily["ma5"])
         else:
             mask = mask & (daily["close"] > daily["ma20"])
     if not compiled.entry_rules:
@@ -762,26 +824,35 @@ def _entry_mask(daily: pd.DataFrame, compiled: CompiledStrategy, *, include_minu
     return mask.fillna(False)
 
 
-def _should_exit_from_compiled_rules(row: pd.Series, compiled: CompiledStrategy) -> bool:
+def _exit_reason_from_compiled_rules(row: pd.Series, compiled: CompiledStrategy) -> str | None:
     if not compiled.exit_rules:
-        return float(row["close"]) < float(row["ma20"])
+        return "close_below_ma20" if float(row["close"]) < float(row["ma20"]) else None
     for rule in compiled.exit_rules:
         rule_key = rule.get("rule_key")
         params = rule.get("params") or {}
         if rule_key == "close_below_indicator":
-            indicator = str(params.get("right") or "ma20")
-            if indicator in row and float(row["close"]) < float(row[indicator]):
-                return True
+            left = str(params.get("left") or "close")
+            right = str(params.get("right") or "ma20")
+            if left == "first_day_band" and right == "first_day_band_b1" and float(row.get("first_day_band_dead_cross", 0.0) or 0.0) > 0:
+                return "first_day_band_dead_cross"
+            if left in row and right in row and float(row[left]) < float(row[right]):
+                return f"{left}_below_{right}"
+            if right in row and float(row["close"]) < float(row[right]):
+                return f"close_below_{right}"
         elif rule_key == "factor_rank_drop":
             rank_below = float(params.get("rank_below") or 0.5)
             if float(row.get("factor_score", 0.0)) < rank_below:
-                return True
+                return "factor_rank_drop"
         elif rule_key == "atr_trailing_stop":
             if float(row["close"]) < float(row["ma20"]):
-                return True
+                return "atr_trailing_stop"
         elif float(row["close"]) < float(row["ma20"]):
-            return True
-    return False
+            return "close_below_ma20"
+    return None
+
+
+def _should_exit_from_compiled_rules(row: pd.Series, compiled: CompiledStrategy) -> bool:
+    return _exit_reason_from_compiled_rules(row, compiled) is not None
 
 
 def _simulate_portfolio(
@@ -1048,8 +1119,8 @@ def _simulate_portfolio(
                     exit_reason = "take_profit"
                 elif drawdown_from_high >= trailing_stop:
                     exit_reason = "trailing_stop"
-                elif _should_exit_from_compiled_rules(row, compiled):
-                    exit_reason = "close_below_ma20"
+                else:
+                    exit_reason = _exit_reason_from_compiled_rules(row, compiled)
                 if exit_reason and date_index + 1 < len(dates):
                     order_id = _append_order(
                         orders,

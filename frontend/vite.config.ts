@@ -70,4 +70,23 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined
+          if (id.includes('/lightweight-charts/')) return 'vendor-lightweight-charts'
+          if (id.includes('/recharts/')) return 'vendor-recharts'
+          if (id.includes('/@xyflow/')) return 'vendor-flow'
+          if (id.includes('/react-markdown/') || id.includes('/remark-gfm/') || id.includes('/micromark') || id.includes('/mdast') || id.includes('/unist')) {
+            return 'vendor-markdown'
+          }
+          if (id.includes('/lucide-react/') || id.includes('/@heroicons/')) {
+            return 'vendor-icons'
+          }
+          return undefined
+        },
+      },
+    },
+  },
 })

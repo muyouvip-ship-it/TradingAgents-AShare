@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Database, Landmark, RefreshCw, Send, Wifi, WifiOff, XCircle } from 'lucide-react'
 
 import { api } from '@/services/api'
-import type { PaperAccount, StrategyDefinition, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
+import type { QmtBulkSellTask, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
 
 function formatMoney(value?: number | null) {
   if (value == null || Number.isNaN(value)) return '--'
@@ -32,9 +32,47 @@ function formatDateTime(value?: string | null) {
 
 function tone(value?: number | null) {
   if (value == null) return 'text-slate-500'
-  if (value > 0) return 'text-emerald-600 dark:text-emerald-400'
-  if (value < 0) return 'text-rose-600 dark:text-rose-400'
+  if (value > 0) return 'text-rose-600 dark:text-rose-400'
+  if (value < 0) return 'text-emerald-600 dark:text-emerald-400'
   return 'text-slate-500'
+}
+
+function normalizeTimeValue(value?: string | null) {
+  if (!value) return null
+  const parsed = new Date(value)
+  if (!Number.isNaN(parsed.getTime())) return parsed
+
+  const digits = value.replace(/[^\d]/g, '')
+  if (digits.length === 14) {
+    const year = Number(digits.slice(0, 4))
+    const month = Number(digits.slice(4, 6)) - 1
+    const day = Number(digits.slice(6, 8))
+    const hour = Number(digits.slice(8, 10))
+    const minute = Number(digits.slice(10, 12))
+    const second = Number(digits.slice(12, 14))
+    const fallback = new Date(year, month, day, hour, minute, second)
+    if (!Number.isNaN(fallback.getTime())) return fallback
+  }
+
+  if (digits.length === 8) {
+    const year = Number(digits.slice(0, 4))
+    const month = Number(digits.slice(4, 6)) - 1
+    const day = Number(digits.slice(6, 8))
+    const fallback = new Date(year, month, day)
+    if (!Number.isNaN(fallback.getTime())) return fallback
+  }
+
+  return null
+}
+
+function isSameLocalDate(value?: string | null, target = new Date()) {
+  const date = normalizeTimeValue(value)
+  if (!date) return false
+  return (
+    date.getFullYear() === target.getFullYear()
+    && date.getMonth() === target.getMonth()
+    && date.getDate() === target.getDate()
+  )
 }
 
 function displaySecurityName(name?: string | null, symbol?: string | null) {
@@ -45,12 +83,29 @@ function displaySecurityName(name?: string | null, symbol?: string | null) {
   return trimmedName
 }
 
-function MetricCard({ label, value, subValue }: { label: string; value: string; subValue?: string }) {
+function normalizeOrderQuantity(value?: number | null) {
+  const quantity = Math.max(Number(value || 0), 0)
+  return Math.floor(quantity / 100) * 100
+}
+
+function MetricCard({
+  label,
+  value,
+  subValue,
+  valueClassName,
+  subValueClassName,
+}: {
+  label: string
+  value: string
+  subValue?: string
+  valueClassName?: string
+  subValueClassName?: string
+}) {
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
       <p className="text-xs tracking-[0.16em] text-slate-400">{label}</p>
-      <p className="mt-2 text-2xl font-semibold text-slate-900 dark:text-white">{value}</p>
-      {subValue ? <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{subValue}</p> : null}
+      <p className={`mt-2 text-2xl font-semibold ${valueClassName || 'text-slate-900 dark:text-white'}`}>{value}</p>
+      {subValue ? <p className={`mt-1 text-sm ${subValueClassName || 'text-slate-500 dark:text-slate-400'}`}>{subValue}</p> : null}
     </div>
   )
 }
@@ -59,6 +114,27 @@ interface WarehousePageProps {
   roleFilter?: 'paper' | 'live'
   pageTitle?: string
   pageDescription?: string
+}
+
+function parseSseBlock(block: string): { event: string; data: Record<string, unknown> } | null {
+  const lines = block.split('\n').map(line => line.trim()).filter(Boolean)
+  if (!lines.length) return null
+  let event = 'message'
+  let dataLine = ''
+  for (const line of lines) {
+    if (line.startsWith('event:')) event = line.replace('event:', '').trim()
+    if (line.startsWith('data:')) dataLine = line.replace('data:', '').trim()
+  }
+  if (!dataLine) return null
+  try {
+    return { event, data: JSON.parse(dataLine) as Record<string, unknown> }
+  } catch {
+    return null
+  }
+}
+
+function isBulkSellTaskActive(status?: string | null) {
+  return ['pending', 'running'].includes(String(status || '').trim().toLowerCase())
 }
 
 export function WarehousePage({
@@ -73,14 +149,14 @@ export function WarehousePage({
   const [diagnosing, setDiagnosing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [diagnostics, setDiagnostics] = useState<VirtualWarehouseDiagnosticsResponse | null>(null)
-  const [strategies, setStrategies] = useState<StrategyDefinition[]>([])
-  const [paperAccounts, setPaperAccounts] = useState<PaperAccount[]>([])
-  const [selectedStrategyId, setSelectedStrategyId] = useState('')
-  const [selectedPaperAccountId, setSelectedPaperAccountId] = useState('')
-  const [paperRunning, setPaperRunning] = useState(false)
   const [submittingOrder, setSubmittingOrder] = useState(false)
+  const [bulkSelling, setBulkSelling] = useState(false)
+  const [bulkSellTask, setBulkSellTask] = useState<QmtBulkSellTask | null>(null)
   const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null)
   const [actionMessage, setActionMessage] = useState<string | null>(null)
+  const [selectedPositionSymbol, setSelectedPositionSymbol] = useState<string | null>(null)
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null)
+  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(null)
   const [orderForm, setOrderForm] = useState({
     symbol: '',
     side: 'buy',
@@ -90,8 +166,86 @@ export function WarehousePage({
     strategyName: 'TradingAgents',
     remark: '',
   })
+  const bulkSellStreamAbortRef = useRef<AbortController | null>(null)
   const account = payload?.account
   const connection = payload?.connection
+  const positions = payload?.positions || []
+  const orders = useMemo(
+    () => [...(payload?.orders || [])]
+      .filter(item => isSameLocalDate(item.order_time))
+      .sort((left, right) => {
+        const rightTime = normalizeTimeValue(right.order_time)?.getTime() || 0
+        const leftTime = normalizeTimeValue(left.order_time)?.getTime() || 0
+        return rightTime - leftTime
+      }),
+    [payload?.orders],
+  )
+  const trades = useMemo(
+    () => [...(payload?.trades || [])]
+      .filter(item => isSameLocalDate(item.trade_time))
+      .sort((left, right) => {
+        const rightTime = normalizeTimeValue(right.trade_time)?.getTime() || 0
+        const leftTime = normalizeTimeValue(left.trade_time)?.getTime() || 0
+        return rightTime - leftTime
+      }),
+    [payload?.trades],
+  )
+
+  const handleFillOrderFromPosition = useCallback((position: VirtualWarehousePosition) => {
+    const sellableQuantity = normalizeOrderQuantity(position.available_position || position.current_position)
+    setSelectedPositionSymbol(position.symbol)
+    setSelectedOrderId(null)
+    setSelectedTradeId(null)
+    setOrderForm(prev => ({
+      ...prev,
+      symbol: position.symbol,
+      side: 'sell',
+      quantity: sellableQuantity > 0 ? sellableQuantity : prev.quantity,
+      priceType: 'latest',
+      price: '',
+      remark: `持仓带入 ${displaySecurityName(position.name, position.symbol)} ${position.symbol}`,
+    }))
+    setActionMessage(
+      `已带入 ${displaySecurityName(position.name, position.symbol)}，默认按最新价卖出 ${sellableQuantity || position.available_position || position.current_position || 0} 股。`,
+    )
+    setError(null)
+  }, [])
+
+  const handleFillOrderFromRecentOrder = useCallback((order: VirtualWarehouseOrder) => {
+    const quantity = normalizeOrderQuantity((order.quantity || 0) - (order.filled_quantity || 0)) || normalizeOrderQuantity(order.quantity)
+    setSelectedOrderId(order.order_id)
+    setSelectedTradeId(null)
+    setSelectedPositionSymbol(order.symbol)
+    setOrderForm(prev => ({
+      ...prev,
+      symbol: order.symbol,
+      side: String(order.side || prev.side).toLowerCase(),
+      quantity: quantity > 0 ? quantity : prev.quantity,
+      priceType: order.price != null ? 'limit' : 'latest',
+      price: order.price != null ? String(order.price) : '',
+      remark: `最近委托带入 ${displaySecurityName(order.name, order.symbol)} ${order.order_id}`,
+    }))
+    setActionMessage(`已带入最近委托 ${order.order_id || '--'}，可继续提交同股票委托${order.can_cancel ? '或直接点击撤单' : ''}。`)
+    setError(null)
+  }, [])
+
+  const handleFillOrderFromTrade = useCallback((trade: VirtualWarehouseTrade) => {
+    const quantity = normalizeOrderQuantity(trade.quantity)
+    setSelectedTradeId(trade.trade_id)
+    setSelectedOrderId(null)
+    setSelectedPositionSymbol(trade.symbol)
+    setOrderForm(prev => ({
+      ...prev,
+      symbol: trade.symbol,
+      side: String(trade.side || '').toLowerCase() === 'buy' ? 'sell' : 'buy',
+      quantity: quantity > 0 ? quantity : prev.quantity,
+      priceType: 'latest',
+      price: '',
+      remark: `最近成交带入 ${displaySecurityName(trade.name, trade.symbol)} ${trade.trade_id}`,
+    }))
+    setActionMessage(`已切换到成交股票 ${displaySecurityName(trade.name, trade.symbol)}，默认按最新价准备${String(trade.side || '').toLowerCase() === 'buy' ? '卖出' : '买入'}。`)
+    setError(null)
+  }, [])
 
   const load = useCallback(async (silent = false, accountKey?: string | null) => {
     try {
@@ -116,36 +270,115 @@ export function WarehousePage({
     }
   }, [pageTitle, roleFilter])
 
-  const loadMeta = useCallback(async () => {
-    try {
-      if (roleFilter !== 'paper') {
-        setStrategies([])
-        setPaperAccounts([])
-        return
-      }
-      const [strategyResponse, paperResponse] = await Promise.all([
-        api.getStrategyPlatformList({ status: 'active' }),
-        api.listPaperAccounts(),
-      ])
-      setStrategies(strategyResponse.strategies || [])
-      setPaperAccounts(paperResponse.items || [])
-      if (!selectedStrategyId && strategyResponse.strategies?.[0]?.id) setSelectedStrategyId(strategyResponse.strategies[0].id)
-      if (!selectedPaperAccountId && paperResponse.items?.[0]?.id) setSelectedPaperAccountId(paperResponse.items[0].id)
-    } catch (err) {
-      console.error(`加载${pageTitle}扩展数据失败`, err)
+  const bulkSellStorageKey = useMemo(
+    () => `qmt-bulk-sell-task:${roleFilter}:${selectedAccountKey || payload?.active_account_key || 'default'}`,
+    [payload?.active_account_key, roleFilter, selectedAccountKey],
+  )
+
+  const stopBulkSellStream = useCallback(() => {
+    bulkSellStreamAbortRef.current?.abort()
+    bulkSellStreamAbortRef.current = null
+  }, [])
+
+  const handleBulkSellTaskState = useCallback(async (task: QmtBulkSellTask) => {
+    setBulkSellTask(task)
+    const active = isBulkSellTaskActive(task.status)
+    setBulkSelling(active)
+    if (typeof window !== 'undefined') {
+      if (active) window.localStorage.setItem(bulkSellStorageKey, task.id)
+      else window.localStorage.removeItem(bulkSellStorageKey)
     }
-  }, [pageTitle, roleFilter, selectedPaperAccountId, selectedStrategyId])
+    if (!active) {
+      stopBulkSellStream()
+      if (task.overview) {
+        setPayload(task.overview)
+        setSelectedAccountKey(task.overview.active_account_key || task.account_key)
+      } else {
+        await load(true, task.account_key)
+      }
+      setActionMessage(
+        task.failure_count > 0
+          ? `一键卖出已完成：成功 ${task.success_count} 笔，失败 ${task.failure_count} 笔。`
+          : `一键卖出已完成：成功 ${task.success_count} 笔。`,
+      )
+      setError(task.failure_count > 0 ? `部分失败：${(task.recent_failures || []).slice(0, 3).join('；')}` : null)
+    }
+  }, [bulkSellStorageKey, load, stopBulkSellStream])
+
+  const connectBulkSellStream = useCallback(async (taskId: string) => {
+    stopBulkSellStream()
+    const controller = new AbortController()
+    bulkSellStreamAbortRef.current = controller
+    try {
+      const response = await api.streamQmtBulkSellTask(taskId, controller.signal)
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('清仓任务流不可用')
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const blocks = buffer.split('\n\n')
+        buffer = blocks.pop() || ''
+        for (const block of blocks) {
+          const parsed = parseSseBlock(block)
+          if (!parsed) continue
+          if (parsed.event === 'state' || parsed.event === 'done') {
+            const task = parsed.data?.task as QmtBulkSellTask | undefined
+            if (task) await handleBulkSellTaskState(task)
+          } else if (parsed.event === 'error') {
+            const message = String(parsed.data?.message || '清仓任务流异常')
+            setError(message)
+          }
+        }
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return
+      setError(err instanceof Error ? err.message : '清仓任务流连接失败')
+    } finally {
+      if (bulkSellStreamAbortRef.current === controller) {
+        bulkSellStreamAbortRef.current = null
+      }
+    }
+  }, [handleBulkSellTaskState, stopBulkSellStream])
 
   useEffect(() => {
     void load(false, selectedAccountKey)
-    void loadMeta()
-  }, [load, loadMeta, selectedAccountKey])
+  }, [load, selectedAccountKey])
 
   useEffect(() => {
+    if (bulkSellTask && isBulkSellTaskActive(bulkSellTask.status)) return undefined
     const intervalSeconds = payload?.refresh_interval_seconds || 10
     const timer = window.setInterval(() => { void load(true, selectedAccountKey) }, intervalSeconds * 1000)
     return () => window.clearInterval(timer)
-  }, [load, payload?.refresh_interval_seconds, selectedAccountKey])
+  }, [bulkSellTask, load, payload?.refresh_interval_seconds, selectedAccountKey])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const taskId = window.localStorage.getItem(bulkSellStorageKey)
+    if (!taskId) return undefined
+    let cancelled = false
+    ;(async () => {
+      try {
+        const response = await api.getQmtBulkSellTask(taskId)
+        if (cancelled) return
+        const task = response.task
+        setBulkSellTask(task)
+        setBulkSelling(isBulkSellTaskActive(task.status))
+        if (isBulkSellTaskActive(task.status)) {
+          await connectBulkSellStream(task.id)
+        } else {
+          window.localStorage.removeItem(bulkSellStorageKey)
+        }
+      } catch {
+        window.localStorage.removeItem(bulkSellStorageKey)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [bulkSellStorageKey, connectBulkSellStream])
+
+  useEffect(() => () => stopBulkSellStream(), [stopBulkSellStream])
 
   const handleDiagnose = useCallback(async (runConnectTest = true) => {
     setDiagnosing(true)
@@ -160,37 +393,11 @@ export function WarehousePage({
     }
   }, [selectedAccountKey])
 
-  const handleRunPaperStrategy = useCallback(async () => {
-    if (!selectedPaperAccountId || !selectedStrategyId) return
-    setPaperRunning(true)
-    try {
-      await api.runStrategyOnPaperAccount(selectedPaperAccountId, selectedStrategyId)
-      await loadMeta()
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '纸交易执行失败')
-    } finally {
-      setPaperRunning(false)
-    }
-  }, [loadMeta, selectedPaperAccountId, selectedStrategyId])
-
-  const handleCreatePaperAccount = useCallback(async () => {
-    try {
-      const key = payload?.active_account_key || selectedAccountKey || 'paper_sim'
-      const created = await api.createPaperAccount({
-        id: `paper-${key}`,
-        name: `${connection?.account_name || '虚拟仓'}纸交易账户`,
-        initial_capital: account?.total_asset || 1_000_000,
-      })
-      await loadMeta()
-      setSelectedPaperAccountId(created.id)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '创建纸交易账户失败')
-    }
-  }, [account?.total_asset, connection?.account_name, loadMeta, payload?.active_account_key, selectedAccountKey])
-
   const handleSubmitOrder = useCallback(async () => {
+    if (roleFilter !== 'paper') {
+      setError('实盘仓已只读锁定：禁止从本系统提交 QMT 委托，请切换到虚拟仓。')
+      return
+    }
     setSubmittingOrder(true)
     setActionMessage(null)
     try {
@@ -204,18 +411,27 @@ export function WarehousePage({
         strategy_name: orderForm.strategyName.trim() || undefined,
         order_remark: orderForm.remark.trim() || undefined,
       })
-      setPayload(response.overview)
-      setSelectedAccountKey(response.overview.active_account_key || selectedAccountKey)
+      if (response.overview) {
+        setPayload(response.overview)
+        setSelectedAccountKey(response.overview.active_account_key || selectedAccountKey)
+      }
       setActionMessage(`委托已提交，订单号 ${response.order_result.order_id || '--'}`)
       setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'QMT 委托提交失败')
+      const message = err instanceof Error ? err.message : 'QMT 委托提交失败'
+      setActionMessage(null)
+      setError(`${message}；已自动刷新账户快照，请核对最近委托和成交。`)
+      await load(true, payload?.active_account_key || selectedAccountKey)
     } finally {
       setSubmittingOrder(false)
     }
-  }, [orderForm, payload?.active_account_key, selectedAccountKey])
+  }, [load, orderForm, payload?.active_account_key, roleFilter, selectedAccountKey])
 
   const handleCancelOrder = useCallback(async (orderId: string) => {
+    if (roleFilter !== 'paper') {
+      setError('实盘仓已只读锁定：禁止从本系统撤销 QMT 委托，请切换到虚拟仓。')
+      return
+    }
     setCancellingOrderId(orderId)
     setActionMessage(null)
     try {
@@ -229,11 +445,49 @@ export function WarehousePage({
     } finally {
       setCancellingOrderId(null)
     }
-  }, [payload?.active_account_key, selectedAccountKey])
+  }, [payload?.active_account_key, roleFilter, selectedAccountKey])
 
-  const positions = payload?.positions || []
-  const orders = payload?.orders || []
-  const trades = payload?.trades || []
+  const sellablePositions = useMemo(
+    () => positions.filter(item => normalizeOrderQuantity(item.available_position || item.current_position) > 0),
+    [positions],
+  )
+
+  const handleSellAllPositions = useCallback(async () => {
+    if (roleFilter !== 'paper') {
+      setError('实盘仓已只读锁定：禁止从本系统提交 QMT 委托，请切换到虚拟仓。')
+      return
+    }
+    if (!sellablePositions.length) {
+      setError('当前没有可卖出的持仓。')
+      return
+    }
+    const totalQuantity = sellablePositions.reduce(
+      (sum, item) => sum + normalizeOrderQuantity(item.available_position || item.current_position),
+      0,
+    )
+    const confirmed = typeof window === 'undefined'
+      ? true
+      : window.confirm(`确认一键卖出全部持仓吗？\n股票数：${sellablePositions.length} 只\n可卖总股数：${totalQuantity} 股`)
+    if (!confirmed) return
+
+    setActionMessage(null)
+    setError(null)
+    try {
+      const response = await api.startQmtBulkSell({
+        account_key: payload?.active_account_key || selectedAccountKey || undefined,
+        strategy_name: orderForm.strategyName.trim() || 'TradingAgents',
+      })
+      setBulkSellTask(response.task)
+      setBulkSelling(true)
+      if (typeof window !== 'undefined') window.localStorage.setItem(bulkSellStorageKey, response.task.id)
+      setActionMessage(`一键卖出任务已启动：共 ${response.task.total} 只股票，正在逐笔提交。`)
+      await connectBulkSellStream(response.task.id)
+    } catch (err) {
+      setBulkSelling(false)
+      setError(err instanceof Error ? err.message : '一键卖出任务启动失败')
+    }
+  }, [bulkSellStorageKey, connectBulkSellStream, orderForm.strategyName, payload?.active_account_key, roleFilter, selectedAccountKey, sellablePositions])
+
   const accountCards = useMemo(() => (payload?.accounts || []).filter(item => item.role === roleFilter), [payload?.accounts, roleFilter])
   const lastQuoteTime = useMemo(() => {
     const quoteTime = positions.find(item => item.quote_time)?.quote_time
@@ -310,6 +564,32 @@ export function WarehousePage({
             ) : null}
             {actionMessage ? <p className="text-sm text-emerald-600 dark:text-emerald-300">{actionMessage}</p> : null}
             {error ? <p className="text-sm text-rose-600 dark:text-rose-300">{error}</p> : null}
+            {bulkSellTask ? (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-500/10 dark:text-amber-200">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <span>清仓进度 {bulkSellTask.processed}/{bulkSellTask.total}</span>
+                  <span>成功 {bulkSellTask.success_count}</span>
+                  <span>失败 {bulkSellTask.failure_count}</span>
+                  <span>状态 {bulkSellTask.status === 'running' ? '执行中' : bulkSellTask.status === 'completed' ? '已完成' : bulkSellTask.status === 'completed_with_errors' ? '部分完成' : bulkSellTask.status === 'failed' ? '失败' : '待执行'}</span>
+                  {bulkSellTask.current_symbol ? (
+                    <span>
+                      当前：{bulkSellTask.current_name || '名称待更新'} {bulkSellTask.current_symbol}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-amber-100 dark:bg-amber-950/60">
+                  <div
+                    className="h-full rounded-full bg-amber-500 transition-all"
+                    style={{ width: `${bulkSellTask.total ? Math.min(100, (bulkSellTask.processed / bulkSellTask.total) * 100) : 0}%` }}
+                  />
+                </div>
+                {bulkSellTask.recent_failures.length ? (
+                  <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                    最近失败：{bulkSellTask.recent_failures.join('；')}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
@@ -335,8 +615,19 @@ export function WarehousePage({
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <MetricCard label="证券账户名称" value={account?.security_account_name || connection?.account_name || '--'} subValue={account?.account_id ? `证券账号 ${account.account_id}` : '待连接 QMT 账户'} />
         <MetricCard label="总资产" value={formatMoney(account?.total_asset)} subValue={`总市值 ${formatMoney(account?.market_value)}`} />
-        <MetricCard label="总盈亏" value={formatMoney(account?.total_pnl)} subValue={formatPercent(account?.total_pnl_pct)} />
-        <MetricCard label="当日盈亏" value={formatMoney(account?.today_pnl)} subValue={lastQuoteTime ? `最近行情 ${lastQuoteTime}` : '等待行情刷新'} />
+        <MetricCard
+          label="总盈亏"
+          value={formatMoney(account?.total_pnl)}
+          subValue={formatPercent(account?.total_pnl_pct)}
+          valueClassName={tone(account?.total_pnl)}
+          subValueClassName={tone(account?.total_pnl_pct)}
+        />
+        <MetricCard
+          label="当日盈亏"
+          value={formatMoney(account?.today_pnl)}
+          subValue={lastQuoteTime ? `最近行情 ${lastQuoteTime}` : '等待行情刷新'}
+          valueClassName={tone(account?.today_pnl)}
+        />
         <MetricCard label="可用资金" value={formatMoney(account?.available_cash)} subValue={`持仓数量 ${account?.position_count || 0} 只`} />
         <MetricCard label="数据同步时间" value={formatDateTime(lastSyncTime)} subValue={payload?.is_stale ? '当前展示最近一次成功同步的缓存快照' : '当前展示最新成功同步数据'} />
         <MetricCard label="数据源" value={connection?.provider || 'xtquant'} subValue={connection?.userdata_path ? `用户目录 ${connection.userdata_path}` : '请在后端配置 QMT_USERDATA_PATH'} />
@@ -356,34 +647,6 @@ export function WarehousePage({
             <div>最近同步：{formatDateTime(lastSyncTime)}</div>
           </div>
         </div>
-        <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <h2 className="text-lg font-semibold text-slate-900 dark:text-white">策略纸交易入口</h2>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">把已激活策略快速下发到纸交易账户，联动模拟仓调试执行链路。</p>
-          <div className="mt-4 space-y-3">
-            <div>
-              <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">纸交易账户</label>
-              <select value={selectedPaperAccountId} onChange={e => setSelectedPaperAccountId(e.target.value)} className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950">
-                <option value="">请选择</option>
-                {paperAccounts.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">激活策略</label>
-              <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)} className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950">
-                <option value="">请选择</option>
-                {strategies.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
-              </select>
-            </div>
-            <div className="flex flex-wrap gap-3">
-              <button type="button" onClick={() => void handleRunPaperStrategy()} disabled={!selectedPaperAccountId || !selectedStrategyId || paperRunning} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900">
-                {paperRunning ? '执行中...' : '运行到纸交易'}
-              </button>
-              <button type="button" onClick={() => void handleCreatePaperAccount()} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 dark:border-slate-700 dark:text-slate-200">
-                新建纸交易账户
-              </button>
-            </div>
-          </div>
-        </div>
         </>
         ) : (
         <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
@@ -392,13 +655,20 @@ export function WarehousePage({
           <div className="mt-4 space-y-2 text-sm text-slate-600 dark:text-slate-300">
             <div>推荐用途：核对 QMT 实盘资产、持仓、委托、成交</div>
             <div>桥接方式：单独 bridge 进程 + 单独端口</div>
-            <div>当前页面支持：实时查询、下单、撤单、委托/成交查看</div>
+            <div>当前页面支持：实时查询、委托/成交查看</div>
+            <div className="text-amber-600 dark:text-amber-300">安全锁：实盘仓只读，页面与后端均禁止下单和撤单</div>
           </div>
         </div>
         )}
+        {roleFilter === 'paper' ? (
         <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-white">QMT 交易控制台</h2>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">直接向当前 QMT 账户提交买卖委托，支持提交后立即回显到最近委托。</p>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">直接向当前 QMT 账户提交买卖委托，支持提交后立即回显到最近委托。点击上方持仓行可自动带入股票、数量和价格模式。</p>
+          {selectedPositionSymbol ? (
+            <div className="mt-3 rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
+              当前已带入：{selectedPositionSymbol}，默认使用“卖出 + 最新价”。
+            </div>
+          ) : null}
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <div>
               <label className="mb-1 block text-sm text-slate-600 dark:text-slate-300">股票代码</label>
@@ -491,6 +761,19 @@ export function WarehousePage({
             </div>
           </div>
         </div>
+        ) : (
+        <div className="rounded-3xl border border-amber-200 bg-amber-50 p-6 shadow-sm dark:border-amber-900/60 dark:bg-amber-950/20">
+          <h2 className="text-lg font-semibold text-amber-900 dark:text-amber-100">实盘交易已锁定</h2>
+          <p className="mt-1 text-sm text-amber-700 dark:text-amber-200">
+            实盘仓仅用于资产、持仓、委托和成交核对。为避免开盘期间误操作，本页面不提供实盘下单或撤单入口。
+          </p>
+          <div className="mt-4 space-y-2 text-sm text-amber-700 dark:text-amber-200">
+            <div>允许：刷新资产、查看持仓、查看最近委托、查看最近成交</div>
+            <div>禁止：提交委托、撤单、策略自动交易</div>
+            <div>如需联调交易，请切换到虚拟仓模拟账户。</div>
+          </div>
+        </div>
+        )}
       </section>
 
       {accountCards.length > 0 ? (
@@ -525,8 +808,8 @@ export function WarehousePage({
               <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
                 <div>账号：{item.connection.account_id || '--'}</div>
                 <div>总资产：{formatMoney(item.summary.total_asset)}</div>
-                <div>总盈亏：{formatMoney(item.summary.total_pnl)}</div>
-                <div>当日盈亏：{formatMoney(item.summary.today_pnl)}</div>
+                <div className={tone(item.summary.total_pnl)}>总盈亏：{formatMoney(item.summary.total_pnl)}</div>
+                <div className={tone(item.summary.today_pnl)}>当日盈亏：{formatMoney(item.summary.today_pnl)}</div>
               </div>
             </button>
           ))}
@@ -588,11 +871,24 @@ export function WarehousePage({
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4 dark:border-slate-800">
           <div>
             <h2 className="text-lg font-semibold text-slate-900 dark:text-white">持仓列表</h2>
-            <p className="text-sm text-slate-500 dark:text-slate-400">展示 QMT 虚拟仓持仓快照，持股天数按首次同步时间持续跟踪。</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">展示 QMT 仓位快照，持股天数按首次同步时间持续跟踪。</p>
           </div>
-          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-            共 {positions.length} 只
-          </span>
+          <div className="flex items-center gap-3">
+            {roleFilter === 'paper' ? (
+              <button
+                type="button"
+                onClick={() => void handleSellAllPositions()}
+                disabled={bulkSelling || !sellablePositions.length}
+                className="inline-flex items-center gap-2 rounded-xl border border-rose-200 px-3 py-2 text-xs font-medium text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
+              >
+                <Send className="h-3.5 w-3.5" />
+                {bulkSelling ? '清仓提交中...' : '一键卖出全部持仓'}
+              </button>
+            ) : null}
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+              共 {positions.length} 只
+            </span>
+          </div>
         </div>
         {!positions.length ? (
           <div className="px-6 py-10 text-sm text-slate-500 dark:text-slate-400">当前暂无可展示的 QMT 持仓。请确认 QMT 账户已配置且已成功连接。</div>
@@ -613,7 +909,14 @@ export function WarehousePage({
               </thead>
               <tbody>
                 {positions.map((item: VirtualWarehousePosition) => (
-                  <tr key={item.symbol} className="border-t border-slate-100 dark:border-slate-800">
+                  <tr
+                    key={item.symbol}
+                    className={`border-t border-slate-100 dark:border-slate-800 ${
+                      roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''
+                    } ${selectedPositionSymbol === item.symbol ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromPosition(item) : undefined}
+                    title={roleFilter === 'paper' ? '点击带入交易控制台' : undefined}
+                  >
                     <td className="px-4 py-3">
                       <div className="font-medium text-slate-900 dark:text-white">{displaySecurityName(item.name, item.symbol)}</div>
                       <div className="text-xs text-slate-500 dark:text-slate-400">{item.symbol}</div>
@@ -653,7 +956,7 @@ export function WarehousePage({
           <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4 dark:border-slate-800">
             <div>
               <h2 className="text-lg font-semibold text-slate-900 dark:text-white">最近委托</h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400">展示桥接返回的最近委托状态，便于验证链路已打通。</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">仅展示当日委托，按时间倒序排列，便于核对最新状态。</p>
             </div>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
               {orders.length} 条
@@ -665,17 +968,25 @@ export function WarehousePage({
             ) : (
               <div className="space-y-3">
                 {orders.map((item: VirtualWarehouseOrder) => (
-                  <div key={`${item.order_id}-${item.symbol}`} className="rounded-2xl border border-slate-100 p-4 dark:border-slate-800">
+                  <div
+                    key={`${item.order_id}-${item.symbol}`}
+                    className={`rounded-2xl border border-slate-100 p-4 dark:border-slate-800 ${roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''} ${selectedOrderId === item.order_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromRecentOrder(item) : undefined}
+                    title={roleFilter === 'paper' ? '点击带入交易控制台' : undefined}
+                  >
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="font-medium text-slate-900 dark:text-white">{displaySecurityName(item.name, item.symbol)}</div>
                         <div className="text-xs text-slate-500 dark:text-slate-400">{item.symbol} · 委托号 {item.order_id || '--'}</div>
                       </div>
                       <div className="flex items-center gap-2">
-                        {item.can_cancel ? (
+                        {roleFilter === 'paper' && item.can_cancel ? (
                           <button
                             type="button"
-                            onClick={() => void handleCancelOrder(item.order_id)}
+                            onClick={event => {
+                              event.stopPropagation()
+                              void handleCancelOrder(item.order_id)
+                            }}
                             disabled={cancellingOrderId === item.order_id}
                             className="inline-flex items-center gap-1 rounded-lg border border-rose-200 px-2.5 py-1 text-xs text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
                           >
@@ -683,7 +994,7 @@ export function WarehousePage({
                             {cancellingOrderId === item.order_id ? '撤单中...' : '撤单'}
                           </button>
                         ) : null}
-                        <span className="text-xs text-slate-500 dark:text-slate-400">{item.order_time || '--'}</span>
+                        <span className="text-xs text-slate-500 dark:text-slate-400">{formatDateTime(item.order_time)}</span>
                       </div>
                     </div>
                     <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
@@ -703,7 +1014,7 @@ export function WarehousePage({
           <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4 dark:border-slate-800">
             <div>
               <h2 className="text-lg font-semibold text-slate-900 dark:text-white">最近成交</h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400">展示桥接返回的最近成交记录，验证资产 / 持仓 / 成交链路。</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">仅展示当日成交，按时间倒序排列，便于核对最新回报。</p>
             </div>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
               {trades.length} 条
@@ -715,13 +1026,18 @@ export function WarehousePage({
             ) : (
               <div className="space-y-3">
                 {trades.map((item: VirtualWarehouseTrade) => (
-                  <div key={`${item.trade_id}-${item.symbol}`} className="rounded-2xl border border-slate-100 p-4 dark:border-slate-800">
+                  <div
+                    key={`${item.trade_id}-${item.symbol}`}
+                    className={`rounded-2xl border border-slate-100 p-4 dark:border-slate-800 ${roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''} ${selectedTradeId === item.trade_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromTrade(item) : undefined}
+                    title={roleFilter === 'paper' ? '点击切换到该股票' : undefined}
+                  >
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="font-medium text-slate-900 dark:text-white">{displaySecurityName(item.name, item.symbol)}</div>
                         <div className="text-xs text-slate-500 dark:text-slate-400">{item.symbol} · 成交号 {item.trade_id || '--'}</div>
                       </div>
-                      <span className="text-xs text-slate-500 dark:text-slate-400">{item.trade_time || '--'}</span>
+                      <span className="text-xs text-slate-500 dark:text-slate-400">{formatDateTime(item.trade_time)}</span>
                     </div>
                     <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
                       <div>方向：{item.side}</div>

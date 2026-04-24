@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,12 +18,15 @@ from sqlalchemy.orm import Session
 from api.core.stock_map import get_reverse_stock_map_cached_only
 from api.core.settings import settings
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, VirtualPositionStateDB
-from api.services import portfolio_import_service
+from api.services import auth_service, portfolio_import_service
 from tradingagents.dataflows.interface import route_to_vendor
 
 
 logger = logging.getLogger(__name__)
 SOURCE_NAME = "qmt_virtual"
+_BULK_SELL_TASKS: dict[str, dict[str, Any]] = {}
+_BULK_SELL_TASKS_LOCK = threading.RLock()
+_BULK_SELL_TASK_RETENTION_SECONDS = 60 * 60 * 6
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,76 @@ class QmtRuntimeConfig:
     refresh_interval_seconds: int
 
 
+def create_qmt_bulk_sell_task(
+    db: Session,
+    user_id: str,
+    *,
+    account_key: str | None,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
+    config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
+    request_id = uuid4().hex
+    _ensure_paper_trading_allowed(config, request_id=request_id, action="bulk_sell")
+    overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
+    positions = overview.get("positions") or []
+    sellable_positions = [
+        {
+            "symbol": str(item.get("symbol") or "").strip().upper(),
+            "name": str(item.get("name") or "").strip(),
+            "quantity": _normalize_order_quantity(item.get("available_position") or item.get("current_position")),
+        }
+        for item in positions
+        if _normalize_order_quantity(item.get("available_position") or item.get("current_position")) > 0
+    ]
+    if not sellable_positions:
+        raise RuntimeError("当前没有可卖出的持仓。")
+
+    task_id = uuid4().hex
+    snapshot = {
+        "id": task_id,
+        "task_type": "qmt_bulk_sell",
+        "user_id": user_id,
+        "account_key": config.key,
+        "account_id": config.account_id,
+        "account_name": config.account_name,
+        "status": "pending",
+        "strategy_name": str(strategy_name or "TradingAgents").strip() or "TradingAgents",
+        "total": len(sellable_positions),
+        "processed": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "current_symbol": None,
+        "current_name": None,
+        "recent_failures": [],
+        "items": [],
+        "version": 0,
+        "created_at": _iso_now(),
+        "updated_at": _iso_now(),
+        "completed_at": None,
+        "request_id": request_id,
+    }
+    with _BULK_SELL_TASKS_LOCK:
+        _cleanup_expired_bulk_sell_tasks()
+        _BULK_SELL_TASKS[task_id] = snapshot
+
+    worker = threading.Thread(
+        target=_run_bulk_sell_task_worker,
+        args=(task_id, user_id, config.key, snapshot["strategy_name"], sellable_positions),
+        daemon=True,
+        name=f"qmt-bulk-sell-{task_id[:8]}",
+    )
+    worker.start()
+    return get_qmt_bulk_sell_task(user_id, task_id)
+
+
+def get_qmt_bulk_sell_task(user_id: str, task_id: str) -> dict[str, Any]:
+    with _BULK_SELL_TASKS_LOCK:
+        task = _BULK_SELL_TASKS.get(task_id)
+        if task is None or task.get("user_id") != user_id:
+            raise RuntimeError("清仓任务不存在")
+        return copy.deepcopy(_public_bulk_sell_task(task))
+
+
 def get_qmt_virtual_account_overview(
     db: Session,
     user_id: str,
@@ -47,7 +122,7 @@ def get_qmt_virtual_account_overview(
     account_key: str | None = None,
     sync_to_imports: bool = False,
 ) -> dict[str, Any]:
-    configs = _runtime_configs()
+    configs = _runtime_configs(db=db, user_id=user_id)
     account_summaries: list[dict[str, Any]] = []
     active_payload: dict[str, Any] | None = None
     active_key = _resolve_active_key(configs, account_key)
@@ -130,29 +205,53 @@ def submit_qmt_order(
     price_type: str,
     strategy_name: str | None = None,
     order_remark: str | None = None,
+    include_overview: bool = True,
 ) -> dict[str, Any]:
-    config = _resolve_runtime_config(account_key)
+    config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
+    request_id = uuid4().hex
+    _audit_qmt_action("submit_order.request", config, request_id, status="received", symbol=symbol, side=side, quantity=quantity)
     if not config.enabled:
+        _audit_qmt_action("submit_order.reject", config, request_id, status="disabled")
         raise RuntimeError("当前 QMT 账户未启用")
+    _ensure_paper_trading_allowed(config, request_id=request_id, action="submit_order")
     if quantity <= 0:
+        _audit_qmt_action("submit_order.reject", config, request_id, status="invalid_quantity", quantity=quantity)
         raise RuntimeError("委托数量必须大于 0")
     if str(price_type or "limit").strip().lower() == "limit" and price in (None, 0):
+        _audit_qmt_action("submit_order.reject", config, request_id, status="invalid_limit_price", price=price)
         raise RuntimeError("限价委托必须填写价格")
 
-    result = _submit_qmt_order(
-        config,
-        symbol=symbol,
-        side=side,
-        quantity=quantity,
-        price=price,
-        price_type=price_type,
-        strategy_name=strategy_name,
-        order_remark=order_remark,
-    )
-    overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
+    try:
+        result = _submit_qmt_order(
+            config,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            price_type=price_type,
+            strategy_name=strategy_name,
+            order_remark=order_remark,
+        )
+        _audit_qmt_action("submit_order.success", config, request_id, status="success", order_id=result.get("order_id"))
+    except requests.exceptions.Timeout as exc:
+        message = (
+            "QMT 委托提交超时：bridge 在 20 秒内未返回结果。"
+            "请刷新委托/成交确认是否已被 QMT 接收；如未出现委托，说明本次未成功提交。"
+        )
+        _audit_qmt_action("submit_order.error", config, request_id, status="timeout", error=str(exc))
+        raise RuntimeError(message) from exc
+    except requests.exceptions.RequestException as exc:
+        message = f"QMT 委托提交失败：bridge 通信异常（{exc}）"
+        _audit_qmt_action("submit_order.error", config, request_id, status="request_error", error=str(exc))
+        raise RuntimeError(message) from exc
+    except Exception as exc:
+        _audit_qmt_action("submit_order.error", config, request_id, status="error", error=str(exc))
+        raise RuntimeError(f"QMT 委托提交失败：{exc}") from exc
+    overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key) if include_overview else None
     return {
         "message": "QMT 委托已提交",
         "account_key": config.key,
+        "request_id": request_id,
         "order_result": result,
         "overview": overview,
     }
@@ -165,24 +264,241 @@ def cancel_qmt_order(
     account_key: str | None,
     order_id: str,
 ) -> dict[str, Any]:
-    config = _resolve_runtime_config(account_key)
+    config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
+    request_id = uuid4().hex
+    _audit_qmt_action("cancel_order.request", config, request_id, status="received", order_id=order_id)
     if not config.enabled:
+        _audit_qmt_action("cancel_order.reject", config, request_id, status="disabled")
         raise RuntimeError("当前 QMT 账户未启用")
+    _ensure_paper_trading_allowed(config, request_id=request_id, action="cancel_order")
     if not str(order_id or "").strip():
+        _audit_qmt_action("cancel_order.reject", config, request_id, status="missing_order_id")
         raise RuntimeError("缺少 order_id")
 
-    result = _cancel_qmt_order(config, order_id=order_id)
+    try:
+        result = _cancel_qmt_order(config, order_id=order_id)
+        _audit_qmt_action("cancel_order.success", config, request_id, status="success", order_id=result.get("order_id"))
+    except Exception as exc:
+        _audit_qmt_action("cancel_order.error", config, request_id, status="error", order_id=order_id, error=str(exc))
+        raise
     overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
     return {
         "message": "QMT 撤单请求已提交",
         "account_key": config.key,
+        "request_id": request_id,
         "cancel_result": result,
         "overview": overview,
     }
 
 
-def diagnose_qmt_accounts(account_key: str | None = None, run_connect_test: bool = False) -> dict[str, Any]:
-    configs = _runtime_configs()
+def _run_bulk_sell_task_worker(
+    task_id: str,
+    user_id: str,
+    account_key: str,
+    strategy_name: str,
+    sellable_positions: list[dict[str, Any]],
+) -> None:
+    try:
+        _update_bulk_sell_task(
+            task_id,
+            status="running",
+            updated_at=_iso_now(),
+        )
+        from api.database import get_db_ctx
+
+        with get_db_ctx() as db:
+            for index, item in enumerate(sellable_positions, start=1):
+                symbol = str(item.get("symbol") or "").strip().upper()
+                name = str(item.get("name") or "").strip()
+                quantity = int(item.get("quantity") or 0)
+                if not symbol or quantity <= 0:
+                    _append_bulk_sell_item(
+                        task_id,
+                        {
+                            "symbol": symbol,
+                            "name": name,
+                            "quantity": quantity,
+                            "status": "skipped",
+                            "message": "无有效可卖数量",
+                        },
+                    )
+                    _update_bulk_sell_task(
+                        task_id,
+                        processed=index,
+                        current_symbol=symbol or None,
+                        current_name=name or None,
+                        updated_at=_iso_now(),
+                    )
+                    continue
+
+                _update_bulk_sell_task(
+                    task_id,
+                    processed=index - 1,
+                    current_symbol=symbol,
+                    current_name=name or None,
+                    updated_at=_iso_now(),
+                )
+                try:
+                    response = submit_qmt_order(
+                        db,
+                        user_id,
+                        account_key=account_key,
+                        symbol=symbol,
+                        side="sell",
+                        quantity=quantity,
+                        price=None,
+                        price_type="latest",
+                        strategy_name=strategy_name,
+                        order_remark=f"一键清仓 {name or symbol} {symbol}",
+                        include_overview=False,
+                    )
+                    order_result = dict(response.get("order_result") or {})
+                    _append_bulk_sell_item(
+                        task_id,
+                        {
+                            "symbol": symbol,
+                            "name": name,
+                            "quantity": quantity,
+                            "status": "success",
+                            "order_id": order_result.get("order_id"),
+                            "message": "委托已提交",
+                        },
+                    )
+                    _increment_bulk_sell_counter(task_id, "success_count")
+                except Exception as exc:
+                    message = str(exc)
+                    _append_bulk_sell_item(
+                        task_id,
+                        {
+                            "symbol": symbol,
+                            "name": name,
+                            "quantity": quantity,
+                            "status": "failed",
+                            "message": message,
+                        },
+                    )
+                    _increment_bulk_sell_counter(task_id, "failure_count")
+                    _push_bulk_sell_failure(task_id, f"{symbol}: {message}")
+                finally:
+                    _update_bulk_sell_task(
+                        task_id,
+                        processed=index,
+                        current_symbol=symbol,
+                        current_name=name or None,
+                        updated_at=_iso_now(),
+                    )
+
+            final_overview = get_qmt_virtual_account_overview(db, user_id, account_key=account_key)
+            final_state = get_qmt_bulk_sell_task(user_id, task_id)
+            final_status = "completed_with_errors" if int(final_state.get("failure_count") or 0) > 0 else "completed"
+            _update_bulk_sell_task(
+                task_id,
+                status=final_status,
+                current_symbol=None,
+                current_name=None,
+                completed_at=_iso_now(),
+                updated_at=_iso_now(),
+                overview=final_overview,
+            )
+    except Exception as exc:
+        logger.exception("[qmt-bulk-sell] task failed id=%s", task_id)
+        _update_bulk_sell_task(
+            task_id,
+            status="failed",
+            current_symbol=None,
+            current_name=None,
+            completed_at=_iso_now(),
+            updated_at=_iso_now(),
+        )
+        _push_bulk_sell_failure(task_id, str(exc))
+
+
+def _public_bulk_sell_task(task: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(task)
+    payload.pop("user_id", None)
+    payload["recent_failures"] = list(payload.get("recent_failures") or [])
+    payload["items"] = list(payload.get("items") or [])
+    return payload
+
+
+def _update_bulk_sell_task(task_id: str, **updates: Any) -> None:
+    with _BULK_SELL_TASKS_LOCK:
+        task = _BULK_SELL_TASKS.get(task_id)
+        if task is None:
+            return
+        task.update(updates)
+        task["updated_at"] = updates.get("updated_at") or _iso_now()
+        task["version"] = int(task.get("version") or 0) + 1
+
+
+def _append_bulk_sell_item(task_id: str, item: dict[str, Any]) -> None:
+    with _BULK_SELL_TASKS_LOCK:
+        task = _BULK_SELL_TASKS.get(task_id)
+        if task is None:
+            return
+        items = list(task.get("items") or [])
+        items.append(item)
+        task["items"] = items[-500:]
+        task["updated_at"] = _iso_now()
+        task["version"] = int(task.get("version") or 0) + 1
+
+
+def _increment_bulk_sell_counter(task_id: str, field: str) -> None:
+    with _BULK_SELL_TASKS_LOCK:
+        task = _BULK_SELL_TASKS.get(task_id)
+        if task is None:
+            return
+        task[field] = int(task.get(field) or 0) + 1
+        task["updated_at"] = _iso_now()
+        task["version"] = int(task.get("version") or 0) + 1
+
+
+def _push_bulk_sell_failure(task_id: str, message: str) -> None:
+    with _BULK_SELL_TASKS_LOCK:
+        task = _BULK_SELL_TASKS.get(task_id)
+        if task is None:
+            return
+        failures = list(task.get("recent_failures") or [])
+        failures.append(message)
+        task["recent_failures"] = failures[-10:]
+        task["updated_at"] = _iso_now()
+        task["version"] = int(task.get("version") or 0) + 1
+
+
+def _cleanup_expired_bulk_sell_tasks() -> None:
+    now = time.time()
+    for task_id, task in list(_BULK_SELL_TASKS.items()):
+        completed_at = _parse_iso_datetime(task.get("completed_at"))
+        if completed_at is None:
+            continue
+        age_seconds = now - completed_at.timestamp()
+        if age_seconds > _BULK_SELL_TASK_RETENTION_SECONDS:
+            _BULK_SELL_TASKS.pop(task_id, None)
+
+
+def _ensure_paper_trading_allowed(config: QmtRuntimeConfig, *, request_id: str, action: str) -> None:
+    role = str(config.role or "").strip().lower()
+    if role == "paper":
+        return
+    _audit_qmt_action(action + ".reject", config, request_id, status="live_readonly_locked")
+    raise RuntimeError("实盘仓已启用只读锁定：禁止通过本系统提交 QMT 下单或撤单，请切换到虚拟仓模拟账户。")
+
+
+def _audit_qmt_action(action: str, config: QmtRuntimeConfig, request_id: str, **fields: Any) -> None:
+    logger.info(
+        "[qmt-audit] action=%s request_id=%s account_key=%s account_id=%s role=%s bridge_url=%s %s",
+        action,
+        request_id,
+        config.key,
+        config.account_id,
+        config.role,
+        config.bridge_base_url,
+        " ".join(f"{key}={value}" for key, value in fields.items() if value is not None),
+    )
+
+
+def diagnose_qmt_accounts(db: Session | None = None, user_id: str | None = None, account_key: str | None = None, run_connect_test: bool = False) -> dict[str, Any]:
+    configs = _runtime_configs(db=db, user_id=user_id)
     active_key = _resolve_active_key(configs, account_key)
     items = [_diagnose_single_account(config, run_connect_test=run_connect_test) for config in configs]
     return {
@@ -199,9 +515,10 @@ def diagnose_qmt_accounts(account_key: str | None = None, run_connect_test: bool
     }
 
 
-def _runtime_configs() -> list[QmtRuntimeConfig]:
+def _runtime_configs(*, db: Session | None = None, user_id: str | None = None) -> list[QmtRuntimeConfig]:
     configs: list[QmtRuntimeConfig] = []
-    for raw in settings.qmt_accounts():
+    raw_accounts = auth_service.get_user_qmt_account_configs(db, user_id).values() if db is not None and user_id else settings.qmt_accounts()
+    for raw in raw_accounts:
         configs.append(
             QmtRuntimeConfig(
                 key=str(raw.get("key") or "qmt_default").strip() or "qmt_default",
@@ -214,7 +531,7 @@ def _runtime_configs() -> list[QmtRuntimeConfig]:
                 userdata_path=str(raw.get("userdata_path") or "").strip(),
                 role=str(raw.get("role") or "paper").strip() or "paper",
                 bridge_base_url=str(raw.get("bridge_base_url") or "").strip(),
-                bridge_token=str(raw.get("bridge_token") or "").strip(),
+                bridge_token=str(raw.get("bridge_token") or settings.qmt_bridge_token or "").strip(),
                 refresh_interval_seconds=max(int(raw.get("refresh_interval_seconds") or settings.qmt_refresh_interval_seconds or 10), 5),
             )
         )
@@ -236,8 +553,8 @@ def _runtime_configs() -> list[QmtRuntimeConfig]:
     ]
 
 
-def _resolve_runtime_config(account_key: str | None) -> QmtRuntimeConfig:
-    configs = _runtime_configs()
+def _resolve_runtime_config(account_key: str | None, *, db: Session | None = None, user_id: str | None = None) -> QmtRuntimeConfig:
+    configs = _runtime_configs(db=db, user_id=user_id)
     active_key = _resolve_active_key(configs, account_key)
     return _pick_active_config(configs, active_key)
 
@@ -1175,7 +1492,7 @@ def _sync_position_state(
 
 
 def _sync_qmt_positions_to_imports(db: Session, user_id: str, account_key: str, positions: list[dict[str, Any]]) -> None:
-    config = _resolve_runtime_config(account_key)
+    config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
     source = _source_name(account_key, config.role)
     payload = [
         {
@@ -1330,6 +1647,14 @@ def _to_float(*values: Any) -> float | None:
         except Exception:
             continue
     return None
+
+
+def _normalize_order_quantity(value: Any) -> int:
+    try:
+        quantity = max(float(value or 0), 0.0)
+    except Exception:
+        return 0
+    return int(quantity // 100 * 100)
 
 
 def _iso_now() -> str:

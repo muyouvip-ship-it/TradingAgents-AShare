@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from datetime import datetime, timezone
+from typing import Any
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -21,6 +27,12 @@ class QmtOrderSubmitRequest(BaseModel):
     price_type: str = Field(default="limit", min_length=1)
     strategy_name: str | None = None
     order_remark: str | None = None
+    include_overview: bool = True
+
+
+class QmtBulkSellRequest(BaseModel):
+    account_key: str | None = None
+    strategy_name: str | None = None
 
 
 @router.get("/qmt/overview")
@@ -68,9 +80,90 @@ def submit_qmt_order(
             price_type=body.price_type,
             strategy_name=body.strategy_name,
             order_remark=body.order_remark,
+            include_overview=body.include_overview,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/qmt/orders/bulk-sell")
+def start_qmt_bulk_sell(
+    body: QmtBulkSellRequest | None = Body(default=None),
+    current_user=Depends(require_api_user),
+    db: Session = Depends(get_db),
+):
+    payload = body or QmtBulkSellRequest()
+    try:
+        task = qmt_virtual_account_service.create_qmt_bulk_sell_task(
+            db,
+            current_user.id,
+            account_key=payload.account_key,
+            strategy_name=payload.strategy_name,
+        )
+        return {"message": "QMT 一键卖出任务已启动", "task": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/qmt/orders/bulk-sell/{task_id}")
+def get_qmt_bulk_sell_task(
+    task_id: str,
+    current_user=Depends(require_api_user),
+):
+    try:
+        return {"task": qmt_virtual_account_service.get_qmt_bulk_sell_task(current_user.id, task_id)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/qmt/orders/bulk-sell/{task_id}/stream")
+async def stream_qmt_bulk_sell_task(
+    task_id: str,
+    current_user=Depends(require_api_user),
+) -> StreamingResponse:
+    def _pack(event: str, payload: dict[str, Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def event_generator():
+        last_version: int | None = None
+        yield _pack(
+            "ready",
+            {
+                "task_id": task_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        while True:
+            try:
+                task = qmt_virtual_account_service.get_qmt_bulk_sell_task(current_user.id, task_id)
+                version = int(task.get("version") or 0)
+                if version != last_version:
+                    last_version = version
+                    yield _pack("state", {"task": task})
+                    if str(task.get("status") or "") in {"completed", "completed_with_errors", "failed"}:
+                        yield _pack("done", {"task": task})
+                        break
+                else:
+                    yield ": ping\n\n"
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                yield _pack(
+                    "error",
+                    {
+                        "task_id": task_id,
+                        "message": str(exc),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/qmt/orders/{order_id}/cancel")
@@ -105,9 +198,14 @@ def get_qmt_virtual_warehouse_diagnostics(
     account_key: str | None = Query(default=None),
     run_connect_test: bool = Query(default=False),
     current_user=Depends(require_api_user),
+    db: Session = Depends(get_db),
 ):
-    del current_user
-    return qmt_virtual_account_service.diagnose_qmt_accounts(account_key=account_key, run_connect_test=run_connect_test)
+    return qmt_virtual_account_service.diagnose_qmt_accounts(
+        db=db,
+        user_id=current_user.id,
+        account_key=account_key,
+        run_connect_test=run_connect_test,
+    )
 
 
 @router.get("/qmt/sync-profiles")

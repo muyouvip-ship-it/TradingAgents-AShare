@@ -7,6 +7,8 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, date
 import logging
 
+from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +178,9 @@ class DataQualityManager:
 
         try:
             from sqlalchemy import text
+            date_column = "trade_date"
+            if data_type == "minute_kline":
+                date_column = "trade_time"
 
             # 1. 检查表是否存在
             check_table = text(f"""
@@ -195,9 +200,9 @@ class DataQualityManager:
                 SELECT
                     COUNT(*) as total_records,
                     COUNT(DISTINCT symbol) as unique_symbols,
-                    MIN(trade_date) as min_date,
-                    MAX(trade_date) as max_date,
-                    COUNT(DISTINCT trade_date) as trading_days
+                    MIN({date_column}) as min_date,
+                    MAX({date_column}) as max_date,
+                    COUNT(DISTINCT DATE({date_column})) as trading_days
                 FROM {table_name}
             """)
             stats = db_session.execute(stats_query).fetchone()
@@ -205,8 +210,8 @@ class DataQualityManager:
             result['stats'] = {
                 'total_records': stats[0],
                 'unique_symbols': stats[1],
-                'min_date': str(stats[2]),
-                'max_date': str(stats[3]),
+                'min_date': str(stats[2]) if stats[2] else None,
+                'max_date': str(stats[3]) if stats[3] else None,
                 'trading_days': stats[4]
             }
 
@@ -214,7 +219,7 @@ class DataQualityManager:
             null_check = text(f"""
                 SELECT
                     COUNT(*) FILTER (WHERE symbol IS NULL) as null_symbols,
-                    COUNT(*) FILTER (WHERE trade_date IS NULL) as null_dates,
+                    COUNT(*) FILTER (WHERE {date_column} IS NULL) as null_dates,
                     COUNT(*) FILTER (WHERE close IS NULL) as null_close
                 FROM {table_name}
             """)
@@ -228,9 +233,9 @@ class DataQualityManager:
             # 4. 检查重复数据
             duplicate_check = text(f"""
                 SELECT COUNT(*) FROM (
-                    SELECT symbol, trade_date, COUNT(*)
+                    SELECT symbol, {date_column}, COUNT(*)
                     FROM {table_name}
-                    GROUP BY symbol, trade_date
+                    GROUP BY symbol, {date_column}
                     HAVING COUNT(*) > 1
                 ) duplicates
             """)
@@ -261,13 +266,13 @@ class DataQualityManager:
                 # 检查是否有股票缺失某些日期的数据
                 continuity_check = text(f"""
                     WITH trading_dates AS (
-                        SELECT DISTINCT trade_date FROM {table_name}
-                        ORDER BY trade_date DESC LIMIT 5
+                        SELECT DISTINCT {date_column} AS trade_date FROM {table_name}
+                        ORDER BY {date_column} DESC LIMIT 5
                     ),
                     symbol_dates AS (
-                        SELECT symbol, COUNT(DISTINCT trade_date) as date_count
+                        SELECT symbol, COUNT(DISTINCT {date_column}) as date_count
                         FROM {table_name}
-                        WHERE trade_date IN (SELECT trade_date FROM trading_dates)
+                        WHERE {date_column} IN (SELECT trade_date FROM trading_dates)
                         GROUP BY symbol
                     )
                     SELECT COUNT(*) FROM symbol_dates WHERE date_count < 5
@@ -276,6 +281,33 @@ class DataQualityManager:
 
                 if incomplete_symbols > 0:
                     result['issues'].append(f"有{incomplete_symbols}只股票数据不完整(近5个交易日有缺失)")
+
+            if data_type == 'daily_kline':
+                cache_stats = get_daily_kline_parquet_stats()
+                if cache_stats:
+                    cache_min = cache_stats.get('date_range_start')
+                    cache_max = cache_stats.get('date_range_end')
+                    result['stats'].update({
+                        'cache_min_date': str(cache_min) if cache_min else None,
+                        'cache_max_date': str(cache_max) if cache_max else None,
+                        'cache_total_records': cache_stats.get('total_records'),
+                        'cache_trading_days': cache_stats.get('trading_days'),
+                    })
+                    db_max = stats[3]
+                    if db_max and cache_max and cache_max < db_max:
+                        result['issues'].append(
+                            f"日线 Parquet 缓存最新仅到 {cache_max}，数据库已更新到 {db_max}，当前回测会读取过期缓存"
+                        )
+                else:
+                    result['stats'].update({
+                        'cache_min_date': None,
+                        'cache_max_date': None,
+                        'cache_total_records': 0,
+                        'cache_trading_days': 0,
+                    })
+
+            if result['issues']:
+                result['valid'] = False
 
         except Exception as e:
             result['valid'] = False

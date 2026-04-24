@@ -229,6 +229,7 @@ export default function BacktestResult() {
   const [orders, setOrders] = useState<BacktestOrderItem[]>([])
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [selectedDate, setSelectedDate] = useState('')
+  const [focusedEventDate, setFocusedEventDate] = useState('')
 
   const load = async (silent = false) => {
     if (!runId) return
@@ -289,6 +290,10 @@ export default function BacktestResult() {
     if (!selectedSymbol && symbols[0]) setSelectedSymbol(symbols[0])
     if (selectedSymbol && !symbols.includes(selectedSymbol)) setSelectedSymbol(symbols[0] || '')
   }, [selectedSymbol, symbols])
+
+  useEffect(() => {
+    setFocusedEventDate('')
+  }, [selectedSymbol])
 
   useEffect(() => {
     if (!selectedDate && dates[0]) setSelectedDate(dates[0])
@@ -357,14 +362,20 @@ export default function BacktestResult() {
   const selectedSymbolMarkers = useMemo(() => ([
     ...selectedSignals.map(item => ({
       date: item.date,
+      timestamp: item.date,
       side: item.side,
-      text: item.side === 'buy' ? '信号买' : '信号卖',
-      color: item.side === 'buy' ? '#ef4444' : '#22c55e',
+      text: item.side === 'buy' ? '信号B' : '信号S',
+      reason: item.reason,
+      color: item.side === 'buy' ? '#dc2626' : '#16a34a',
     })),
     ...selectedTrades.map(item => ({
       date: item.timestamp,
+      timestamp: item.timestamp,
       side: item.direction,
-      text: item.direction === 'buy' ? '成交买' : '成交卖',
+      quantity: item.quantity,
+      price: item.price,
+      reason: item.reason,
+      text: item.direction === 'buy' ? '买入' : '卖出',
       color: item.direction === 'buy' ? '#b91c1c' : '#15803d',
     })),
   ]), [selectedSignals, selectedTrades])
@@ -690,6 +701,8 @@ export default function BacktestResult() {
                     <KlinePanel
                       symbol={selectedSymbol}
                       onSymbolChange={setSelectedSymbol}
+                      showChanlunOverlay={false}
+                      focusDate={focusedEventDate}
                       markers={selectedSymbolMarkers}
                     />
                   </div>
@@ -705,13 +718,20 @@ export default function BacktestResult() {
                     .sort((left, right) => String(right.time).localeCompare(String(left.time)))
                     .slice(0, 30)
                     .map((item, index) => (
-                      <div key={`${item.type}_${item.time}_${index}`} className="rounded-xl border border-slate-100 p-3 dark:border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => setFocusedEventDate(String(item.time || '').slice(0, 10))}
+                        key={`${item.type}_${item.time}_${index}`}
+                        className={`w-full rounded-xl border p-3 text-left transition hover:border-blue-300 hover:bg-blue-50/40 dark:hover:border-blue-700 dark:hover:bg-blue-500/5 ${
+                          String(item.time || '').slice(0, 10) === focusedEventDate ? 'border-blue-300 bg-blue-50/60 dark:border-blue-700 dark:bg-blue-500/10' : 'border-slate-100 dark:border-slate-800'
+                        }`}
+                      >
                         <div className="flex items-center justify-between gap-3">
                           <div className="text-sm font-medium text-slate-900 dark:text-slate-100">{item.type}</div>
                           <div className="text-xs text-slate-400">{formatDateTime(item.time)}</div>
                         </div>
                         <div className="mt-1 text-sm text-slate-600 dark:text-slate-300">{item.text}</div>
-                      </div>
+                      </button>
                     ))}
                 </div>
               </SectionCard>

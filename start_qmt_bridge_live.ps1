@@ -15,6 +15,12 @@ if (-not $env:QMT_BRIDGE_HOST) {
 if (-not $env:QMT_BRIDGE_PORT) {
     $env:QMT_BRIDGE_PORT = "8711"
 }
+if (-not $env:QMT_BRIDGE_ROLE) {
+    $env:QMT_BRIDGE_ROLE = "live"
+}
+if (-not $env:QMT_BRIDGE_ALLOW_TRADING) {
+    $env:QMT_BRIDGE_ALLOW_TRADING = "0"
+}
 
 Write-Host "=========================================="
 Write-Host "QMT Live Bridge Server starting..."
@@ -22,6 +28,8 @@ Write-Host "Project Dir: $PWD"
 Write-Host "QMT_USERDATA_PATH=$env:QMT_USERDATA_PATH"
 Write-Host "QMT_BRIDGE_HOST=$env:QMT_BRIDGE_HOST"
 Write-Host "QMT_BRIDGE_PORT=$env:QMT_BRIDGE_PORT"
+Write-Host "QMT_BRIDGE_ROLE=$env:QMT_BRIDGE_ROLE"
+Write-Host "QMT_BRIDGE_ALLOW_TRADING=$env:QMT_BRIDGE_ALLOW_TRADING"
 Write-Host "=========================================="
 
 if (-not (Test-Path -Path $env:QMT_USERDATA_PATH)) {

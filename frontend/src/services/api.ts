@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeListResponse, NewsEyeRefreshResponse } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -81,6 +81,40 @@ class ApiService {
         if (startDate) params.append('start_date', startDate)
         if (endDate) params.append('end_date', endDate)
         return this.request<KlineResponse>(`/v1/market/kline?${params}`)
+    }
+
+    async getChanlunOverlay(symbol: string, startDate?: string, endDate?: string): Promise<ChanlunOverlayResponse> {
+        const params = new URLSearchParams({ symbol })
+        if (startDate) params.append('start_date', startDate)
+        if (endDate) params.append('end_date', endDate)
+        return this.request<ChanlunOverlayResponse>(`/v1/market/kline/chanlun?${params}`)
+    }
+
+    async getMarketOverview(limit = 20): Promise<MarketOverviewResponse> {
+        return this.request<MarketOverviewResponse>(`/v1/market/overview?limit=${limit}`)
+    }
+
+    async getNewsEyeItems(params?: {
+        limit?: number
+        source?: string
+        sentiment?: string
+        symbol?: string
+        sector?: string
+    }): Promise<NewsEyeListResponse> {
+        const query = new URLSearchParams()
+        if (params?.limit) query.append('limit', String(params.limit))
+        if (params?.source) query.append('source', params.source)
+        if (params?.sentiment) query.append('sentiment', params.sentiment)
+        if (params?.symbol) query.append('symbol', params.symbol)
+        if (params?.sector) query.append('sector', params.sector)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<NewsEyeListResponse>(`/v1/news-eye/items${suffix}`)
+    }
+
+    async refreshNewsEye(limit = 80): Promise<NewsEyeRefreshResponse> {
+        return this.request<NewsEyeRefreshResponse>(`/v1/news-eye/refresh?limit=${limit}`, {
+            method: 'POST',
+        })
     }
 
     async chatCompletion(
@@ -208,6 +242,15 @@ class ApiService {
         if (accountKey) params.set('account_key', accountKey)
         return this.request(`/v1/virtual-warehouse/qmt/trades${params.toString() ? `?${params}` : ''}`)
     }
+    async getBacktestDataConfigs(): Promise<{ configs: BacktestDataConfigItem[]; total: number }> {
+        return this.request('/v1/backtest-data/configs')
+    }
+    async getBacktestDataSubscriptionStatus(configId: number): Promise<BacktestDataSubscriptionStatus> {
+        return this.request(`/v1/backtest-data/configs/${configId}/subscription-status`)
+    }
+    async runBacktestDataSubscriptionNow(configId: number): Promise<{ message: string; config_id: number; task_ids: number[]; created_count: number }> {
+        return this.request(`/v1/backtest-data/configs/${configId}/run`, { method: 'POST' })
+    }
     async submitQmtOrder(payload: QmtOrderSubmitRequest): Promise<QmtOrderSubmitResponse> {
         return this.request<QmtOrderSubmitResponse>('/v1/virtual-warehouse/qmt/orders', {
             method: 'POST',
@@ -220,6 +263,37 @@ class ApiService {
         return this.request<QmtOrderCancelResponse>(`/v1/virtual-warehouse/qmt/orders/${orderId}/cancel${params.toString() ? `?${params}` : ''}`, {
             method: 'POST',
         })
+    }
+    async startQmtBulkSell(payload?: { account_key?: string; strategy_name?: string }): Promise<{ message: string; task: QmtBulkSellTask }> {
+        return this.request<{ message: string; task: QmtBulkSellTask }>('/v1/virtual-warehouse/qmt/orders/bulk-sell', {
+            method: 'POST',
+            body: JSON.stringify(payload || {}),
+        })
+    }
+    async getQmtBulkSellTask(taskId: string): Promise<{ task: QmtBulkSellTask }> {
+        return this.request<{ task: QmtBulkSellTask }>(`/v1/virtual-warehouse/qmt/orders/bulk-sell/${taskId}`)
+    }
+    async streamQmtBulkSellTask(taskId: string, signal?: AbortSignal): Promise<Response> {
+        const token = getAuthToken()
+        const response = await fetch(`${getBaseUrl()}/v1/virtual-warehouse/qmt/orders/bulk-sell/${taskId}/stream`, {
+            method: 'GET',
+            signal,
+            headers: {
+                Accept: 'text/event-stream',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+        })
+        if (!response.ok) {
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = data?.detail || data?.message
+                throw new Error(detail || `HTTP error! status: ${response.status}`)
+            }
+            const detail = await response.text().catch(() => '')
+            throw new Error(detail || `HTTP error! status: ${response.status}`)
+        }
+        return response
     }
     async getQmtSyncProfiles(): Promise<{ items: QmtSyncProfile[] }> {
         return this.request<{ items: QmtSyncProfile[] }>('/v1/virtual-warehouse/qmt/sync-profiles')
@@ -533,6 +607,128 @@ class ApiService {
         const params = new URLSearchParams({ strategy_id: strategyId })
         return this.request(`/v1/paper/accounts/${accountId}/run-strategy?${params.toString()}`, {
             method: 'POST',
+        })
+    }
+
+    async createRealtimeMonitor(data: RealtimeMonitorCreateRequest): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>('/v1/realtime/monitors', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async getRealtimeMonitors(): Promise<{ items: RealtimeMonitor[] }> {
+        return this.request<{ items: RealtimeMonitor[] }>('/v1/realtime/monitors')
+    }
+
+    async getRealtimeMonitor(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}`)
+    }
+
+    async deleteRealtimeMonitor(monitorId: string): Promise<{ message: string; monitor: RealtimeMonitor }> {
+        return this.request<{ message: string; monitor: RealtimeMonitor }>(`/v1/realtime/monitors/${monitorId}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async startRealtimeMonitor(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}/start`, {
+            method: 'POST',
+        })
+    }
+
+    async pauseRealtimeMonitor(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}/pause`, {
+            method: 'POST',
+        })
+    }
+
+    async stopRealtimeMonitor(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}/stop`, {
+            method: 'POST',
+        })
+    }
+
+    async resumeRealtimeMonitor(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}/resume`, {
+            method: 'POST',
+        })
+    }
+
+    async runRealtimeMonitorOnce(monitorId: string): Promise<{ monitor: RealtimeMonitor; events: RealtimeEvent[] }> {
+        return this.request<{ monitor: RealtimeMonitor; events: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/run-once`, {
+            method: 'POST',
+        })
+    }
+
+    async resetRealtimeMonitorFuse(monitorId: string): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}/fuse-reset`, {
+            method: 'POST',
+        })
+    }
+
+    async getRealtimeMonitorEvents(monitorId: string, params?: { limit?: number; after_id?: string }): Promise<{ items: RealtimeEvent[] }> {
+        const query = new URLSearchParams()
+        if (params?.limit) query.set('limit', String(params.limit))
+        if (params?.after_id) query.set('after_id', params.after_id)
+        return this.request<{ items: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/events${query.toString() ? `?${query}` : ''}`)
+    }
+
+    async streamRealtimeMonitor(monitorId: string, params?: { initial_limit?: number; signal?: AbortSignal }): Promise<Response> {
+        const query = new URLSearchParams()
+        if (params?.initial_limit !== undefined) query.set('initial_limit', String(params.initial_limit))
+        const token = getAuthToken()
+        const response = await fetch(`${getBaseUrl()}/v1/realtime/monitors/${monitorId}/stream${query.toString() ? `?${query}` : ''}`, {
+            method: 'GET',
+            signal: params?.signal,
+            headers: {
+                Accept: 'text/event-stream',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+        })
+        if (!response.ok) {
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = data?.detail || data?.message
+                throw new Error(detail || `HTTP error! status: ${response.status}`)
+            }
+            const detail = await response.text().catch(() => '')
+            throw new Error(detail || `HTTP error! status: ${response.status}`)
+        }
+        return response
+    }
+
+    async getRealtimeMonitorOrders(monitorId: string): Promise<{ items: RealtimeEvent[] }> {
+        return this.request<{ items: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/orders`)
+    }
+
+    async getRealtimeMonitorTrades(monitorId: string): Promise<{ items: RealtimeEvent[] }> {
+        return this.request<{ items: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/trades`)
+    }
+
+    async getRealtimeMonitorPositions(monitorId: string): Promise<RealtimeMonitorPositionsResponse> {
+        return this.request<RealtimeMonitorPositionsResponse>(`/v1/realtime/monitors/${monitorId}/positions`)
+    }
+
+    async getRealtimeApprovals(params?: { status?: string; monitor_id?: string }): Promise<{ items: RealtimeApprovalTask[] }> {
+        const query = new URLSearchParams()
+        if (params?.status) query.set('status', params.status)
+        if (params?.monitor_id) query.set('monitor_id', params.monitor_id)
+        return this.request<{ items: RealtimeApprovalTask[] }>(`/v1/realtime/approvals${query.toString() ? `?${query}` : ''}`)
+    }
+
+    async approveRealtimeApproval(approvalId: string, decision?: Record<string, unknown>): Promise<RealtimeApprovalTask> {
+        return this.request<RealtimeApprovalTask>(`/v1/realtime/approvals/${approvalId}/approve`, {
+            method: 'POST',
+            body: JSON.stringify({ decision: decision || {} }),
+        })
+    }
+
+    async rejectRealtimeApproval(approvalId: string, decision?: Record<string, unknown>): Promise<RealtimeApprovalTask> {
+        return this.request<RealtimeApprovalTask>(`/v1/realtime/approvals/${approvalId}/reject`, {
+            method: 'POST',
+            body: JSON.stringify({ decision: decision || {} }),
         })
     }
 
