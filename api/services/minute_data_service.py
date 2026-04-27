@@ -93,6 +93,8 @@ def evaluate_first_day_band_signals(
     trade_date: str,
     timeframe: str = "5m",
     lookback_days: int = 7,
+    supplement_frame: pd.DataFrame | None = None,
+    supplement_source: str | None = None,
 ) -> MinuteSignalResult:
     normalized_symbols = _normalize_symbols(symbols)
     if not normalized_symbols:
@@ -108,6 +110,24 @@ def evaluate_first_day_band_signals(
     start_dt = (end_dt - timedelta(days=max(lookback_days, 1) + 3)).date().isoformat()
     frame = _try_load_minute_frame_range(normalized_symbols, start_date=start_dt, end_date=trade_date)
     source = "postgresql:stock_minute_kline"
+    if supplement_frame is not None and not supplement_frame.empty:
+        extra = supplement_frame.copy()
+        if "symbol" in extra.columns:
+            extra["symbol"] = extra["symbol"].map(_normalize_symbol)
+        if "trade_time" in extra.columns:
+            extra["trade_time"] = pd.to_datetime(extra["trade_time"])
+        if frame is None or frame.empty:
+            frame = extra
+            source = supplement_source or source
+        else:
+            frame = (
+                pd.concat([frame, extra], ignore_index=True)
+                .sort_values(["symbol", "trade_time"])
+                .drop_duplicates(subset=["symbol", "trade_time"], keep="last")
+                .reset_index(drop=True)
+            )
+            if supplement_source:
+                source = f"{source}+{supplement_source}"
     if frame is None or frame.empty:
         frame = _generate_synthetic_minute_frame(normalized_symbols, trade_date)
         source = "synthetic:fallback"
@@ -286,6 +306,8 @@ def _aggregate_minute_frame(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame
     aggregated_frames: list[pd.DataFrame] = []
     for symbol, group in data.groupby("symbol"):
         group = group.set_index("trade_time")
+        latest_trade_time = group.index.max()
+        latest_closed_end = latest_trade_time.floor(rule)
         resampled = group.resample(rule, label="right", closed="right").agg(
             open=("open", "first"),
             high=("high", "max"),
@@ -294,6 +316,7 @@ def _aggregate_minute_frame(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame
             volume=("volume", "sum"),
             amount=("amount", "sum"),
         ).dropna(subset=["open", "high", "low", "close"], how="any")
+        resampled = resampled[resampled.index <= latest_closed_end]
         if resampled.empty:
             continue
         resampled["symbol"] = symbol

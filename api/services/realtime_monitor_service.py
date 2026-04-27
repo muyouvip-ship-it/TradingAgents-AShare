@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import pandas as pd
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
@@ -21,7 +22,7 @@ from api.models.strategy_models import (
 )
 from api.services import qmt_virtual_account_service, watchlist_service
 from api.services.minute_data_service import evaluate_first_day_band_signals, evaluate_intraday_confirmation
-from api.services.qmt_realtime_minute_capture_service import capture_today_minute_bars
+from api.services.qmt_realtime_minute_capture_service import _fetch_minute_bars, _upsert_minute_records, capture_today_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
 from api.services.strategy_platform_repository import get_platform_strategy
 
@@ -601,11 +602,55 @@ def _build_minute_features(monitor: RealtimeMonitorDB, symbols: list[str]) -> di
     try:
         if signal_mode == "first_day_band":
             result = evaluate_first_day_band_signals(symbols=symbols, trade_date=trade_date, timeframe=timeframe)
+            if not _minute_result_covers_trade_date(result.items, trade_date):
+                supplemented = _supplement_first_day_band_result(
+                    account_key=monitor.account_key,
+                    symbols=symbols,
+                    trade_date=trade_date,
+                    timeframe=timeframe,
+                )
+                if supplemented is not None:
+                    result = supplemented
         else:
             result = evaluate_intraday_confirmation(symbols=symbols, trade_date=trade_date, timeframe=timeframe)
         return {"timeframe": result.timeframe, "source": result.source, "items": result.items, "missing_symbols": result.missing_symbols}
     except Exception as exc:
         return {"timeframe": timeframe, "source": "unavailable", "items": [], "missing_symbols": symbols, "error": str(exc), "signal_mode": signal_mode}
+
+
+def _minute_result_covers_trade_date(items: list[dict[str, Any]], trade_date: str) -> bool:
+    for item in items or []:
+        bar_end = str(item.get("bar_end") or "")
+        if bar_end[:10] == trade_date:
+            return True
+    return False
+
+
+def _supplement_first_day_band_result(
+    *,
+    account_key: str,
+    symbols: list[str],
+    trade_date: str,
+    timeframe: str,
+):
+    config = qmt_virtual_account_service._resolve_runtime_config(account_key)
+    live_records = _fetch_minute_bars(config, symbols, trade_date)
+    if not live_records:
+        return None
+    try:
+        _upsert_minute_records(live_records)
+    except Exception as exc:
+        logger.warning("[realtime-monitor] minute supplement upsert failed trade_date=%s symbols=%s error=%s", trade_date, len(symbols), exc)
+    supplement_frame = pd.DataFrame(live_records)
+    if supplement_frame.empty:
+        return None
+    return evaluate_first_day_band_signals(
+        symbols=symbols,
+        trade_date=trade_date,
+        timeframe=timeframe,
+        supplement_frame=supplement_frame,
+        supplement_source="qmt_bridge_live",
+    )
 
 
 def _generate_signals(
@@ -713,16 +758,27 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
     symbol = signal["symbol"]
     price = float(signal.get("price") or 0)
     lot_size = int((monitor.config_json or {}).get("lot_size") or 100)
+    reentry_anchor_quantity = None
     if side == "sell":
         available = float((positions.get(symbol) or {}).get("available_position") or 0.0)
         quantity = int(available // lot_size) * lot_size
     else:
         total_asset = float(account.get("total_asset") or account.get("available_cash") or 0.0)
         available_cash = float(account.get("available_cash") or account.get("cash") or total_asset)
-        target_pct = float(signal.get("target_position_pct") or 0.02)
-        target_cash = min(total_asset * target_pct, available_cash)
-        quantity = int((target_cash / max(price, 0.01)) // lot_size) * lot_size
-    return {
+        reentry_anchor_quantity = _resolve_reentry_buy_quantity(
+            monitor,
+            overview,
+            symbol=symbol,
+            price=price,
+            lot_size=lot_size,
+        )
+        if reentry_anchor_quantity is not None:
+            quantity = reentry_anchor_quantity
+        else:
+            target_pct = float(signal.get("target_position_pct") or 0.02)
+            target_cash = min(total_asset * target_pct, available_cash)
+            quantity = int((target_cash / max(price, 0.01)) // lot_size) * lot_size
+    intent = {
         "account_key": monitor.account_key,
         "symbol": symbol,
         "side": side,
@@ -734,6 +790,9 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
         "order_remark": signal.get("reason") or "realtime_monitor",
         "target_position_pct": signal.get("target_position_pct"),
     }
+    if reentry_anchor_quantity is not None:
+        intent["reentry_anchor_quantity"] = reentry_anchor_quantity
+    return intent
 
 
 def _risk_check(db: Session, monitor: RealtimeMonitorDB, intent: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
@@ -1060,6 +1119,7 @@ def _emit_position_updates(
         current = current_positions.get(symbol)
         if previous == current:
             continue
+        _sync_reentry_anchor_with_position_change(monitor, symbol, previous, current)
         _append_event(
             db,
             monitor,
@@ -1249,6 +1309,125 @@ def _set_execution_tracker(monitor: RealtimeMonitorDB, tracker: dict[str, Any]) 
         "tracked_orders": len((tracker.get("last_orders") or {})),
         "tracked_trades": len((tracker.get("seen_trade_ids") or [])),
         "tracked_positions": len((tracker.get("last_positions") or {})),
+    }
+    monitor.state_json = _json_safe(state)
+
+
+def _resolve_reentry_buy_quantity(
+    monitor: RealtimeMonitorDB,
+    overview: dict[str, Any],
+    *,
+    symbol: str,
+    price: float,
+    lot_size: int,
+) -> int | None:
+    anchor = _get_reentry_anchor(monitor, symbol)
+    if not anchor:
+        return None
+    positions = {item.get("symbol"): item for item in (overview.get("positions") or []) if item.get("symbol")}
+    if symbol in positions:
+        return None
+    available_cash = float((overview.get("account") or {}).get("available_cash") or (overview.get("account") or {}).get("cash") or 0.0)
+    target_quantity = int(anchor.get("quantity") or 0)
+    if target_quantity <= 0:
+        return None
+    if lot_size > 0:
+        target_quantity = int(target_quantity // lot_size) * lot_size
+    affordable_quantity = int((available_cash / max(price, 0.01)) // max(lot_size, 1)) * max(lot_size, 1)
+    quantity = min(target_quantity, affordable_quantity) if affordable_quantity > 0 else 0
+    return quantity if quantity > 0 else None
+
+
+def _sync_reentry_anchor_with_position_change(
+    monitor: RealtimeMonitorDB,
+    symbol: str,
+    previous: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> None:
+    target_symbol = _single_symbol_reentry_target(monitor)
+    if target_symbol != symbol:
+        return
+    previous_position = int(float((previous or {}).get("current_position") or 0))
+    current_position = int(float((current or {}).get("current_position") or 0))
+    if previous_position > 0 and current_position <= 0:
+        _set_reentry_anchor(
+            monitor,
+            symbol,
+            quantity=previous_position,
+            previous_position=previous_position,
+            current_position=current_position,
+            source="position_changed_exit",
+        )
+        return
+    if current_position > 0:
+        _clear_reentry_anchor(monitor, symbol, reason="position_restored")
+
+
+def _single_symbol_reentry_target(monitor: RealtimeMonitorDB) -> str | None:
+    config = dict(monitor.config_json or {})
+    if str(config.get("signal_mode") or "").strip().lower() != "first_day_band":
+        return None
+    pool = dict(monitor.monitor_pool_json or {})
+    if str(pool.get("mode") or "").strip().lower() != "manual_only":
+        return None
+    candidates = pool.get("manual_symbols") or pool.get("symbols") or pool.get("resolved_symbols") or []
+    normalized = []
+    seen: set[str] = set()
+    for item in candidates:
+        normalized_symbol = _normalize_symbol(item)
+        if normalized_symbol and normalized_symbol not in seen:
+            seen.add(normalized_symbol)
+            normalized.append(normalized_symbol)
+    if len(normalized) != 1:
+        return None
+    return normalized[0]
+
+
+def _get_reentry_anchor(monitor: RealtimeMonitorDB, symbol: str) -> dict[str, Any] | None:
+    if _single_symbol_reentry_target(monitor) != symbol:
+        return None
+    state = dict(monitor.state_json or {})
+    anchors = dict(state.get("reentry_anchors") or {})
+    anchor = anchors.get(symbol)
+    return dict(anchor) if isinstance(anchor, dict) else None
+
+
+def _set_reentry_anchor(
+    monitor: RealtimeMonitorDB,
+    symbol: str,
+    *,
+    quantity: int,
+    previous_position: int,
+    current_position: int,
+    source: str,
+) -> None:
+    if quantity <= 0:
+        return
+    state = dict(monitor.state_json or {})
+    anchors = dict(state.get("reentry_anchors") or {})
+    anchors[symbol] = {
+        "symbol": symbol,
+        "quantity": int(quantity),
+        "previous_position": int(previous_position),
+        "current_position": int(current_position),
+        "source": source,
+        "captured_at": _now_dt().isoformat(),
+    }
+    state["reentry_anchors"] = _json_safe(anchors)
+    monitor.state_json = _json_safe(state)
+
+
+def _clear_reentry_anchor(monitor: RealtimeMonitorDB, symbol: str, *, reason: str) -> None:
+    state = dict(monitor.state_json or {})
+    anchors = dict(state.get("reentry_anchors") or {})
+    if symbol not in anchors:
+        return
+    anchors.pop(symbol, None)
+    state["reentry_anchors"] = _json_safe(anchors)
+    state["reentry_anchor_last_cleared"] = {
+        "symbol": symbol,
+        "reason": reason,
+        "cleared_at": _now_dt().isoformat(),
     }
     monitor.state_json = _json_safe(state)
 
@@ -1580,7 +1759,8 @@ def _now_dt() -> datetime:
 
 def _ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        return value.replace(tzinfo=local_tz).astimezone(timezone.utc)
     return value.astimezone(timezone.utc)
 
 

@@ -52,6 +52,19 @@ function formatCurrency(value?: number | null) {
   return `${prefix}¥${formatPrice(amount)}`
 }
 
+function parseFiniteNumber(value: unknown) {
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function displaySecurityName(name?: string | null, symbol?: string | null) {
+  const trimmedName = String(name || '').trim()
+  const trimmedSymbol = String(symbol || '').trim().toUpperCase()
+  if (!trimmedName) return ''
+  if (trimmedName.toUpperCase() === trimmedSymbol) return ''
+  return trimmedName
+}
+
 function pnlTone(value?: number | null) {
   if (value == null || Number.isNaN(value) || value === 0) return 'text-slate-600 dark:text-slate-300'
   return value > 0 ? 'text-rose-600 dark:text-rose-300' : 'text-emerald-600 dark:text-emerald-300'
@@ -71,6 +84,18 @@ function parseSseBlock(block: string): { event: string; data: Record<string, unk
   } catch {
     return null
   }
+}
+
+function mergeRealtimeEvents(current: RealtimeEvent[], incoming: RealtimeEvent[]) {
+  const merged = [...current]
+  for (const item of incoming) {
+    const index = merged.findIndex(row => row.id === item.id)
+    if (index >= 0) merged[index] = item
+    else merged.push(item)
+  }
+  return merged
+    .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
+    .slice(-1500)
 }
 
 function statusLabel(status: string) {
@@ -96,41 +121,6 @@ function statusTone(status: string) {
   }[status] || 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
 }
 
-function eventLabel(eventType: string) {
-  return {
-    monitor_created: '实例已创建',
-    monitor_started: '实例已启动',
-    monitor_paused: '实例已暂停',
-    monitor_stopped: '实例已停机',
-    monitor_resumed: '实例已恢复',
-    monitor_fused: '实例已熔断',
-    cycle_started: '开始新一轮扫描',
-    cycle_skipped: '本轮已跳过',
-    market_snapshot: '行情快照',
-    minute_features: '分钟特征',
-    signal_generated: '生成交易信号',
-    order_intent: '生成委托意图',
-    order_submitted: '委托已提交',
-    order_snapshot_refreshed: '委托快照刷新',
-    order_status_changed: '委托状态变化',
-    order_cancel_requested: '触发自动撤单',
-    order_cancelled: '撤单已确认',
-    order_cancel_error: '撤单异常',
-    order_replace_requested: '触发自动补单',
-    order_rejected: '委托被拒绝',
-    order_error: '委托执行异常',
-    trade_confirmed: '成交已确认',
-    position_changed: '持仓变化',
-    execution_tracker_initialized: '执行追踪已初始化',
-    approval_created: '进入人工确认',
-    approval_executed: '人工确认后执行',
-    approval_rejected: '人工确认已拒绝',
-    no_signal: '本轮无信号',
-    fuse_reset: '熔断已解除',
-    live_readonly_guard: '实盘只读保护',
-  }[eventType] || eventType
-}
-
 function timeframeLabel(value?: string | null) {
   if (!value) return '--'
   const normalized = String(value).toLowerCase()
@@ -145,30 +135,6 @@ function timeframeLabel(value?: string | null) {
   }[normalized] || value
 }
 
-function eventTone(eventType: string) {
-  if (['monitor_fused', 'order_error', 'order_rejected', 'order_cancel_error'].includes(eventType)) {
-    return 'border-rose-200 bg-rose-50/70 dark:border-rose-500/30 dark:bg-rose-500/10'
-  }
-  if (['signal_generated', 'approval_executed', 'trade_confirmed', 'order_submitted'].includes(eventType)) {
-    return 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10'
-  }
-  if (['minute_features', 'minute_capture', 'market_snapshot', 'cycle_started'].includes(eventType)) {
-    return 'border-blue-200 bg-blue-50/70 dark:border-blue-500/30 dark:bg-blue-500/10'
-  }
-  if (['no_signal', 'cycle_skipped'].includes(eventType)) {
-    return 'border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950'
-  }
-  return 'border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900'
-}
-
-function eventTagLabel(eventType: string) {
-  if (['minute_features', 'minute_capture', 'market_snapshot'].includes(eventType)) return '分钟判定'
-  if (['signal_generated', 'order_intent', 'order_submitted', 'trade_confirmed'].includes(eventType)) return '交易执行'
-  if (['monitor_fused', 'order_error', 'order_rejected', 'order_cancel_error'].includes(eventType)) return '风险异常'
-  if (['position_changed', 'execution_tracker_initialized'].includes(eventType)) return '账户跟踪'
-  return '运行事件'
-}
-
 function signalSideLabel(value?: string | null) {
   if (!value) return '--'
   const normalized = String(value).toLowerCase()
@@ -180,48 +146,357 @@ function signalSideLabel(value?: string | null) {
 }
 
 function eventSide(item: RealtimeEvent) {
-  return String(item.order_payload?.side || item.signal_payload?.side || item.payload?.side || '').toLowerCase()
-}
-
-function eventSideTone(item: RealtimeEvent) {
-  const side = eventSide(item)
-  if (side === 'buy') return 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300'
-  if (side === 'sell') return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
-  if (item.event_type === 'monitor_fused' || item.event_type === 'order_error' || item.event_type === 'order_rejected') {
-    return 'bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300'
-  }
-  return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
-}
-
-function eventSideLabel(item: RealtimeEvent) {
-  const side = eventSide(item)
-  if (side === 'buy') return '买入'
-  if (side === 'sell') return '卖出'
-  if (item.event_type === 'trade_confirmed') return '成交'
-  if (item.event_type === 'order_rejected' || item.event_type === 'order_error') return '异常'
-  return '跟踪'
-}
-
-function eventAccent(item: RealtimeEvent) {
-  const side = eventSide(item)
-  if (side === 'buy') return 'border-l-rose-500'
-  if (side === 'sell') return 'border-l-emerald-500'
-  if (['monitor_fused', 'order_error', 'order_rejected', 'order_cancel_error'].includes(item.event_type)) return 'border-l-amber-500'
-  return 'border-l-blue-500'
+  return String(item.order_payload?.side || item.broker_result?.side || item.signal_payload?.side || item.payload?.side || '').toLowerCase()
 }
 
 function eventMetricLine(item: RealtimeEvent) {
-  const quantity = Number(item.order_payload?.quantity || item.broker_result?.quantity || item.payload?.quantity || NaN)
+  const quantity = eventQuantity(item)
+  const filledQuantity =
+    parseFiniteNumber(item.payload?.filled_quantity) ??
+    parseFiniteNumber(item.order_payload?.filled_quantity) ??
+    parseFiniteNumber(item.broker_result?.filled_quantity)
   const price = Number(item.order_payload?.price || item.broker_result?.price || item.payload?.price || NaN)
   const priceType = String(item.order_payload?.price_type || item.payload?.price_type || '').trim()
+  const state = eventExecutionState(item)
   const fields: string[] = []
-  if (Number.isFinite(quantity)) fields.push(`${formatNumber(quantity)} 股`)
-  if (Number.isFinite(price)) fields.push(`¥${formatPrice(price)}`)
-  if (priceType) fields.push(priceType)
+  if (quantity != null) fields.push(`委托 ${formatNumber(quantity)} 股`)
+  if (Number.isFinite(price)) fields.push(`价格 ¥${formatPrice(price)}`)
+  if (priceType) fields.push(`方式 ${priceType}`)
+  if (filledQuantity != null && filledQuantity > 0) fields.push(`已成交 ${formatNumber(filledQuantity)} 股`)
+  if (state && !['已成交', '未成交'].includes(state)) fields.push(`状态 ${state}`)
   return fields.join(' / ')
 }
 
-function getEventSummary(item: RealtimeEvent) {
+function eventSymbol(item: RealtimeEvent) {
+  return String(item.symbol || item.order_payload?.symbol || item.broker_result?.symbol || item.signal_payload?.symbol || '').trim().toUpperCase()
+}
+
+function eventActionLabel(item: RealtimeEvent) {
+  const side = eventSide(item)
+  if (side === 'buy') return '买入'
+  if (side === 'sell') return '卖出'
+  return '调仓'
+}
+
+function eventQuantity(item: RealtimeEvent) {
+  return (
+    parseFiniteNumber(item.order_payload?.quantity) ??
+    parseFiniteNumber(item.broker_result?.quantity) ??
+    parseFiniteNumber((item.broker_result?.raw as Record<string, unknown> | undefined)?.traded_volume) ??
+    parseFiniteNumber(item.broker_result?.filled_quantity) ??
+    parseFiniteNumber(item.payload?.quantity) ??
+    parseFiniteNumber(item.payload?.filled_quantity)
+  )
+}
+
+function eventCurrentPosition(item: RealtimeEvent, positionMap: Map<string, number>) {
+  const payloadCurrent = item.payload?.current as Record<string, unknown> | undefined
+  const payloadPrevious = item.payload?.previous as Record<string, unknown> | undefined
+  const currentMissing = Object.prototype.hasOwnProperty.call(item.payload || {}, 'current') && payloadCurrent == null
+  const currentPosition =
+    (currentMissing ? 0 : null) ??
+    parseFiniteNumber(payloadCurrent?.current_position) ??
+    parseFiniteNumber(payloadPrevious?.current_position) ??
+    positionMap.get(eventSymbol(item))
+  return currentPosition ?? null
+}
+
+function eventSecurityName(item: RealtimeEvent, positionNameMap: Map<string, string>) {
+  const payloadCurrent = item.payload?.current as Record<string, unknown> | undefined
+  const payloadPrevious = item.payload?.previous as Record<string, unknown> | undefined
+  const symbol = eventSymbol(item)
+  return (
+    displaySecurityName(String(payloadCurrent?.name || ''), symbol) ||
+    displaySecurityName(String(payloadPrevious?.name || ''), symbol) ||
+    displaySecurityName(String(item.order_payload?.name || ''), symbol) ||
+    displaySecurityName(String(item.broker_result?.name || ''), symbol) ||
+    displaySecurityName(String(item.broker_result?.security_name || item.broker_result?.stockName || ''), symbol) ||
+    positionNameMap.get(symbol) ||
+    ''
+  )
+}
+
+function eventPositionChange(item: RealtimeEvent) {
+  const payloadCurrent = item.payload?.current as Record<string, unknown> | undefined
+  const payloadPrevious = item.payload?.previous as Record<string, unknown> | undefined
+  const hasCurrent = Object.prototype.hasOwnProperty.call(item.payload || {}, 'current')
+  const hasPrevious = Object.prototype.hasOwnProperty.call(item.payload || {}, 'previous')
+  const currentPosition = payloadCurrent == null && hasCurrent ? 0 : parseFiniteNumber(payloadCurrent?.current_position)
+  const previousPosition = payloadPrevious == null && hasPrevious ? 0 : parseFiniteNumber(payloadPrevious?.current_position)
+  if (currentPosition == null || previousPosition == null) return null
+  return currentPosition - previousPosition
+}
+
+function eventOrderId(item: RealtimeEvent) {
+  return String(
+    item.payload?.order_id ||
+    item.order_payload?.order_id ||
+    item.broker_result?.order_id ||
+    (item.broker_result?.order_result as Record<string, unknown> | undefined)?.order_id ||
+    '',
+  ).trim()
+}
+
+function eventLifecycleKey(item: RealtimeEvent) {
+  const correlationId = String(item.correlation_id || '').trim()
+  const symbol = eventSymbol(item)
+  if (correlationId && symbol) return `corr:${correlationId}:${symbol}`
+  const orderId = eventOrderId(item)
+  if (orderId) return `order:${orderId}`
+  return ''
+}
+
+function selectRepresentativeEvent(items: RealtimeEvent[]) {
+  const priorities = [
+    'trade_confirmed',
+    'order_status_changed',
+    'order_cancelled',
+    'order_rejected',
+    'order_error',
+    'order_cancel_error',
+    'order_replace_requested',
+    'order_cancel_requested',
+    'order_submitted',
+    'position_changed',
+  ]
+  for (const eventType of priorities) {
+    const matched = items.filter(item => item.event_type === eventType)
+    if (matched.length) return matched[matched.length - 1]
+  }
+  return items[items.length - 1]
+}
+
+function mergeTradeLifecycleGroup(items: RealtimeEvent[]) {
+  const representative = selectRepresentativeEvent(items)
+  const mergedPayload = items.find(item => Object.keys(item.payload || {}).length)?.payload || representative.payload
+  const mergedSignalPayload = items.find(item => Object.keys(item.signal_payload || {}).length)?.signal_payload || representative.signal_payload
+  const mergedOrderPayload = items.find(item => Object.keys(item.order_payload || {}).length)?.order_payload || representative.order_payload
+  const mergedBrokerResult = [...items].reverse().find(item => Object.keys(item.broker_result || {}).length)?.broker_result || representative.broker_result
+  const mergedRiskPayload = items.find(item => Object.keys(item.risk_payload || {}).length)?.risk_payload || representative.risk_payload
+  const mergedErrorPayload = [...items].reverse().find(item => Object.keys(item.error_payload || {}).length)?.error_payload || representative.error_payload
+  return {
+    ...representative,
+    payload: mergedPayload,
+    signal_payload: mergedSignalPayload,
+    order_payload: mergedOrderPayload,
+    broker_result: mergedBrokerResult,
+    risk_payload: mergedRiskPayload,
+    error_payload: mergedErrorPayload,
+  }
+}
+
+function buildTradeFlowItems(events: RealtimeEvent[]) {
+  const groups: RealtimeEvent[][] = []
+  const groupsByOrderId = new Map<string, RealtimeEvent[]>()
+  const groupsByCorrelation = new Map<string, RealtimeEvent[]>()
+  const standalone: RealtimeEvent[] = []
+  for (const item of [...events].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))) {
+    if (!isTradeBehaviorEvent(item) && item.event_type !== 'order_snapshot_refreshed') continue
+    const symbol = eventSymbol(item)
+    const orderId = eventOrderId(item)
+    const correlationKey = (() => {
+      const correlationId = String(item.correlation_id || '').trim()
+      return correlationId && symbol ? `corr:${correlationId}:${symbol}` : ''
+    })()
+    let targetGroup: RealtimeEvent[] | undefined
+    if (orderId) {
+      targetGroup = groupsByOrderId.get(orderId)
+    }
+    if (!targetGroup && correlationKey) {
+      targetGroup = groupsByCorrelation.get(correlationKey)
+    }
+    if (!targetGroup && item.event_type === 'position_changed' && symbol) {
+      const itemTime = new Date(item.created_at || '').getTime()
+      if (Number.isFinite(itemTime)) {
+        targetGroup = [...groups].reverse().find(group => {
+          const latest = group[group.length - 1]
+          const latestTime = new Date(latest.created_at || '').getTime()
+          if (!Number.isFinite(latestTime)) return false
+          return eventSymbol(latest) === symbol && Math.abs(itemTime - latestTime) <= 90_000
+        })
+      }
+    }
+    if (!targetGroup) {
+      if (!isTradeBehaviorEvent(item)) continue
+      const key = eventLifecycleKey(item)
+      if (!key) {
+        standalone.push(item)
+        continue
+      }
+      targetGroup = [item]
+      groups.push(targetGroup)
+    } else {
+      targetGroup.push(item)
+    }
+    if (orderId) {
+      groupsByOrderId.set(orderId, targetGroup)
+    }
+    if (correlationKey) {
+      groupsByCorrelation.set(correlationKey, targetGroup)
+    }
+    if (!orderId && !correlationKey && !isTradeBehaviorEvent(item)) {
+      continue
+    }
+    if (!orderId && !correlationKey && isTradeBehaviorEvent(item) && !groups.includes(targetGroup)) {
+      if (isTradeBehaviorEvent(item)) standalone.push(item)
+    }
+  }
+  const merged = groups
+    .filter(items => items.some(item => isTradeBehaviorEvent(item)))
+    .map(items => mergeTradeLifecycleGroup(items))
+  return [...standalone, ...merged]
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, 40)
+}
+
+function eventExecutionState(item: RealtimeEvent) {
+  if (item.event_type === 'trade_confirmed') return '已成交'
+  if (item.event_type === 'order_submitted') return '未成交'
+  if (item.event_type === 'order_rejected') return '已拒单'
+  if (item.event_type === 'order_error') return '执行异常'
+  if (item.event_type === 'order_cancel_requested' || item.event_type === 'order_replace_requested') return '处理中'
+  if (item.event_type === 'order_cancelled') return '已撤单'
+  if (item.event_type === 'position_changed') {
+    const change = eventPositionChange(item)
+    if (change == null) return '持仓已刷新'
+    return change === 0 ? '未成交' : '已成交'
+  }
+  if (item.event_type === 'order_status_changed') {
+    const quantity = eventQuantity(item)
+    const filledQuantity =
+      parseFiniteNumber(item.payload?.filled_quantity) ??
+      parseFiniteNumber(item.order_payload?.filled_quantity) ??
+      parseFiniteNumber(item.broker_result?.filled_quantity)
+    const statusText = String(item.payload?.current_status || item.order_payload?.status || item.broker_result?.status || '').toLowerCase()
+    if (filledQuantity != null && quantity != null && filledQuantity >= quantity && quantity > 0) return '已成交'
+    if (filledQuantity != null && filledQuantity > 0) return '部分成交'
+    if (statusText.includes('cancel')) return '已撤单'
+    if (statusText.includes('reject') || statusText.includes('invalid')) return '已拒单'
+    if (statusText.includes('error') || statusText.includes('fail')) return '执行异常'
+    if (statusText.includes('pending') || statusText.includes('queue') || statusText.includes('submit') || statusText.includes('new')) return '处理中'
+    return '未成交'
+  }
+  return ''
+}
+
+function eventStatusKind(item: RealtimeEvent) {
+  const state = eventExecutionState(item)
+  if (item.event_type === 'monitor_fused') return 'risk'
+  if (state === '执行异常') return 'error'
+  if (state === '已拒单') return 'rejected'
+  if (state === '已撤单') return 'cancelled'
+  if (state === '部分成交') return 'partial'
+  if (state === '已成交') return 'filled'
+  if (state === '处理中') return 'pending_action'
+  if (item.event_type === 'signal_generated' || item.event_type === 'order_intent') return 'pending_action'
+  const side = eventSide(item)
+  if (side === 'buy') return 'buy'
+  if (side === 'sell') return 'sell'
+  return 'info'
+}
+
+function eventTone(item: RealtimeEvent) {
+  return {
+    buy: 'border-rose-200 bg-rose-50/70 dark:border-rose-500/30 dark:bg-rose-500/10',
+    sell: 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10',
+    filled: 'border-sky-200 bg-sky-50/70 dark:border-sky-500/30 dark:bg-sky-500/10',
+    partial: 'border-amber-200 bg-amber-50/80 dark:border-amber-500/30 dark:bg-amber-500/10',
+    cancelled: 'border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950',
+    rejected: 'border-rose-200 bg-rose-50/70 dark:border-rose-500/30 dark:bg-rose-500/10',
+    error: 'border-rose-200 bg-rose-50/70 dark:border-rose-500/30 dark:bg-rose-500/10',
+    risk: 'border-amber-200 bg-amber-50/80 dark:border-amber-500/30 dark:bg-amber-500/10',
+    pending_action: 'border-indigo-200 bg-indigo-50/70 dark:border-indigo-500/30 dark:bg-indigo-500/10',
+    info: 'border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900',
+  }[eventStatusKind(item)]
+}
+
+function eventTagLabel(item: RealtimeEvent) {
+  if (['minute_features', 'minute_capture', 'market_snapshot', 'cycle_started', 'cycle_skipped', 'no_signal'].includes(item.event_type)) {
+    return '分钟判定'
+  }
+  if (['signal_generated', 'order_intent'].includes(item.event_type)) return '交易信号'
+  if (['order_submitted', 'order_status_changed', 'order_snapshot_refreshed'].includes(item.event_type)) return '委托跟踪'
+  if (['trade_confirmed'].includes(item.event_type)) return '成交回报'
+  if (['order_cancel_requested', 'order_cancelled', 'order_replace_requested'].includes(item.event_type)) return '撤补流程'
+  if (['monitor_fused', 'order_error', 'order_rejected', 'order_cancel_error', 'live_readonly_guard'].includes(item.event_type)) {
+    return '风险异常'
+  }
+  if (['position_changed', 'execution_tracker_initialized', 'approval_created', 'approval_executed', 'approval_rejected'].includes(item.event_type)) {
+    return '账户跟踪'
+  }
+  return '运行事件'
+}
+
+function eventSideTone(item: RealtimeEvent) {
+  return {
+    buy: 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
+    sell: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
+    filled: 'bg-sky-100 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300',
+    partial: 'bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
+    cancelled: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
+    rejected: 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
+    error: 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
+    risk: 'bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
+    pending_action: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300',
+    info: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
+  }[eventStatusKind(item)]
+}
+
+function eventSideLabel(item: RealtimeEvent) {
+  return {
+    buy: '买入委托',
+    sell: '卖出委托',
+    filled: '已成交',
+    partial: '部分成交',
+    cancelled: '已撤单',
+    rejected: '已拒单',
+    error: '执行异常',
+    risk: '熔断',
+    pending_action: '处理中',
+    info: '跟踪中',
+  }[eventStatusKind(item)]
+}
+
+function eventAccent(item: RealtimeEvent) {
+  return {
+    buy: 'border-l-rose-500',
+    sell: 'border-l-emerald-500',
+    filled: 'border-l-sky-500',
+    partial: 'border-l-amber-500',
+    cancelled: 'border-l-slate-400',
+    rejected: 'border-l-rose-500',
+    error: 'border-l-rose-500',
+    risk: 'border-l-amber-500',
+    pending_action: 'border-l-indigo-500',
+    info: 'border-l-blue-500',
+  }[eventStatusKind(item)]
+}
+
+function isTradeBehaviorEvent(item: RealtimeEvent) {
+  if (
+    ![
+      'order_submitted',
+      'order_status_changed',
+      'order_cancel_requested',
+      'order_cancelled',
+      'order_cancel_error',
+      'order_replace_requested',
+      'order_rejected',
+      'order_error',
+      'trade_confirmed',
+      'position_changed',
+    ].includes(item.event_type)
+  ) {
+    return false
+  }
+  if (item.event_type === 'position_changed') {
+    const change = eventPositionChange(item)
+    return change != null && change !== 0
+  }
+  return true
+}
+
+function getEventSummary(item: RealtimeEvent, positionMap: Map<string, number>) {
   const payload = item.payload || {}
   if (item.event_type === 'minute_capture') {
     const success = Boolean(payload.success)
@@ -255,13 +530,62 @@ function getEventSummary(item: RealtimeEvent) {
   }
 
   if (item.event_type === 'order_submitted') {
-    return `委托已发出：${signalSideLabel(String(item.order_payload?.side || ''))} ${formatNumber(Number(item.order_payload?.quantity || 0))} 股`
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，未成交，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
+  }
+
+  if (item.event_type === 'order_status_changed') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，${eventExecutionState(item)}，当前持仓 ${formatNumber(currentPosition ?? 0)} 股`
+  }
+
+  if (item.event_type === 'trade_confirmed') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，已成交，当前持仓 ${formatNumber(currentPosition ?? 0)} 股`
+  }
+
+  if (item.event_type === 'order_cancel_requested') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，处理中，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
+  }
+
+  if (item.event_type === 'order_cancelled') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，已撤单，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
+  }
+
+  if (item.event_type === 'order_replace_requested') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，处理中，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
+  }
+
+  if (item.event_type === 'order_rejected' || item.event_type === 'order_error') {
+    const quantity = eventQuantity(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `${eventActionLabel(item)} ${formatNumber(quantity ?? 0)} 股，${eventExecutionState(item)}，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
   }
 
   if (item.event_type === 'position_changed') {
     const current = item.payload?.current as Record<string, unknown> | undefined
+    const change = eventPositionChange(item)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    if (change == null) {
+      return `当前持仓 ${formatNumber(currentPosition ?? 0)} 股`
+    }
+    if (change > 0) {
+      return `买入 ${formatNumber(change)} 股，已成交，当前持仓 ${formatNumber(currentPosition ?? 0)} 股`
+    }
+    if (change < 0) {
+      return `卖出 ${formatNumber(Math.abs(change))} 股，已成交，当前持仓 ${formatNumber(currentPosition ?? 0)} 股`
+    }
     if (current) {
-      return `持仓变动：${String(current.name || item.symbol || '--')}，持仓 ${formatNumber(Number(current.current_position || 0))} 股`
+      return `当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未变化`
     }
   }
 
@@ -362,11 +686,20 @@ export default function RealtimeMonitorPage() {
   const loadDetail = useCallback(async (monitorId: string) => {
     const [monitor, eventRes, positionRes] = await Promise.all([
       api.getRealtimeMonitor(monitorId),
-      api.getRealtimeMonitorEvents(monitorId, { limit: 100 }),
+      api.getRealtimeMonitorEvents(monitorId, { limit: 1000 }),
       api.getRealtimeMonitorPositions(monitorId),
     ])
     setSelectedMonitor(monitor)
-    setEvents(eventRes.items || [])
+    setEvents(current => mergeRealtimeEvents(current, eventRes.items || []))
+    setPositionsPayload(positionRes)
+  }, [])
+
+  const loadMonitorSnapshot = useCallback(async (monitorId: string) => {
+    const [monitor, positionRes] = await Promise.all([
+      api.getRealtimeMonitor(monitorId),
+      api.getRealtimeMonitorPositions(monitorId),
+    ])
+    setSelectedMonitor(monitor)
     setPositionsPayload(positionRes)
   }, [])
 
@@ -410,6 +743,7 @@ export default function RealtimeMonitorPage() {
 
   useEffect(() => {
     if (!selectedMonitorId) return
+    setEvents([])
     void loadDetail(selectedMonitorId)
   }, [loadDetail, selectedMonitorId])
 
@@ -468,8 +802,7 @@ export default function RealtimeMonitorPage() {
               const item = parsed.data.item as RealtimeEvent | undefined
               if (!item?.id) continue
               setEvents(current => {
-                const merged = [...current.filter(row => row.id !== item.id), item]
-                return merged.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))).slice(-200)
+                return mergeRealtimeEvents(current, [item])
               })
               if ([
                 'order_submitted',
@@ -486,7 +819,7 @@ export default function RealtimeMonitorPage() {
                 'approval_executed',
                 'approval_rejected',
               ].includes(item.event_type)) {
-                void loadDetail(selectedMonitorId)
+                void loadMonitorSnapshot(selectedMonitorId)
               }
             }
           }
@@ -501,7 +834,7 @@ export default function RealtimeMonitorPage() {
 
     void startStream()
     return () => controller.abort()
-  }, [loadDetail, selectedMonitorId])
+  }, [loadMonitorSnapshot, selectedMonitorId])
 
   const handleCreate = useCallback(async () => {
     if (!form.strategy_id) {
@@ -580,7 +913,7 @@ export default function RealtimeMonitorPage() {
       const result = await api.runRealtimeMonitorOnce(selectedMonitorId)
       setSelectedMonitor(result.monitor)
       setMonitors(current => current.map(item => (item.id === result.monitor.id ? result.monitor : item)))
-      setEvents(result.events || [])
+      setEvents(current => mergeRealtimeEvents(current, result.events || []))
       await loadDetail(selectedMonitorId)
       setMessage('已手动执行一轮实时监控')
       setError(null)
@@ -658,25 +991,22 @@ export default function RealtimeMonitorPage() {
     [positionsPayload?.positions],
   )
 
-  const eventFlowItems = useMemo(() => {
-    const tradeEventTypes = new Set([
-      'signal_generated',
-      'order_intent',
-      'order_submitted',
-      'order_status_changed',
-      'order_cancel_requested',
-      'order_cancelled',
-      'order_rejected',
-      'order_error',
-      'trade_confirmed',
-      'position_changed',
-      'monitor_fused',
-    ])
-    return [...events]
-      .reverse()
-      .filter(item => tradeEventTypes.has(item.event_type))
-      .slice(0, 40)
-  }, [events])
+  const strategyPositionMap = useMemo(
+    () => new Map(strategyPositions.map(position => [String(position.symbol || '').trim().toUpperCase(), Number(position.current_position || 0)])),
+    [strategyPositions],
+  )
+
+  const strategyPositionNameMap = useMemo(
+    () => new Map(
+      strategyPositions.map(position => [
+        String(position.symbol || '').trim().toUpperCase(),
+        displaySecurityName(position.name, position.symbol),
+      ]),
+    ),
+    [strategyPositions],
+  )
+
+  const eventFlowItems = useMemo(() => buildTradeFlowItems(events), [events])
 
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">实时监控模块加载中...</div>
@@ -886,22 +1216,41 @@ export default function RealtimeMonitorPage() {
                   <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">显示股票交易相关的信号、委托、成交与风险事件。</div>
                   <div className="mt-4 max-h-[980px] space-y-3 overflow-auto pr-1">
                     {eventFlowItems.length ? eventFlowItems.map(item => (
-                      <div key={item.id} className={`rounded-2xl border border-l-4 p-4 ${eventTone(item.event_type)} ${eventAccent(item)}`}>
+                      <div key={item.id} className={`rounded-2xl border border-l-4 p-4 ${eventTone(item)} ${eventAccent(item)}`}>
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className={`rounded-full px-2 py-1 text-[11px] font-semibold ${eventSideTone(item)}`}>
                                 {eventSideLabel(item)}
                               </span>
-                              <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
-                                {item.symbol || String(item.order_payload?.symbol || item.signal_payload?.symbol || '--')}
-                              </span>
-                              <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-                                {eventLabel(item.event_type)}
-                              </span>
+                              {(() => {
+                                const symbol = eventSymbol(item)
+                                const name = eventSecurityName(item, strategyPositionNameMap)
+                                if (!symbol && !name) {
+                                  return (
+                                    <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
+                                      --
+                                    </span>
+                                  )
+                                }
+                                return (
+                                  <>
+                                    {symbol ? (
+                                      <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
+                                        {symbol}
+                                      </span>
+                                    ) : null}
+                                    {name ? (
+                                      <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                                        {name}
+                                      </span>
+                                    ) : null}
+                                  </>
+                                )
+                              })()}
                             </div>
                             <div className="mt-2 text-sm font-medium text-slate-800 dark:text-slate-100">
-                              {getEventSummary(item) || '事件已记录'}
+                              {getEventSummary(item, strategyPositionMap) || '事件已记录'}
                             </div>
                             {eventMetricLine(item) ? (
                               <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
@@ -918,7 +1267,7 @@ export default function RealtimeMonitorPage() {
                         </div>
                         <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
                           <span className="rounded-full bg-slate-100 px-2 py-1 dark:bg-slate-800">
-                            {eventTagLabel(item.event_type)}
+                            {eventTagLabel(item)}
                           </span>
                           {item.risk_payload?.reason ? (
                             <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
@@ -927,11 +1276,6 @@ export default function RealtimeMonitorPage() {
                           ) : null}
                         </div>
                         {renderEventDetail(item)}
-                        {Object.keys(item.signal_payload || {}).length ? (
-                          <div className="mt-3 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
-                            信号：{JSON.stringify(item.signal_payload)}
-                          </div>
-                        ) : null}
                         {Object.keys(item.error_payload || {}).length ? (
                           <div className="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
                             异常：{JSON.stringify(item.error_payload)}

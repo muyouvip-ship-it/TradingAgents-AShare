@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -9,6 +9,7 @@ from api.main import app
 from api.core.strategy_db import get_strategy_db_ctx
 from api.models.strategy_models import RealtimeApprovalDB, RealtimeMonitorDB
 from api.routes.strategy_platform import _default_dsl
+from api.services import realtime_monitor_service
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
 
 
@@ -441,3 +442,76 @@ def test_run_monitor_once_replays_positions_and_auto_replaces_stale_order(monkey
     assert "position_changed" in event_types
     summary = second_run.json()["monitor"]["state"]["execution_tracker_summary"]
     assert summary["pending_orders"] == 1
+
+
+def test_first_day_band_single_symbol_reentry_buy_uses_last_exit_quantity(monkeypatch):
+    client = _client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    strategy_id = _create_strategy(client, f"首日波段回补策略-{uuid4().hex[:6]}")
+    _mock_common(monkeypatch, account_key="paper_sim", role="paper")
+
+    created = client.post(
+        "/v1/realtime/monitors",
+        headers=headers,
+        json={
+            "name": "首日波段单票回补",
+            "strategy_id": strategy_id,
+            "account_key": "paper_sim",
+            "execution_mode": "auto",
+            "monitor_pool": {"mode": "manual_only", "manual_symbols": ["300520.SZ"]},
+            "config": {"signal_mode": "first_day_band", "signal_timeframe": "5m", "lot_size": 100},
+        },
+    )
+    assert created.status_code == 200
+    monitor_id = created.json()["id"]
+
+    with get_strategy_db_ctx() as db:
+        monitor = db.query(RealtimeMonitorDB).filter(RealtimeMonitorDB.id == monitor_id).first()
+        realtime_monitor_service._sync_reentry_anchor_with_position_change(
+            monitor,
+            "300520.SZ",
+            {"symbol": "300520.SZ", "current_position": 1000},
+            None,
+        )
+        intent = realtime_monitor_service._build_order_intent(
+            monitor,
+            {
+                "account": {
+                    "total_asset": 1_000_000.0,
+                    "available_cash": 900_000.0,
+                    "cash": 900_000.0,
+                },
+                "positions": [],
+            },
+            {"symbol": "300520.SZ", "side": "buy", "price": 34.57, "target_position_pct": 0.2},
+        )
+
+    assert intent["quantity"] == 1000
+    assert intent["reentry_anchor_quantity"] == 1000
+
+
+def test_ensure_utc_interprets_naive_datetimes_as_local_time():
+    naive_value = datetime(2026, 4, 27, 12, 57, 37)
+    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+
+    converted = realtime_monitor_service._ensure_utc(naive_value)
+    expected = naive_value.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+    assert converted == expected
+
+
+def test_monitor_due_handles_naive_local_heartbeat():
+    local_now = datetime.now().astimezone().replace(tzinfo=None)
+    monitor = RealtimeMonitorDB(
+        id=uuid4().hex,
+        user_id="tester",
+        name="心跳时区测试",
+        account_key="paper_sim",
+        strategy_id=uuid4().hex,
+        status="running",
+        config_json={"poll_interval_seconds": 20},
+        last_heartbeat_at=local_now - timedelta(seconds=45),
+    )
+
+    assert realtime_monitor_service._monitor_due(monitor) is True
