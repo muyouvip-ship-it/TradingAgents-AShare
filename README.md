@@ -5,8 +5,14 @@
 ### Backend
 
 ```bash
-python -m pip install -r requirements.txt
-uvicorn api.app:app --reload --port 8500
+uv sync --frozen --no-dev
+uv run uvicorn api.app:app --reload --port 8500
+```
+
+### Scheduler
+
+```bash
+uv run tradingagents-scheduler
 ```
 
 ### Frontend
@@ -16,6 +22,14 @@ cd frontend
 npm install
 npm run dev
 ```
+
+### One-Command Startup
+
+```bash
+./scripts/start_services.sh
+```
+
+定时分析依赖独立调度器；如果只启动后端和前端，不启动 `tradingagents-scheduler`，定时任务不会按时间自动执行。
 
 ## Testing
 

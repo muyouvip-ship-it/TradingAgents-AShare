@@ -7,7 +7,7 @@ FRONTEND_PORT="${FRONTEND_PORT:-5174}"
 
 cd "$ROOT"
 
-for pidfile in .runtime/backend.pid .runtime/frontend.pid; do
+for pidfile in .runtime/backend.pid .runtime/frontend.pid .runtime/scheduler.pid; do
   if [[ -f "$pidfile" ]]; then
     pid="$(cat "$pidfile")"
     if kill -0 "$pid" >/dev/null 2>&1; then
@@ -24,4 +24,6 @@ for port in "$BACKEND_PORT" "$FRONTEND_PORT"; do
   fi
 done
 
-echo "[done] stopped backend/frontend if they were running"
+pgrep -f "tradingagents-scheduler|python -m scheduler.main" | xargs kill 2>/dev/null || true
+
+echo "[done] stopped backend/frontend/scheduler if they were running"

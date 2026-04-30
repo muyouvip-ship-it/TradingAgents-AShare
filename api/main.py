@@ -202,6 +202,10 @@ def _build_manual_imported_user_context(db, user_id: str, symbol: str) -> Dict[s
     return portfolio_import_service.build_scheduled_user_context(db, user_id, symbol)
 
 
+def _build_imported_user_context(db, user_id: str, symbol: str) -> Dict[str, Any]:
+    return _build_manual_imported_user_context(db, user_id, symbol)
+
+
 def _attach_stock_names(items: List[dict], code_to_name: Dict[str, str]) -> List[dict]:
     for item in items:
         symbol = str(item.get("symbol") or "").upper()
@@ -254,8 +258,26 @@ def _build_scheduled_analyze_request(
 
 
 async def _run_job(job_id: str, request: AnalyzeRequest, *args, **kwargs) -> None:
-    del request, args, kwargs
-    _set_job(job_id, status="completed")
+    from api.routes.chat import _resolve_selected_analysts, _run_background_analysis_job
+
+    user_id = kwargs.get("user_id")
+    if user_id is None and len(args) >= 3:
+        user_id = args[2]
+    if not user_id:
+        raise ValueError("scheduled analysis requires user_id")
+
+    selected_analysts = _resolve_selected_analysts(
+        getattr(request, "selected_analysts", None),
+        user_id,
+    )
+    await _run_background_analysis_job(
+        job_id=job_id,
+        symbol=request.symbol,
+        trade_date=request.trade_date or cn_today_str(),
+        query=request.query or f"定时分析 {request.symbol}",
+        user_id=user_id,
+        selected_analysts=selected_analysts,
+    )
 
 
 async def _run_scheduled_analysis_once(

@@ -6,6 +6,7 @@ unnecessary circular dependencies during tests and startup.
 
 __all__ = [
     "backtest_data_auto_update_service",
+    "news_eye_service",
     "portfolio_import_service",
     "qmt_market_sync_service",
     "qmt_virtual_account_service",

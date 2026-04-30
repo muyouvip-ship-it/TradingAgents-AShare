@@ -23,6 +23,14 @@ export default function NewsEye() {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<string | null>(null)
+  const [backgroundMeta, setBackgroundMeta] = useState<{
+    interval_seconds?: number
+    status?: string
+    active_sources?: string[]
+    tracked_symbols?: string[]
+    last_success_at?: string | null
+    last_error?: string | null
+  } | null>(null)
   const [filters, setFilters] = useState({
     source: '',
     sentiment: 'all',
@@ -41,6 +49,7 @@ export default function NewsEye() {
       })
       setItems(response.items || [])
       setUpdatedAt(response.updated_at)
+      setBackgroundMeta(response.background || null)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载资讯失败')
@@ -68,14 +77,17 @@ export default function NewsEye() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void handleRefresh()
-    }, 60000)
+      void loadItems()
+    }, 20000)
     return () => window.clearInterval(timer)
-  }, [handleRefresh])
+  }, [loadItems])
 
   const sourceOptions = useMemo(() => {
-    return Array.from(new Set(items.map(item => item.source).filter(Boolean)))
-  }, [items])
+    return Array.from(new Set([
+      ...items.map(item => item.source).filter(Boolean),
+      ...(backgroundMeta?.active_sources || []).map(source => source.split(':')[0]).filter(Boolean),
+    ]))
+  }, [backgroundMeta?.active_sources, items])
 
   return (
     <div className="space-y-6">
@@ -83,11 +95,13 @@ export default function NewsEye() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">资讯之眼</h1>
           <p className="mt-1 text-slate-500 dark:text-slate-400">
-            倒序查看市场快讯、来源与利好利空映射，默认每 60 秒自动刷新。
+            后台常驻采集多源市场快讯，这里展示的是服务端缓存与情绪映射结果。
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
           <span>最近更新：{formatDateTime(updatedAt)}</span>
+          {backgroundMeta?.interval_seconds ? <span>后台轮询：{backgroundMeta.interval_seconds}s</span> : null}
+          {backgroundMeta?.active_sources?.length ? <span>活跃源：{backgroundMeta.active_sources.length}</span> : null}
           <button
             type="button"
             onClick={() => void handleRefresh()}
@@ -101,6 +115,28 @@ export default function NewsEye() {
       </div>
 
       <div className="card space-y-4">
+        {backgroundMeta && (
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+              状态：{backgroundMeta.status || 'unknown'}
+            </span>
+            {backgroundMeta.last_success_at ? (
+              <span className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300">
+                最近成功：{formatDateTime(backgroundMeta.last_success_at)}
+              </span>
+            ) : null}
+            {(backgroundMeta.active_sources || []).slice(0, 8).map(source => (
+              <span key={source} className="rounded-full bg-blue-50 px-3 py-1 text-blue-700 dark:bg-blue-950/30 dark:text-blue-300">
+                {source}
+              </span>
+            ))}
+            {(backgroundMeta.tracked_symbols || []).slice(0, 6).map(symbol => (
+              <span key={symbol} className="rounded-full bg-amber-50 px-3 py-1 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
+                关注 {symbol}
+              </span>
+            ))}
+          </div>
+        )}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <div>
             <div className="mb-2 text-sm font-medium text-slate-600 dark:text-slate-300">来源</div>
@@ -158,6 +194,9 @@ export default function NewsEye() {
             <AlertCircle className="h-4 w-4" />
             {error}
           </div>
+          {backgroundMeta?.last_error ? (
+            <div className="mt-2 text-xs opacity-80">后台最近异常：{backgroundMeta.last_error}</div>
+          ) : null}
         </div>
       )}
 

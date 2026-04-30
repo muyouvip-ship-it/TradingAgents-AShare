@@ -460,6 +460,17 @@ export interface NewsEyeListResponse {
     updated_at: string
     source?: string
     fallback?: boolean
+    background?: {
+        enabled?: boolean
+        interval_seconds?: number
+        status?: string
+        last_run_at?: string | null
+        last_success_at?: string | null
+        last_error?: string | null
+        active_sources?: string[]
+        tracked_symbols?: string[]
+        saved_count?: number
+    }
 }
 
 export interface NewsEyeRefreshResponse {

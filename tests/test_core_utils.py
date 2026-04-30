@@ -11,3 +11,21 @@ def test_normalize_symbol_supports_beijing_exchange_suffix():
 
 def test_normalize_symbol_infers_beijing_exchange_for_8_prefix():
     assert normalize_symbol("830000") == "830000.BJ"
+
+
+from api.core.stock_utils import resolve_watchlist_identifier, search_cn_stock_by_name
+
+
+def test_resolve_watchlist_identifier_recovers_wrong_suffix_when_code_is_unique():
+    symbol, name, error = resolve_watchlist_identifier(
+        "000001.SH",
+        {"平安银行": "000001.SZ"},
+        {"000001.SZ": "平安银行"},
+    )
+    assert error is None
+    assert symbol == "000001.SZ"
+    assert name == "平安银行"
+
+
+def test_search_cn_stock_by_name_recovers_wrong_suffix_when_code_is_unique():
+    assert search_cn_stock_by_name("000001.SH") == "000001.SZ"
