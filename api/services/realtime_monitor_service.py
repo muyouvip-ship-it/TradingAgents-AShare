@@ -20,9 +20,10 @@ from api.models.strategy_models import (
     RealtimeEventDB,
     RealtimeMonitorDB,
 )
+from api.services.qmt_market_data_service import fetch_intraday_bars
 from api.services import qmt_virtual_account_service, watchlist_service
 from api.services.minute_data_service import evaluate_first_day_band_signals, evaluate_intraday_confirmation
-from api.services.qmt_realtime_minute_capture_service import _fetch_minute_bars, _upsert_minute_records, capture_today_minute_bars
+from api.services.qmt_realtime_minute_capture_service import capture_today_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
 from api.services.strategy_platform_repository import get_platform_strategy
 
@@ -223,6 +224,7 @@ def run_monitor_once(strategy_db: Session, main_db: Session, user_id: str, monit
 
 def list_events(db: Session, user_id: str, monitor_id: str, *, limit: int = 200, after_id: str | None = None) -> list[dict[str, Any]]:
     _require_monitor(db, user_id, monitor_id)
+    max_limit = max(min(limit, 1000), 1)
     query = db.query(RealtimeEventDB).filter(
         RealtimeEventDB.monitor_id == monitor_id,
         RealtimeEventDB.user_id == user_id,
@@ -230,8 +232,27 @@ def list_events(db: Session, user_id: str, monitor_id: str, *, limit: int = 200,
     if after_id:
         cursor = db.query(RealtimeEventDB).filter(RealtimeEventDB.id == after_id).first()
         if cursor and cursor.created_at:
-            query = query.filter(RealtimeEventDB.created_at > cursor.created_at)
-    rows = query.order_by(RealtimeEventDB.created_at.desc()).limit(max(min(limit, 1000), 1)).all()
+            # Use >= and trim in Python so we don't drop sibling events created in the same
+            # timestamp bucket as the cursor event.
+            rows = (
+                query.filter(RealtimeEventDB.created_at >= cursor.created_at)
+                .order_by(RealtimeEventDB.created_at.asc())
+                .all()
+            )
+            cursor_seen = False
+            fresh_rows: list[RealtimeEventDB] = []
+            for row in rows:
+                if not cursor_seen:
+                    if row.id == after_id:
+                        cursor_seen = True
+                    continue
+                fresh_rows.append(row)
+                if len(fresh_rows) >= max_limit:
+                    break
+            if not cursor_seen:
+                fresh_rows = [row for row in rows if row.created_at > cursor.created_at][:max_limit]
+            return [row.to_dict() for row in fresh_rows]
+    rows = query.order_by(RealtimeEventDB.created_at.desc()).limit(max_limit).all()
     return [row.to_dict() for row in reversed(rows)]
 
 
@@ -454,6 +475,11 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                 "trade_date": minute_capture.get("trade_date"),
                 "source": minute_capture.get("source"),
                 "message": minute_capture.get("message"),
+                "captured_symbols": minute_capture.get("captured_symbols") or [],
+                "missing_symbols": minute_capture.get("missing_symbols") or [],
+                "symbol_rows": minute_capture.get("symbol_rows") or {},
+                "symbol_errors": minute_capture.get("symbol_errors") or {},
+                "partial": bool(minute_capture.get("partial")),
             },
             correlation_id=cycle_id,
         )
@@ -633,14 +659,21 @@ def _supplement_first_day_band_result(
     trade_date: str,
     timeframe: str,
 ):
-    config = qmt_virtual_account_service._resolve_runtime_config(account_key)
-    live_records = _fetch_minute_bars(config, symbols, trade_date)
+    live_records: list[dict[str, Any]] = []
+    for symbol in symbols:
+        payload = fetch_intraday_bars(
+            symbol,
+            trade_date=trade_date,
+            period="1m",
+            include_latest_quote=False,
+            account_key=account_key,
+            persist=True,
+        )
+        items = payload.get("items") or []
+        if isinstance(items, list):
+            live_records.extend([dict(item) for item in items if isinstance(item, dict)])
     if not live_records:
         return None
-    try:
-        _upsert_minute_records(live_records)
-    except Exception as exc:
-        logger.warning("[realtime-monitor] minute supplement upsert failed trade_date=%s symbols=%s error=%s", trade_date, len(symbols), exc)
     supplement_frame = pd.DataFrame(live_records)
     if supplement_frame.empty:
         return None
@@ -1434,6 +1467,23 @@ def _clear_reentry_anchor(monitor: RealtimeMonitorDB, symbol: str, *, reason: st
 
 def _monitor_payload(monitor: RealtimeMonitorDB) -> dict[str, Any]:
     payload = monitor.to_dict()
+    pool = dict(payload.get("monitor_pool") or {})
+    manual_symbols = [
+        _normalize_symbol(item)
+        for item in (pool.get("manual_symbols") or pool.get("symbols") or [])
+        if _normalize_symbol(item)
+    ]
+    resolved_symbols = [
+        _normalize_symbol(item)
+        for item in (pool.get("resolved_symbols") or [])
+        if _normalize_symbol(item)
+    ]
+    payload["manual_symbols"] = manual_symbols
+    payload["resolved_symbols"] = resolved_symbols
+    payload["manual_symbol_count"] = len(manual_symbols)
+    payload["resolved_symbol_count"] = len(resolved_symbols)
+    payload["display_symbols"] = resolved_symbols or manual_symbols
+    payload["display_symbol_count"] = len(payload["display_symbols"])
     payload["circuit_breaker"] = {
         "active": monitor.status == "fused",
         "reason": monitor.fused_reason,

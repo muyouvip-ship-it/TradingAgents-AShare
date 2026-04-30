@@ -6,7 +6,7 @@
 
 ```bash
 python -m pip install -r requirements.txt
-uvicorn api.app:app --reload
+uvicorn api.app:app --reload --port 8500
 ```
 
 ### Frontend

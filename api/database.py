@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Generator
 
-from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, text
+from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 from api.core.env import load_project_env
@@ -82,7 +82,138 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_market_data_schema()
     _ensure_backtest_data_schema()
+
+
+def _ensure_market_data_schema() -> None:
+    """Ensure production market data tables and indexes exist."""
+    try:
+        with engine.begin() as conn:
+            inspector = inspect(engine)
+            if IS_SQLITE:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS index_daily_kline (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_date DATE NOT NULL,
+                        open DOUBLE,
+                        high DOUBLE,
+                        low DOUBLE,
+                        close DOUBLE,
+                        volume DOUBLE,
+                        amount DOUBLE,
+                        source VARCHAR(32) DEFAULT 'qmt',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS index_minute_kline (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_time TIMESTAMP NOT NULL,
+                        open DOUBLE,
+                        high DOUBLE,
+                        low DOUBLE,
+                        close DOUBLE,
+                        volume BIGINT,
+                        amount DOUBLE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
+                if inspector.has_table("stock_minute_kline"):
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
+            else:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS index_daily_kline (
+                        id BIGSERIAL PRIMARY KEY,
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_date DATE NOT NULL,
+                        open DOUBLE PRECISION,
+                        high DOUBLE PRECISION,
+                        low DOUBLE PRECISION,
+                        close DOUBLE PRECISION,
+                        volume DOUBLE PRECISION,
+                        amount DOUBLE PRECISION,
+                        source VARCHAR(32) DEFAULT 'qmt',
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS index_minute_kline (
+                        id BIGSERIAL PRIMARY KEY,
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_time TIMESTAMP NOT NULL,
+                        open DOUBLE PRECISION,
+                        high DOUBLE PRECISION,
+                        low DOUBLE PRECISION,
+                        close DOUBLE PRECISION,
+                        volume BIGINT,
+                        amount DOUBLE PRECISION,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
+                if inspector.has_table("stock_minute_kline"):
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
+            current_inspector = inspect(conn)
+            if current_inspector.has_table("index_daily_kline"):
+                index_daily_columns = {column["name"] for column in current_inspector.get_columns("index_daily_kline")}
+                if "source" not in index_daily_columns:
+                    conn.execute(text(
+                        "ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"
+                        if IS_SQLITE
+                        else "ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"
+                    ))
+                if "created_at" not in index_daily_columns:
+                    conn.execute(text(
+                        "ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
+                    ))
+                if "updated_at" not in index_daily_columns:
+                    conn.execute(text(
+                        "ALTER TABLE index_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE index_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
+                    ))
+            if current_inspector.has_table("index_minute_kline"):
+                index_minute_columns = {column["name"] for column in current_inspector.get_columns("index_minute_kline")}
+                if "created_at" not in index_minute_columns:
+                    conn.execute(text(
+                        "ALTER TABLE index_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE index_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
+                    ))
+                if "updated_at" not in index_minute_columns:
+                    conn.execute(text(
+                        "ALTER TABLE index_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE index_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
+                    ))
+            if current_inspector.has_table("stock_minute_kline"):
+                stock_minute_columns = {column["name"] for column in current_inspector.get_columns("stock_minute_kline")}
+                if "created_at" not in stock_minute_columns:
+                    conn.execute(text(
+                        "ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
+                    ))
+                if "updated_at" not in stock_minute_columns:
+                    conn.execute(text(
+                        "ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                        if IS_SQLITE
+                        else "ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
+                    ))
+    except Exception as e:
+        logger.error("Failed to ensure market data schema: %s", e)
 
 
 def _ensure_report_schema() -> None:

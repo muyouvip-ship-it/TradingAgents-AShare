@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,15 +11,17 @@ from api.core.stock_map import get_reverse_stock_map
 from api.core.stock_utils import normalize_symbol, search_cn_stock_by_name
 from api.database import get_db
 from api.deps import require_api_user
-from tradingagents.dataflows.interface import route_to_vendor
+from api.services.qmt_market_data_service import (
+    build_market_integrity_report,
+    fetch_daily_bars,
+    fetch_intraday_bars,
+    fetch_realtime_quotes,
+    get_index_presets,
+)
 
 router = APIRouter(prefix="/v1/market", tags=["Market"])
 
-INDEX_PRESETS = [
-    {"symbol": "000001.SH", "code": "000001", "name": "上证指数"},
-    {"symbol": "399001.SZ", "code": "399001", "name": "深证成指"},
-    {"symbol": "399006.SZ", "code": "399006", "name": "创业板指"},
-]
+INDEX_PRESETS = get_index_presets()
 
 
 @router.get("/stock-search")
@@ -73,6 +74,12 @@ def get_kline(symbol: str, start_date: str, end_date: str, db: Session = Depends
     index_codes = {item["code"] for item in INDEX_PRESETS}
     is_index = normalized in {item["symbol"] for item in INDEX_PRESETS} or code in index_codes
     rows = _load_kline_rows(db, code, start_date, end_date, prefer_index=is_index)
+    if is_index and not rows:
+        try:
+            fetch_daily_bars(normalized, start_date=start_date, end_date=end_date)
+            rows = _load_kline_rows(db, code, start_date, end_date, prefer_index=True)
+        except Exception:
+            rows = rows or []
 
     candles = []
     previous_close = None
@@ -112,6 +119,38 @@ def get_kline(symbol: str, start_date: str, end_date: str, db: Session = Depends
     }
 
 
+@router.get("/intraday")
+def get_intraday(
+    symbol: str,
+    trade_date: str,
+    period: str = Query("1m", pattern="^1m$"),
+    include_latest_quote: bool = Query(True),
+):
+    normalized = normalize_symbol(symbol)
+    payload = fetch_intraday_bars(
+        normalized,
+        trade_date=trade_date,
+        period=period,
+        include_latest_quote=include_latest_quote,
+        account_key=None,
+        persist=True,
+    )
+    return payload
+
+
+@router.get("/quote")
+def get_market_quote(symbol: str):
+    normalized = normalize_symbol(symbol)
+    quote = fetch_realtime_quotes([normalized]).get(normalized)
+    if not quote:
+        raise HTTPException(status_code=404, detail=f"QMT quote unavailable for {normalized}")
+    return {
+        "symbol": normalized,
+        "quote": quote,
+        "source": "qmt_realtime",
+    }
+
+
 @router.get("/overview")
 def get_market_overview(
     limit: int = Query(20, ge=5, le=100),
@@ -125,16 +164,12 @@ def get_market_overview(
     for item in INDEX_PRESETS:
         latest = _load_latest_index_item(db, item["code"])
         quote = quote_map.get(item["symbol"]) or quote_map.get(item["code"]) or {}
-        if _to_float(quote.get("price")) is not None and _to_float(quote.get("price")) < 1000:
-            quote = {}
-        if not quote and not latest.get("price"):
-            latest = _load_akshare_index_quote(item["code"], item["symbol"]) or latest
         merged = _merge_market_item(
             symbol=item["symbol"],
             name=item["name"],
             latest=latest,
             quote=quote,
-            source="qmt_realtime" if quote else (latest.get("source") or "postgresql:index_daily_data"),
+            source="qmt_realtime" if quote else (latest.get("source") or "postgresql:index_daily_kline"),
         )
         indices.append(merged)
 
@@ -153,6 +188,16 @@ def get_market_overview(
         "source": "qmt_realtime+postgresql_fallback",
         "fallback": not bool(quote_map),
     }
+
+
+@router.get("/integrity-report")
+def get_market_integrity_report(
+    target_date: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_api_user),
+):
+    del current_user
+    return build_market_integrity_report(db, target_date=target_date)
 
 
 @router.get("/kline/chanlun")
@@ -204,7 +249,7 @@ def get_hot_stocks(source: str = "em", limit: int = 30) -> Dict:
 
 
 def _load_kline_rows(db: Session, code: str, start_date: str, end_date: str, *, prefer_index: bool = False):
-    table_candidates = ["index_daily_data", "index_daily_kline"] if prefer_index else ["stock_daily_kline", "index_daily_data", "index_daily_kline"]
+    table_candidates = ["index_daily_kline", "index_daily_data"] if prefer_index else ["stock_daily_kline", "index_daily_kline", "index_daily_data"]
     symbol_candidates = [code]
     if prefer_index:
         symbol_candidates = [code, f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"]
@@ -255,13 +300,7 @@ def _load_quote_map(symbols: list[str]) -> dict[str, dict[str, Any]]:
         return {}
     normalized = [normalize_symbol(symbol) for symbol in symbols]
     try:
-        payload = route_to_vendor("get_realtime_quotes", normalized)
-        if isinstance(payload, str):
-            parsed = json.loads(payload)
-        elif isinstance(payload, dict):
-            parsed = payload
-        else:
-            parsed = {}
+        parsed = fetch_realtime_quotes(normalized)
     except Exception:
         return {}
     if not isinstance(parsed, dict):
@@ -322,7 +361,7 @@ def _load_latest_index_item(db: Session, code: str) -> dict[str, Any]:
     symbol_candidates = [code, f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"]
     placeholders = ", ".join(f":symbol_{index}" for index, _ in enumerate(symbol_candidates))
     params = {f"symbol_{index}": value for index, value in enumerate(symbol_candidates)}
-    for table_name in ("index_daily_data", "index_daily_kline"):
+    for table_name in ("index_daily_kline", "index_daily_data"):
         if not _has_table(db, table_name):
             continue
         try:
@@ -356,35 +395,6 @@ def _load_latest_index_item(db: Session, code: str) -> dict[str, Any]:
         except Exception:
             continue
     return {}
-
-
-def _load_akshare_index_quote(code: str, symbol: str) -> dict[str, Any] | None:
-    try:
-        import akshare as ak
-
-        frame = ak.stock_zh_index_spot_sina()
-        if frame is None or frame.empty:
-            return None
-        candidates = {code, f"sh{code}", f"sz{code}", symbol, symbol.replace(".", "").lower()}
-        for _, row in frame.iterrows():
-            row_code = str(row.get("代码") or row.get("code") or "").strip()
-            if row_code not in candidates:
-                continue
-            price = _to_float(row.get("最新价") or row.get("price") or row.get("最新"))
-            change = _to_float(row.get("涨跌额") or row.get("change"))
-            change_pct = _to_float(row.get("涨跌幅") or row.get("change_pct"))
-            return {
-                "price": price,
-                "change": change,
-                "change_pct": change_pct,
-                "volume": _to_float(row.get("成交量") or row.get("volume")),
-                "amount": _to_float(row.get("成交额") or row.get("amount")),
-                "trade_date": datetime.now(timezone.utc).isoformat(),
-                "source": "akshare:index_spot_sina",
-            }
-    except Exception:
-        return None
-    return None
 
 
 def _merge_market_item(symbol: str, name: str, latest: dict[str, Any], quote: dict[str, Any], source: str) -> dict[str, Any]:
@@ -652,11 +662,7 @@ def _derive_chanlun_points(fractals: list[dict[str, Any]], zhongshu: list[dict[s
 
 
 def _append_live_candle(candles: list[dict], symbol: str, start_date: str, end_date: str) -> None:
-    try:
-        quote_payload = json.loads(route_to_vendor("get_realtime_quotes", [symbol]))
-    except Exception:
-        return
-    quote = quote_payload.get(symbol) or {}
+    quote = fetch_realtime_quotes([symbol]).get(symbol) or {}
     quote_time = str(quote.get("quote_time") or "")
     quote_date = quote_time[:10]
     if not quote_date or quote_date < start_date or quote_date > end_date:

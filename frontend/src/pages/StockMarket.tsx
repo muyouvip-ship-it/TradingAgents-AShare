@@ -5,6 +5,11 @@ import KlinePanel from '@/components/KlinePanel'
 import { api } from '@/services/api'
 import type { MarketOverviewResponse, MarketSectorItem, MarketTickerItem, StockSearchResult } from '@/types'
 
+function isFiniteNumberValue(value: unknown): value is number {
+  if (value === null || value === undefined || value === '') return false
+  return Number.isFinite(Number(value))
+}
+
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
   const date = new Date(value)
@@ -13,20 +18,20 @@ function formatDateTime(value?: string | null) {
 }
 
 function formatNumber(value?: number | null, digits = 2) {
+  if (!isFiniteNumberValue(value)) return '--'
   const number = Number(value)
-  if (!Number.isFinite(number)) return '--'
   return number.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
 function formatPercent(value?: number | null) {
+  if (!isFiniteNumberValue(value)) return '--'
   const number = Number(value)
-  if (!Number.isFinite(number)) return '--'
   return `${number >= 0 ? '+' : ''}${formatNumber(number)}%`
 }
 
 function formatMoneyFlow(value?: number | null) {
+  if (!isFiniteNumberValue(value)) return '--'
   const number = Number(value)
-  if (!Number.isFinite(number)) return '--'
   const abs = Math.abs(number)
   if (abs >= 1e8) return `${number >= 0 ? '+' : '-'}${formatNumber(abs / 1e8)}亿`
   if (abs >= 1e4) return `${number >= 0 ? '+' : '-'}${formatNumber(abs / 1e4)}万`
@@ -91,10 +96,16 @@ function MarketListCard({
           </div>
         )}
         {items.map((item, index) => {
-          const value = valueMode === 'flow'
-            ? Number((item as MarketSectorItem).net_inflow || 0)
-            : Number((item as MarketTickerItem | MarketSectorItem).change_pct || 0)
-          const isPositive = value >= 0
+          const rawValue = valueMode === 'flow'
+            ? (item as MarketSectorItem).net_inflow
+            : (item as MarketTickerItem | MarketSectorItem).change_pct
+          const hasValue = isFiniteNumberValue(rawValue)
+          const numberValue = hasValue ? Number(rawValue) : null
+          const valueToneClass = !hasValue
+            ? 'text-slate-400 dark:text-slate-500'
+            : numberValue !== null && numberValue >= 0
+              ? 'text-red-500'
+              : 'text-emerald-500'
           return (
             <button
               key={`${title}-${index}-${isSector ? (item as MarketSectorItem).sector_name : (item as MarketTickerItem).symbol}`}
@@ -118,7 +129,7 @@ function MarketListCard({
                     : `${(item as MarketTickerItem).symbol} ｜ ${formatNumber((item as MarketTickerItem).price)}`}
                 </div>
               </div>
-              <div className={`shrink-0 text-sm font-semibold ${isPositive ? 'text-red-500' : 'text-emerald-500'}`}>
+              <div className={`shrink-0 text-sm font-semibold ${valueToneClass}`}>
                 {valueMode === 'flow'
                   ? formatMoneyFlow((item as MarketSectorItem).net_inflow)
                   : formatPercent((item as MarketTickerItem | MarketSectorItem).change_pct)}
@@ -282,7 +293,18 @@ export default function StockMarket() {
         <>
           <div className="grid gap-4 xl:grid-cols-3">
             {(overview.indices || []).map((item) => {
-              const positive = Number(item.change_pct || 0) >= 0
+              const hasChange = isFiniteNumberValue(item.change_pct)
+              const positive = hasChange ? Number(item.change_pct) >= 0 : null
+              const badgeClass = !hasChange
+                ? 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                : positive
+                  ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                  : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+              const trendIconClass = !hasChange
+                ? 'text-slate-400 dark:text-slate-500'
+                : positive
+                  ? 'text-red-500'
+                  : 'text-emerald-500'
               return (
                 <button
                   key={item.symbol}
@@ -296,12 +318,19 @@ export default function StockMarket() {
                       <div className="mt-2 text-2xl font-bold text-slate-900 dark:text-slate-100">{formatNumber(item.price)}</div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">{item.symbol}</div>
                     </div>
-                    <div className={`rounded-full px-3 py-1 text-sm font-semibold ${positive ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300' : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'}`}>
+                    <div className={`rounded-full px-3 py-1 text-sm font-semibold ${badgeClass}`}>
                       {formatPercent(item.change_pct)}
                     </div>
                   </div>
                   <div className="mt-4 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>{positive ? <TrendingUp className="inline h-3.5 w-3.5 text-red-500" /> : <TrendingDown className="inline h-3.5 w-3.5 text-emerald-500" />} 日内波动</span>
+                    <span>
+                      {positive === null
+                        ? <TrendingUp className={`inline h-3.5 w-3.5 ${trendIconClass}`} />
+                        : positive
+                          ? <TrendingUp className={`inline h-3.5 w-3.5 ${trendIconClass}`} />
+                          : <TrendingDown className={`inline h-3.5 w-3.5 ${trendIconClass}`} />}
+                      {' '}日内波动
+                    </span>
                     <span>{formatDateTime(item.trade_time)}</span>
                   </div>
                 </button>

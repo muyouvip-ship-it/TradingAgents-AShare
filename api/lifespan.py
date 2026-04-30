@@ -9,7 +9,7 @@ from api.core.strategy_db import strategy_engine
 from api.database import init_db
 from api.job_store import get_job_store
 from api.models.strategy_models import Base
-from api.services import backtest_data_auto_update_service, qmt_minute_subscription_service, qmt_sync_scheduler_service, realtime_monitor_service
+from api.services import backtest_data_auto_update_service, qmt_market_sync_service, qmt_sync_scheduler_service, realtime_monitor_service
 
 
 def _log(msg: str):
@@ -47,8 +47,8 @@ async def lifespan(app):
     _log("Stock map pre-loaded on startup.")
     await qmt_sync_scheduler_service.start_background_worker()
     _log("QMT sync background worker started.")
-    await qmt_minute_subscription_service.start_background_worker()
-    _log("QMT minute subscription worker started.")
+    await qmt_market_sync_service.start_background_worker()
+    _log("QMT market sync worker started.")
     await backtest_data_auto_update_service.start_background_worker()
     _log("Backtest data auto update worker started.")
     await realtime_monitor_service.start_background_worker()
@@ -56,8 +56,8 @@ async def lifespan(app):
     yield
     await realtime_monitor_service.stop_background_worker()
     _log("Realtime monitor background worker stopped.")
-    await qmt_minute_subscription_service.stop_background_worker()
-    _log("QMT minute subscription worker stopped.")
+    await qmt_market_sync_service.stop_background_worker()
+    _log("QMT market sync worker stopped.")
     await backtest_data_auto_update_service.stop_background_worker()
     _log("Backtest data auto update worker stopped.")
     await qmt_sync_scheduler_service.stop_background_worker()

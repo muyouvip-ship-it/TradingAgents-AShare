@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +26,18 @@ DAILY_KLINE_NUMERIC_COLUMNS = [
 ]
 
 
+def normalize_daily_kline_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    text = re.sub(r"^(SH|SZ|BJ)", "", text)
+    text = re.sub(r"\.(SH|SZ|BJ)$", "", text)
+    match = re.search(r"(\d{6})", text)
+    if match:
+        return match.group(1)
+    return text
+
+
 def get_daily_kline_parquet_root() -> Path:
     return Path(os.getenv("DAILY_KLINE_PARQUET_ROOT") or DAILY_KLINE_PARQUET_ROOT)
 
@@ -47,13 +60,31 @@ def get_daily_kline_parquet_stats(
 
             row = duckdb.execute(
                 """
+                WITH normalized AS (
+                    SELECT
+                        regexp_replace(
+                            regexp_replace(upper(trim(symbol)), '^(SH|SZ|BJ)', ''),
+                            '\\.(SH|SZ|BJ)$',
+                            ''
+                        ) AS normalized_symbol,
+                        CAST(date AS DATE) AS trade_date
+                    FROM read_parquet(?, union_by_name=true)
+                    WHERE symbol IS NOT NULL
+                      AND date IS NOT NULL
+                ),
+                deduped AS (
+                    SELECT normalized_symbol AS symbol, trade_date AS date
+                    FROM normalized
+                    WHERE normalized_symbol <> ''
+                    GROUP BY 1, 2
+                )
                 SELECT
                     COUNT(*) AS total_records,
                     COUNT(DISTINCT symbol) AS symbol_count,
-                    COUNT(DISTINCT CAST(date AS DATE)) AS trading_days,
-                    MIN(CAST(date AS DATE)) AS date_range_start,
-                    MAX(CAST(date AS DATE)) AS date_range_end
-                FROM read_parquet(?, union_by_name=true)
+                    COUNT(DISTINCT date) AS trading_days,
+                    MIN(date) AS date_range_start,
+                    MAX(date) AS date_range_end
+                FROM deduped
                 """,
                 ([str(path) for path in files],),
             ).fetchone()
@@ -76,7 +107,9 @@ def get_daily_kline_parquet_stats(
             merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if merged.empty:
                 return None
+            merged["symbol"] = merged["symbol"].map(normalize_daily_kline_symbol)
             merged["date"] = pd.to_datetime(merged["date"]).dt.date
+            merged = merged[merged["symbol"].astype(str).str.len() > 0].drop_duplicates(["symbol", "date"], keep="last")
             return {
                 "total_records": int(len(merged)),
                 "symbol_count": int(merged["symbol"].nunique()),
@@ -108,29 +141,55 @@ def load_daily_kline_slice_from_parquet(
         import duckdb
 
         symbol_list = list(symbols)
+        normalized_symbols = [normalize_daily_kline_symbol(symbol) for symbol in symbol_list if normalize_daily_kline_symbol(symbol)]
         if symbol_list:
             query = """
-                SELECT symbol, CAST(date AS DATE) AS date, open, high, low, close, volume, amount,
+                WITH normalized AS (
+                    SELECT
+                        regexp_replace(
+                            regexp_replace(upper(trim(symbol)), '^(SH|SZ|BJ)', ''),
+                            '\\.(SH|SZ|BJ)$',
+                            ''
+                        ) AS normalized_symbol,
+                        CAST(date AS DATE) AS date,
+                        open, high, low, close, volume, amount,
+                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
+                    FROM read_parquet(?, union_by_name=true)
+                )
+                SELECT normalized_symbol AS symbol, date, open, high, low, close, volume, amount,
                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                FROM read_parquet(?, union_by_name=true)
-                WHERE CAST(date AS DATE) >= CAST(? AS DATE)
-                  AND CAST(date AS DATE) <= CAST(? AS DATE)
-                  AND symbol IN (SELECT UNNEST(?))
-                QUALIFY row_number() OVER (PARTITION BY symbol, date ORDER BY date DESC) = 1
+                FROM normalized
+                WHERE date >= CAST(? AS DATE)
+                  AND date <= CAST(? AS DATE)
+                  AND normalized_symbol IN (SELECT UNNEST(?))
+                QUALIFY row_number() OVER (PARTITION BY normalized_symbol, date ORDER BY date DESC) = 1
                 ORDER BY date, symbol
             """
             frame = duckdb.execute(
                 query,
-                ([str(path) for path in files], start_date, end_date, symbol_list),
+                ([str(path) for path in files], start_date, end_date, normalized_symbols),
             ).fetchdf()
         else:
             query = """
-                SELECT symbol, CAST(date AS DATE) AS date, open, high, low, close, volume, amount,
+                WITH normalized AS (
+                    SELECT
+                        regexp_replace(
+                            regexp_replace(upper(trim(symbol)), '^(SH|SZ|BJ)', ''),
+                            '\\.(SH|SZ|BJ)$',
+                            ''
+                        ) AS normalized_symbol,
+                        CAST(date AS DATE) AS date,
+                        open, high, low, close, volume, amount,
+                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
+                    FROM read_parquet(?, union_by_name=true)
+                )
+                SELECT normalized_symbol AS symbol, date, open, high, low, close, volume, amount,
                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                FROM read_parquet(?, union_by_name=true)
-                WHERE CAST(date AS DATE) >= CAST(? AS DATE)
-                  AND CAST(date AS DATE) <= CAST(? AS DATE)
-                QUALIFY row_number() OVER (PARTITION BY symbol, date ORDER BY date DESC) = 1
+                FROM normalized
+                WHERE date >= CAST(? AS DATE)
+                  AND date <= CAST(? AS DATE)
+                  AND normalized_symbol <> ''
+                QUALIFY row_number() OVER (PARTITION BY normalized_symbol, date ORDER BY date DESC) = 1
                 ORDER BY date, symbol
             """
             frame = duckdb.execute(
@@ -172,7 +231,8 @@ def write_daily_kline_parquet_cache(
 def _normalize_daily_kline_frame_for_parquet(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
     if "symbol" in normalized.columns:
-        normalized["symbol"] = normalized["symbol"].astype(str)
+        normalized["symbol"] = normalized["symbol"].map(normalize_daily_kline_symbol)
+        normalized = normalized[normalized["symbol"].astype(str).str.len() > 0]
     if "date" in normalized.columns:
         normalized["date"] = pd.to_datetime(normalized["date"]).dt.date
     for column in DAILY_KLINE_NUMERIC_COLUMNS:

@@ -1180,6 +1180,10 @@ export default function RealtimeMonitorPage() {
                   <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
                     账户：{positionsPayload?.account?.account_name || selectedMonitor.account_key} ｜ 显示当前监控账户的股票持仓列表
                   </div>
+                  <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    监控池：实际解析 {selectedMonitor.display_symbol_count ?? selectedMonitor.resolved_symbol_count ?? 0} 只
+                    {typeof selectedMonitor.manual_symbol_count === 'number' ? ` ｜ 手动配置 ${selectedMonitor.manual_symbol_count} 只` : ''}
+                  </div>
                   <div className="mt-4 space-y-3">
                     {strategyPositions.length ? strategyPositions.map(position => (
                       <div key={`${position.symbol}-${position.account_id}`} className="rounded-2xl border border-slate-200 p-4 dark:border-slate-700">

@@ -12,12 +12,13 @@ import {
     MouseEventParams,
     SeriesMarker,
     Time,
+    UTCTimestamp,
     createSeriesMarkers,
     createChart,
 } from 'lightweight-charts'
 import { Activity, CandlestickChart, Layers3 } from 'lucide-react'
 import { api } from '@/services/api'
-import type { ChanlunOverlayResponse, KlineCandle } from '@/types'
+import type { ChanlunOverlayResponse, KlineCandle, MarketQuote } from '@/types'
 import { useAnalysisStore } from '@/stores/analysisStore'
 
 interface KlinePanelProps {
@@ -36,6 +37,8 @@ interface KlinePanelProps {
         color?: string
     }>
 }
+
+type ViewMode = 'daily' | 'intraday'
 
 function normalizeDateKey(value?: string | null): string {
     return value ? value.slice(0, 10) : ''
@@ -65,6 +68,54 @@ function toBusinessDay(value: string): BusinessDay | null {
     return { year, month, day }
 }
 
+function toChartTime(value: string): Time | null {
+    if (!value) return null
+    if (value.includes(' ')) {
+        const ts = Date.parse(value.replace(' ', 'T'))
+        if (!Number.isFinite(ts)) return null
+        return Math.floor(ts / 1000) as UTCTimestamp
+    }
+    return toBusinessDay(value.slice(0, 10))
+}
+
+function chartTimeToKey(value: Time): string {
+    if (typeof value === 'number') {
+        const dt = new Date(value * 1000)
+        const y = dt.getFullYear()
+        const m = String(dt.getMonth() + 1).padStart(2, '0')
+        const d = String(dt.getDate()).padStart(2, '0')
+        const h = String(dt.getHours()).padStart(2, '0')
+        const min = String(dt.getMinutes()).padStart(2, '0')
+        const s = String(dt.getSeconds()).padStart(2, '0')
+        return `${y}-${m}-${d} ${h}:${min}:${s}`
+    }
+    if (typeof value === 'string') return value
+    return `${value.year}-${String(value.month).padStart(2, '0')}-${String(value.day).padStart(2, '0')}`
+}
+
+function mapIntradayItemToCandle(item: {
+    trade_time: string
+    open?: number | null
+    high?: number | null
+    low?: number | null
+    close?: number | null
+    volume?: number | null
+    amount?: number | null
+}): KlineCandle {
+    return {
+        date: item.trade_time,
+        open: Number(item.open || 0),
+        high: Number(item.high || 0),
+        low: Number(item.low || 0),
+        close: Number(item.close || 0),
+        volume: item.volume ?? null,
+        amount: item.amount ?? null,
+        change: null,
+        change_percent: null,
+        turnover_rate: null,
+    }
+}
+
 const SYMBOL_NAME_MAP: Record<string, string> = {
     '000001.SH': '上证指数',
     '399001.SZ': '深证成指',
@@ -72,6 +123,8 @@ const SYMBOL_NAME_MAP: Record<string, string> = {
     '000300.SH': '沪深300',
     '000905.SH': '中证500',
     '000852.SH': '中证1000',
+    '000688.SH': '科创50',
+    '899050.BJ': '北证50',
     '300750.SZ': '宁德时代',
     '600406.SH': '国电南瑞',
     '510300.SH': '沪深300ETF',
@@ -101,6 +154,9 @@ const INDEX_PRESETS = [
     { symbol: '000001.SH', label: '上证指数' },
     { symbol: '399001.SZ', label: '深证成指' },
     { symbol: '399006.SZ', label: '创业板指' },
+    { symbol: '000300.SH', label: '沪深300' },
+    { symbol: '000905.SH', label: '中证500' },
+    { symbol: '000852.SH', label: '中证1000' },
     { symbol: '000688.SH', label: '科创50' },
     { symbol: '899050.BJ', label: '北证50' },
 ] as const
@@ -114,8 +170,10 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [isDark, setIsDark] = useState(document.documentElement.classList.contains('dark'))
+    const [viewMode, setViewMode] = useState<ViewMode>('daily')
     const [candles, setCandles] = useState<KlineCandle[]>([])
     const [activeCandle, setActiveCandle] = useState<KlineCandle | null>(null)
+    const [quote, setQuote] = useState<MarketQuote | null>(null)
     const [overlayLoading, setOverlayLoading] = useState(false)
     const [overlayMessage, setOverlayMessage] = useState<string | null>(null)
     const [overlayData, setOverlayData] = useState<ChanlunOverlayResponse | null>(null)
@@ -197,11 +255,17 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     timeVisible: true,
                     rightOffset: 6,
                     tickMarkFormatter: (time: BusinessDay | string) => {
+                        if (typeof time === 'number') {
+                            const dt = new Date(time * 1000)
+                            const h = String(dt.getHours()).padStart(2, '0')
+                            const m = String(dt.getMinutes()).padStart(2, '0')
+                            return viewMode === 'intraday' ? `${h}:${m}` : `${dt.getMonth() + 1}/${dt.getDate()}`
+                        }
                         if (typeof time !== 'object') return String(time)
                         const y = String(time.year)
                         const m = String(time.month).padStart(2, '0')
                         const d = String(time.day).padStart(2, '0')
-                        return `${y}/${m}/${d}`
+                        return viewMode === 'intraday' ? `${m}/${d}` : `${y}/${m}/${d}`
                     },
                 },
                 crosshair: {
@@ -228,7 +292,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         markersRef.current = seriesMarkers
         if (candlesRef.current.length) {
             const existingData: CandlestickData[] = candlesRef.current.flatMap((c) => {
-                const time = toBusinessDay((c.date || '').slice(0, 10))
+                const time = toChartTime(c.date || '')
                 const open = Number(c.open)
                 const high = Number(c.high)
                 const low = Number(c.low)
@@ -248,10 +312,8 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             }
             const pointData = param.seriesData.get(seriesRef.current) as CandlestickData | undefined
             if (!pointData) return
-            const time = typeof pointData.time === 'object'
-                ? `${pointData.time.year}-${String(pointData.time.month).padStart(2, '0')}-${String(pointData.time.day).padStart(2, '0')}`
-                : String(pointData.time)
-            const matched = candlesRef.current.find(c => c.date === time)
+            const timeKey = chartTimeToKey(pointData.time)
+            const matched = candlesRef.current.find(c => c.date === timeKey || normalizeDateKey(c.date) === normalizeDateKey(timeKey))
             if (matched) setActiveCandle(matched)
         }
         chart.subscribeCrosshairMove(handleCrosshairMove)
@@ -280,7 +342,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             markersRef.current = null
             overlaySeriesRef.current = []
         }
-    }, [isDark])
+    }, [isDark, viewMode])
 
     useEffect(() => {
         let cancelled = false
@@ -290,9 +352,14 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             setLoading(true)
             setError(null)
             try {
-                const resp = await api.getKline(symbol, range.start, range.end)
-                const data: CandlestickData[] = resp.candles.flatMap((c) => {
-                    const time = toBusinessDay((c.date || '').slice(0, 10))
+                const tradeDate = normalizeDateKey(focusDate) || range.end
+                const dailyResponse = viewMode === 'daily' ? await api.getKline(symbol, range.start, range.end) : null
+                const intradayResponse = viewMode === 'intraday' ? await api.getIntraday(symbol, tradeDate, true) : null
+                const sourceRows = viewMode === 'intraday'
+                    ? intradayResponse?.items.map(mapIntradayItemToCandle) || []
+                    : dailyResponse?.candles || []
+                const data: CandlestickData[] = sourceRows.flatMap((c) => {
+                    const time = toChartTime(c.date || '')
                     const open = Number(c.open)
                     const high = Number(c.high)
                     const low = Number(c.low)
@@ -303,17 +370,18 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 })
 
                 if (cancelled) return
-                setCandles(resp.candles)
-                candlesRef.current = resp.candles
-                setActiveCandle(resp.candles.length ? resp.candles[resp.candles.length - 1] : null)
+                setCandles(sourceRows)
+                candlesRef.current = sourceRows
+                setActiveCandle(sourceRows.length ? sourceRows[sourceRows.length - 1] : null)
+                if (intradayResponse?.latest_quote) setQuote(intradayResponse.latest_quote)
                 seriesRef.current?.setData(data)
                 chartRef.current?.timeScale().fitContent()
                 if (!data.length) {
-                    setError('暂无可用K线数据')
+                    setError(viewMode === 'daily' ? '暂无可用K线数据' : '暂无可用分时数据')
                 }
             } catch (e) {
                 if (cancelled) return
-                setError(e instanceof Error ? e.message : '加载K线失败')
+                setError(e instanceof Error ? e.message : (viewMode === 'daily' ? '加载K线失败' : '加载分时失败'))
                 setCandles([])
                 candlesRef.current = []
                 setActiveCandle(null)
@@ -327,7 +395,27 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         return () => {
             cancelled = true
         }
-    }, [range.end, range.start, symbol])
+    }, [focusDate, range.end, range.start, symbol, viewMode])
+
+    useEffect(() => {
+        let cancelled = false
+        const loadQuote = async () => {
+            try {
+                const response = await api.getQuote(symbol)
+                if (!cancelled) setQuote(response.quote)
+            } catch {
+                if (!cancelled) setQuote(null)
+            }
+        }
+        void loadQuote()
+        const timer = window.setInterval(() => {
+            void loadQuote()
+        }, 15000)
+        return () => {
+            cancelled = true
+            window.clearInterval(timer)
+        }
+    }, [symbol])
 
     useEffect(() => {
         const targetDate = normalizeDateKey(focusDate)
@@ -338,15 +426,15 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         if (matched) setActiveCandle(matched)
         const from = candlesRef.current[Math.max(0, targetIndex - 12)]
         const to = candlesRef.current[Math.min(candlesRef.current.length - 1, targetIndex + 12)]
-        const fromTime = toBusinessDay(normalizeDateKey(from?.date))
-        const toTime = toBusinessDay(normalizeDateKey(to?.date))
+        const fromTime = toChartTime(from?.date || '')
+        const toTime = toChartTime(to?.date || '')
         if (fromTime && toTime) {
             chartRef.current.timeScale().setVisibleRange({ from: fromTime, to: toTime })
         }
     }, [candles, focusDate])
 
     useEffect(() => {
-        if (!showChanlunOverlay) {
+        if (!showChanlunOverlay || viewMode !== 'daily') {
             setOverlayData(null)
             setOverlayMessage(null)
             setOverlayLoading(false)
@@ -372,12 +460,16 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         return () => {
             cancelled = true
         }
-    }, [range.end, range.start, showChanlunOverlay, symbol])
+    }, [range.end, range.start, showChanlunOverlay, symbol, viewMode])
 
     useEffect(() => {
         if (!markersRef.current) return
+        if (viewMode !== 'daily') {
+            markersRef.current.setMarkers([])
+            return
+        }
         const tradeMarkers: SeriesMarker<Time>[] = markers.flatMap((marker) => {
-            const time = toBusinessDay((marker.date || '').slice(0, 10))
+            const time = toChartTime(marker.date || '')
             if (!time) return []
             return [{
                 time,
@@ -390,7 +482,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         const overlayMarkers: SeriesMarker<Time>[] = []
         if (showChanlunOverlay && overlayToggles.fractals && overlayData) {
             overlayMarkers.push(...overlayData.fractals.flatMap((point) => {
-                const time = toBusinessDay((point.date || '').slice(0, 10))
+                const time = toChartTime(point.date || '')
                 if (!time) return []
                 return [{
                     time,
@@ -404,7 +496,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         }
         if (showChanlunOverlay && overlayToggles.buySell && overlayData) {
             overlayMarkers.push(...overlayData.buy_sell_points.flatMap((point) => {
-                const time = toBusinessDay((point.date || '').slice(0, 10))
+                const time = toChartTime(point.date || '')
                 if (!time) return []
                 return [{
                     time,
@@ -417,13 +509,13 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             }))
         }
         markersRef.current.setMarkers([...tradeMarkers, ...overlayMarkers])
-    }, [markers, overlayData, overlayToggles.buySell, overlayToggles.fractals, showChanlunOverlay])
+    }, [markers, overlayData, overlayToggles.buySell, overlayToggles.fractals, showChanlunOverlay, viewMode])
 
     useEffect(() => {
         if (!chartRef.current) return
         overlaySeriesRef.current.forEach((series) => chartRef.current?.removeSeries(series))
         overlaySeriesRef.current = []
-        if (!showChanlunOverlay || !overlayData) return
+        if (!showChanlunOverlay || !overlayData || viewMode !== 'daily') return
 
         const pushLineSeries = (data: LineData<Time>[], options: Record<string, unknown>) => {
             if (!chartRef.current || data.length < 2) return
@@ -491,22 +583,30 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 )
             })
         }
-    }, [isDark, overlayData, overlayToggles.bi, overlayToggles.segments, overlayToggles.zhongshu, showChanlunOverlay])
+    }, [isDark, overlayData, overlayToggles.bi, overlayToggles.segments, overlayToggles.zhongshu, showChanlunOverlay, viewMode])
 
     const panelCandle = activeCandle ?? (candles.length ? candles[candles.length - 1] : null)
-    const panelChange = panelCandle?.change ?? (panelCandle ? panelCandle.close - panelCandle.open : null)
-    const panelChangePercent = panelCandle?.change_percent ?? (
-        panelCandle && panelCandle.open !== 0 ? (panelChange! / panelCandle.open) * 100 : null
+    const panelPrice = quote?.price ?? panelCandle?.close
+    const panelOpen = quote?.open ?? panelCandle?.open
+    const panelHigh = quote?.high ?? panelCandle?.high
+    const panelLow = quote?.low ?? panelCandle?.low
+    const panelVolume = quote?.volume ?? panelCandle?.volume
+    const panelAmount = quote?.amount ?? panelCandle?.amount
+    const panelChange = quote?.change ?? panelCandle?.change ?? (panelCandle ? panelCandle.close - panelCandle.open : null)
+    const panelChangePercent = quote?.change_pct ?? panelCandle?.change_percent ?? (
+        panelOpen && panelOpen !== 0 && panelChange != null ? (panelChange / panelOpen) * 100 : null
     )
     const isUp = (panelChange ?? 0) >= 0
     const compactChangePercent = panelChangePercent == null ? '--' : `${panelChangePercent >= 0 ? '+' : ''}${formatNumber(panelChangePercent)}%`
+    const panelTimestamp = quote?.quote_time || panelCandle?.date || '--'
     const showCurrentSymbolButton = !!currentAnalysisSymbol && currentAnalysisSymbol !== symbol
     const currentSymbolLabel = currentAnalysisSymbol ? getDisplayName(currentAnalysisSymbol).replace(/（.*?）/, '') : '当前标的'
     const activeMarkerDetails = useMemo(() => {
+        if (viewMode !== 'daily') return []
         const activeDate = normalizeDateKey(panelCandle?.date)
         if (!activeDate) return []
         return markers.filter(marker => normalizeDateKey(marker.date) === activeDate)
-    }, [markers, panelCandle?.date])
+    }, [markers, panelCandle?.date, viewMode])
 
     return (
         <section className="card h-full flex flex-col overflow-hidden">
@@ -514,20 +614,37 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 <div className="min-w-0 flex items-center gap-3">
                     <CandlestickChart className="w-5 h-5 text-cyan-500" />
                     <div className="min-w-0 flex flex-wrap items-center gap-x-4 gap-y-1">
-                        <h2 className="truncate text-lg font-semibold text-slate-900 dark:text-slate-100">{getDisplayName(symbol)} K线</h2>
+                        <h2 className="truncate text-lg font-semibold text-slate-900 dark:text-slate-100">{getDisplayName(symbol)} {viewMode === 'daily' ? 'K线' : '分时'}</h2>
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                            <span className="text-slate-500 dark:text-slate-400">{panelCandle?.date || '--'}</span>
-                            <span className={`font-medium ${isUp ? 'text-red-500' : 'text-emerald-500'}`}>收盘 {formatNumber(panelCandle?.close)}</span>
-                            <span className="text-slate-500 dark:text-slate-400">开盘 {formatNumber(panelCandle?.open)}</span>
+                            <span className="text-slate-500 dark:text-slate-400">{panelTimestamp}</span>
+                            <span className={`font-medium ${isUp ? 'text-red-500' : 'text-emerald-500'}`}>最新 {formatNumber(panelPrice)}</span>
+                            <span className="text-slate-500 dark:text-slate-400">开盘 {formatNumber(panelOpen)}</span>
                             <span className={`font-medium ${isUp ? 'text-red-500' : 'text-emerald-500'}`}>{compactChangePercent}</span>
-                            <span className="text-slate-500 dark:text-slate-400">高/低 {formatNumber(panelCandle?.high)} / {formatNumber(panelCandle?.low)}</span>
-                            <span className="text-slate-500 dark:text-slate-400">量 {formatVolume(panelCandle?.volume)}</span>
-                            <span className="text-slate-500 dark:text-slate-400">换手 {panelCandle?.turnover_rate == null ? '--' : `${formatNumber(panelCandle.turnover_rate)}%`}</span>
+                            <span className="text-slate-500 dark:text-slate-400">高/低 {formatNumber(panelHigh)} / {formatNumber(panelLow)}</span>
+                            <span className="text-slate-500 dark:text-slate-400">量 {formatVolume(panelVolume)}</span>
+                            <span className="text-slate-500 dark:text-slate-400">额 {formatVolume(panelAmount)}</span>
+                            <span className="text-slate-500 dark:text-slate-400">换手 {viewMode === 'daily' && panelCandle?.turnover_rate != null ? `${formatNumber(panelCandle.turnover_rate)}%` : '--'}</span>
                         </div>
                     </div>
                 </div>
                 <div className="flex items-center gap-1.5">
-                    {showChanlunOverlay && (
+                    <div className="flex items-center gap-1 rounded-xl border border-slate-200 px-1.5 py-1 dark:border-slate-700">
+                        <button
+                            type="button"
+                            onClick={() => setViewMode('daily')}
+                            className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${viewMode === 'daily' ? 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'text-slate-500 dark:text-slate-400'}`}
+                        >
+                            日K
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setViewMode('intraday')}
+                            className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${viewMode === 'intraday' ? 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'text-slate-500 dark:text-slate-400'}`}
+                        >
+                            分时
+                        </button>
+                    </div>
+                    {showChanlunOverlay && viewMode === 'daily' && (
                     <div className="hidden flex-wrap items-center gap-1 rounded-xl border border-slate-200 px-2 py-1 dark:border-slate-700 xl:flex">
                         <Layers3 className="h-3.5 w-3.5 text-violet-500" />
                         {[
@@ -585,7 +702,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         加载中
                     </div>
                 )}
-                {showChanlunOverlay && overlayLoading && (
+                {showChanlunOverlay && viewMode === 'daily' && overlayLoading && (
                     <div className="absolute right-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300 flex items-center gap-1">
                         <Layers3 className="w-3 h-3 animate-pulse" />
                         缠论计算中
@@ -619,7 +736,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         </div>
                     </div>
                 )}
-                {showChanlunOverlay && overlayMessage && !error && (
+                {showChanlunOverlay && viewMode === 'daily' && overlayMessage && !error && (
                     <div className="absolute left-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300">
                         {overlayMessage}
                     </div>

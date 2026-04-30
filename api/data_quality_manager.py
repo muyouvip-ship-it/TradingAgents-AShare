@@ -12,6 +12,15 @@ from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats
 logger = logging.getLogger(__name__)
 
 
+def _normalized_symbol_sql(column_name: str = "symbol") -> str:
+    return (
+        f"regexp_replace("
+        f"regexp_replace(upper(trim({column_name})), '^(SH|SZ|BJ)', ''), "
+        f"'\\.(SH|SZ|BJ)$', ''"
+        f")"
+    )
+
+
 class DataQualityManager:
     """数据质量管理器"""
 
@@ -196,10 +205,11 @@ class DataQualityManager:
                 return result
 
             # 2. 统计基本信息
+            normalized_symbol_expr = _normalized_symbol_sql("symbol") if data_type == "daily_kline" else "symbol"
             stats_query = text(f"""
                 SELECT
                     COUNT(*) as total_records,
-                    COUNT(DISTINCT symbol) as unique_symbols,
+                    COUNT(DISTINCT {normalized_symbol_expr}) as unique_symbols,
                     MIN({date_column}) as min_date,
                     MAX({date_column}) as max_date,
                     COUNT(DISTINCT DATE({date_column})) as trading_days
@@ -233,9 +243,9 @@ class DataQualityManager:
             # 4. 检查重复数据
             duplicate_check = text(f"""
                 SELECT COUNT(*) FROM (
-                    SELECT symbol, {date_column}, COUNT(*)
+                    SELECT {normalized_symbol_expr} AS symbol_key, {date_column}, COUNT(*)
                     FROM {table_name}
-                    GROUP BY symbol, {date_column}
+                    GROUP BY symbol_key, {date_column}
                     HAVING COUNT(*) > 1
                 ) duplicates
             """)

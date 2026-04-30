@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from api.services import minute_data_service
 from api.services.minute_data_service import _aggregate_minute_frame
 
 
@@ -61,3 +62,18 @@ def test_aggregate_minute_frame_drops_incomplete_current_five_minute_bar():
 
     assert len(aggregated) == 1
     assert str(aggregated.iloc[0]["bar_end"]) == "2026-04-27 14:20:00"
+
+
+def test_load_aggregated_minute_bars_returns_empty_without_synthetic_fallback(monkeypatch):
+    monkeypatch.setattr(minute_data_service, "_try_load_minute_frame", lambda symbols, trade_date: None)
+    monkeypatch.setattr(minute_data_service, "_write_minute_cache", lambda *args, **kwargs: {})
+
+    result = minute_data_service.load_aggregated_minute_bars(
+        symbols=["300520.SZ"],
+        trade_date="2026-04-27",
+        timeframe="5m",
+    )
+
+    assert result.source == "empty"
+    assert result.items == []
+    assert result.missing_symbols == ["300520.SZ"]

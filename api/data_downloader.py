@@ -284,6 +284,7 @@ class DataDownloader:
 
         command = [
             sys.executable,
+            "-u",
             str(script_path),
             "--period", "1m",
             "--start-date", start_date.isoformat(),
@@ -384,6 +385,8 @@ class DataDownloader:
             headers["Authorization"] = f"Bearer {token}"
 
         database_url = str(os.getenv("QMT_MINUTE_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+        skip_export_raw = str(os.getenv("QMT_MINUTE_SKIP_EXPORT", "1") or "1").strip().lower()
+        skip_export = skip_export_raw in {"1", "true", "yes", "on"}
         payload = {
             "period": "1m",
             "start_date": start_date.isoformat(),
@@ -392,6 +395,7 @@ class DataDownloader:
             "symbols": symbols,
             "file_format": "parquet",
             "import_db": True,
+            "skip_export": skip_export,
             "database_url": database_url,
             "force": force,
             "window_days": int(os.getenv("QMT_MINUTE_WINDOW_DAYS", "365") or 365),
@@ -400,7 +404,7 @@ class DataDownloader:
         }
         request_id = f"qmt-history-{int(time.time())}"
         logger.info(
-            "[qmt-audit] action=history_minute_sync.request request_id=%s account_key=%s account_id=%s role=%s bridge_url=%s symbols=%s start=%s end=%s",
+            "[qmt-audit] action=history_minute_sync.request request_id=%s account_key=%s account_id=%s role=%s bridge_url=%s symbols=%s start=%s end=%s skip_export=%s",
             request_id,
             account_key,
             account_id,
@@ -409,6 +413,7 @@ class DataDownloader:
             len(symbols),
             start_date,
             end_date,
+            skip_export,
         )
         if not database_url:
             return {"success": False, "records": 0, "error": "缺少 QMT_MINUTE_DATABASE_URL / DATABASE_URL，无法让 Windows bridge 导入分钟线"}
@@ -445,10 +450,18 @@ class DataDownloader:
         job_id = str(job.get("job_id") or "")
         if not job_id:
             return {"success": False, "records": 0, "error": f"QMT bridge 未返回 job_id：{job}"}
+        await self._emit_progress(
+            progress_callback,
+            max(int(job.get("progress") or 0), 10),
+            f"已创建 QMT 历史分钟线任务，job_id={job_id}，正在解析股票池",
+        )
 
         timeout_seconds = int(os.getenv("QMT_HISTORY_JOB_TIMEOUT", "86400") or 86400)
+        stale_timeout_seconds = max(int(os.getenv("QMT_HISTORY_JOB_STALE_TIMEOUT", "240") or 240), 60)
         started = time.time()
         last_message = ""
+        last_heartbeat = 0.0
+        last_bridge_update_at: datetime | None = None
         while True:
             try:
                 status_response = await asyncio.to_thread(
@@ -465,9 +478,24 @@ class DataDownloader:
             status = str(job.get("status") or "").lower()
             progress = int(job.get("progress") or 0)
             message = str(job.get("message") or "")
+            current_symbol = str(job.get("current_symbol") or "").strip()
+            updated_at_raw = str(job.get("updated_at") or "").strip()
+            if updated_at_raw:
+                try:
+                    last_bridge_update_at = datetime.fromisoformat(updated_at_raw)
+                except ValueError:
+                    last_bridge_update_at = None
             if message and message != last_message:
                 await self._emit_progress(progress_callback, progress, message)
                 last_message = message
+                last_heartbeat = time.time()
+            elif time.time() - last_heartbeat >= 15:
+                heartbeat_message = message or "QMT bridge 正在处理历史分钟线任务"
+                if current_symbol:
+                    heartbeat_message = f"{heartbeat_message}（当前股票：{current_symbol}）"
+                heartbeat_message = f"{heartbeat_message}，job_id={job_id}"
+                await self._emit_progress(progress_callback, max(progress, 10), heartbeat_message)
+                last_heartbeat = time.time()
             if status == "completed":
                 after_count = self._count_minute_kline_rows(symbols, start_date, end_date)
                 inserted_rows = max(after_count - before_count, 0)
@@ -508,41 +536,52 @@ class DataDownloader:
                     "account_key": account_key,
                     "role": role,
                 }
+            if last_bridge_update_at is not None:
+                bridge_stale_seconds = (datetime.now(last_bridge_update_at.tzinfo) - last_bridge_update_at).total_seconds()
+                if bridge_stale_seconds >= stale_timeout_seconds:
+                    return {
+                        "success": False,
+                        "records": 0,
+                        "error": (
+                            f"QMT bridge 历史分钟线任务疑似卡住：{job_id}，"
+                            f"{int(bridge_stale_seconds)} 秒无状态更新，当前股票 {current_symbol or 'unknown'}"
+                        ),
+                        "bridge_job_id": job_id,
+                        "bridge": base_url,
+                        "account_key": account_key,
+                        "role": role,
+                    }
             if time.time() - started > timeout_seconds:
                 return {"success": False, "records": 0, "error": f"QMT bridge 历史分钟线任务超时：{job_id}", "bridge_job_id": job_id}
             await asyncio.sleep(2)
 
     @staticmethod
     def _resolve_qmt_history_bridge() -> dict[str, str] | None:
-        history_account_key = str(os.getenv("QMT_HISTORY_ACCOUNT_KEY") or settings.qmt_history_account_key or "paper_sim").strip() or "paper_sim"
-        explicit_base = str(os.getenv("QMT_HISTORY_BRIDGE_BASE_URL") or "").strip()
-        explicit_token = str(os.getenv("QMT_HISTORY_BRIDGE_TOKEN") or os.getenv("QMT_BRIDGE_TOKEN") or "").strip()
+        history_account_key = (
+            str(os.getenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY") or settings.qmt_minute_history_account_key or "live_real").strip()
+            or "live_real"
+        )
+        explicit_base = str(os.getenv("QMT_MINUTE_HISTORY_BRIDGE_BASE_URL") or os.getenv("QMT_HISTORY_BRIDGE_BASE_URL") or "").strip()
+        explicit_token = str(
+            os.getenv("QMT_MINUTE_HISTORY_BRIDGE_TOKEN") or os.getenv("QMT_HISTORY_BRIDGE_TOKEN") or os.getenv("QMT_BRIDGE_TOKEN") or ""
+        ).strip()
         if explicit_base:
-            if DataDownloader._bridge_url_looks_live(explicit_base):
-                logger.warning("[qmt-audit] QMT_HISTORY_BRIDGE_BASE_URL 指向实盘端口，拒绝用于回测分钟线下载: %s", explicit_base)
-                return None
-            return {"bridge_base_url": explicit_base, "bridge_token": explicit_token, "account_key": history_account_key, "role": "paper"}
+            return {"bridge_base_url": explicit_base, "bridge_token": explicit_token, "account_key": history_account_key, "role": "live"}
         for account in settings.qmt_accounts():
             if not bool(account.get("enabled", True)):
                 continue
             if str(account.get("key") or "").strip() != history_account_key:
                 continue
-            if str(account.get("role") or "paper").strip().lower() != "paper":
-                logger.warning("[qmt-audit] QMT_HISTORY_ACCOUNT_KEY=%s 不是模拟仓，拒绝用于回测分钟线下载", history_account_key)
-                return None
             base_url = str(account.get("bridge_base_url") or "").strip()
-            if DataDownloader._bridge_url_looks_live(base_url):
-                logger.warning("[qmt-audit] QMT_HISTORY_ACCOUNT_KEY=%s 的 bridge 指向实盘端口，拒绝用于回测分钟线下载: %s", history_account_key, base_url)
-                return None
             if base_url:
                 return {
                     "bridge_base_url": base_url,
                     "bridge_token": str(account.get("bridge_token") or ""),
                     "account_key": str(account.get("key") or history_account_key),
                     "account_id": str(account.get("account_id") or ""),
-                    "role": str(account.get("role") or "paper"),
+                    "role": str(account.get("role") or "live"),
                 }
-        if not settings.qmt_accounts_json and str(settings.qmt_default_account_key or "paper_sim").strip() == history_account_key:
+        if not settings.qmt_accounts_json and str(settings.qmt_default_account_key or "").strip() == history_account_key:
             base_url = str(settings.qmt_bridge_base_url or "").strip()
             if base_url:
                 return {
@@ -550,9 +589,9 @@ class DataDownloader:
                     "bridge_token": str(settings.qmt_bridge_token or ""),
                     "account_key": history_account_key,
                     "account_id": str(settings.qmt_account_id or ""),
-                    "role": "paper",
+                    "role": "live",
                 }
-        logger.warning("[qmt-audit] 未找到 QMT_HISTORY_ACCOUNT_KEY=%s 对应的模拟仓 bridge，回测分钟线不会回退到其他 QMT 账户", history_account_key)
+        logger.warning("[qmt-audit] 未找到 QMT_MINUTE_HISTORY_ACCOUNT_KEY=%s 对应的历史分钟线 bridge", history_account_key)
         return None
 
     @staticmethod

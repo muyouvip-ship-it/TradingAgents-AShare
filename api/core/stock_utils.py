@@ -8,7 +8,7 @@ from api.core.stock_map import load_cn_stock_map
 
 def normalize_symbol(raw: str) -> str:
     s = raw.strip().upper()
-    m = re.search(r"(\d{6})(?:\.(SH|SZ|SS))?", s)
+    m = re.search(r"(\d{6})(?:\.(SH|SZ|SS|BJ))?", s)
     if m:
         code = m.group(1)
         suffix = m.group(2)
@@ -16,7 +16,12 @@ def normalize_symbol(raw: str) -> str:
             if suffix == "SS":
                 return f"{code}.SH"
             return f"{code}.{suffix}"
-        market = "SH" if code.startswith(("5", "6", "9")) else "SZ"
+        if code.startswith(("4", "8")):
+            market = "BJ"
+        elif code.startswith(("5", "6", "9")):
+            market = "SH"
+        else:
+            market = "SZ"
         return f"{code}.{market}"
     m2 = re.search(r"([A-Z]{1,6}(?:\.[A-Z]{1,3})?)", s)
     if m2:

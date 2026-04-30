@@ -5,6 +5,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
+import calendar as month_calendar
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 import asyncio
@@ -13,12 +14,14 @@ import pandas as pd
 
 from api.database import get_db, get_db_ctx, UserDB
 from api.deps import require_api_user as get_current_user
+from api.core.settings import settings
 from api.data_downloader import DataDownloader
 from api.quantclass_downloader import QuantClassDownloader
 from api.quantclass_importer import import_stock_daily_from_quantclass
 from api.data_quality_manager import DataQualityManager
 from api.data_source_monitor import get_data_source_monitor
 from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats, write_daily_kline_parquet_cache
+from api.services.qmt_market_data_service import sync_index_minute_history
 from .backtest_data_models import (
     BacktestDataTaskCreate, BacktestDataTask,
     BacktestDataConfigCreate, BacktestDataConfig,
@@ -35,6 +38,7 @@ _TABLE_STATS_MAPPING = {
     "daily_kline": ("stock_daily_kline", "trade_date"),
     "index_data": ("index_daily_data", "trade_date"),
     "minute_kline": ("stock_minute_kline", "trade_time"),
+    "index_minute_kline": ("index_minute_kline", "trade_time"),
 }
 
 
@@ -122,10 +126,11 @@ def _build_backtest_table_stat(db: Session, *, data_type: str, table_name: str, 
     if not table_exists:
         return None
 
+    normalized_symbol_expr = _normalized_symbol_sql("symbol") if data_type == "daily_kline" else "symbol"
     row = db.execute(text(f"""
         SELECT
             COUNT(*) AS total_records,
-            COUNT(DISTINCT symbol) AS symbol_count,
+            COUNT(DISTINCT {normalized_symbol_expr}) AS symbol_count,
             COUNT(DISTINCT DATE({date_column})) AS trading_days,
             MIN(DATE({date_column})) AS date_range_start,
             MAX(DATE({date_column})) AS date_range_end
@@ -309,11 +314,21 @@ def _parse_optional_date(value) -> date | None:
         return value
     return date.fromisoformat(str(value))
 
+
+def _normalized_symbol_sql(column_name: str = "symbol") -> str:
+    return (
+        f"regexp_replace("
+        f"regexp_replace(upper(trim({column_name})), '^(SH|SZ|BJ)', ''), "
+        f"'\\.(SH|SZ|BJ)$', ''"
+        f")"
+    )
+
 # 数据源兼容性映射
 DATA_SOURCE_COMPATIBILITY = {
     'daily_kline': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
     'minute_kline': ['qmt', 'akshare'],  # QMT 优先，AKShare 作为兜底
     'index_data': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
+    'index_minute_kline': ['qmt', 'akshare'],
     'chip_data': ['quantclass'],  # 只有量化课堂支持
     'financial_data': ['quantclass'],  # 只有量化课堂支持
     'research_reports': ['eastmoney']  # 只有东方财富支持
@@ -629,6 +644,101 @@ async def get_backtest_data_stats(
         return BacktestDataStatsListResponse(stats=stats, total=len(stats))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取数据统计失败: {str(e)}")
+
+
+@router.get("/daily-kline/coverage-calendar")
+async def get_daily_kline_coverage_calendar(
+    year: Optional[int] = None,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回股票日K线按年的月度覆盖视图。"""
+    try:
+        del current_user
+        coverage = db.execute(text("""
+            SELECT
+                MIN(trade_date) AS min_date,
+                MAX(trade_date) AS max_date
+            FROM stock_daily_kline
+        """)).fetchone()
+        min_date = coverage.min_date if coverage else None
+        max_date = coverage.max_date if coverage else None
+        if min_date is None or max_date is None:
+            raise HTTPException(status_code=404, detail="数据库 stock_daily_kline 暂无可展示数据")
+
+        min_year = int(min_date.year)
+        max_year = int(max_date.year)
+        selected_year = int(year or max_year)
+        if selected_year < min_year or selected_year > max_year:
+            raise HTTPException(status_code=400, detail=f"年份超出范围：{min_year} - {max_year}")
+
+        start_date = date(selected_year, 1, 1)
+        end_date = date(selected_year + 1, 1, 1)
+        normalized_symbol_expr = _normalized_symbol_sql("symbol")
+        rows = db.execute(text(f"""
+            SELECT
+                trade_date::date AS trade_date,
+                COUNT(*) AS row_count,
+                COUNT(DISTINCT {normalized_symbol_expr}) AS symbol_count
+            FROM stock_daily_kline
+            WHERE trade_date >= :start_date
+              AND trade_date < :end_date
+            GROUP BY trade_date::date
+            ORDER BY trade_date::date
+        """), {
+            "start_date": start_date,
+            "end_date": end_date,
+        }).fetchall()
+
+        coverage_by_date = {
+            row.trade_date: {
+                "row_count": int(row.row_count or 0),
+                "symbol_count": int(row.symbol_count or 0),
+            }
+            for row in rows
+        }
+
+        months: list[dict[str, object]] = []
+        total_days_with_data = 0
+        for month in range(1, 13):
+            _, days_in_month = month_calendar.monthrange(selected_year, month)
+            month_days: list[dict[str, object]] = []
+            days_with_data = 0
+            for day in range(1, days_in_month + 1):
+                current_date = date(selected_year, month, day)
+                payload = coverage_by_date.get(current_date)
+                has_data = payload is not None and int(payload.get("symbol_count") or 0) > 0
+                if has_data:
+                    days_with_data += 1
+                month_days.append({
+                    "date": current_date.isoformat(),
+                    "day": day,
+                    "weekday": int(current_date.weekday()),
+                    "has_data": has_data,
+                    "symbol_count": int(payload.get("symbol_count") or 0) if payload else 0,
+                    "row_count": int(payload.get("row_count") or 0) if payload else 0,
+                })
+            total_days_with_data += days_with_data
+            months.append({
+                "month": month,
+                "days": month_days,
+                "days_in_month": days_in_month,
+                "days_with_data": days_with_data,
+            })
+
+        return {
+            "data_type": "daily_kline",
+            "year": selected_year,
+            "min_year": min_year,
+            "max_year": max_year,
+            "available_years": list(range(min_year, max_year + 1)),
+            "total_days_with_data": total_days_with_data,
+            "months": months,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取日K覆盖日历失败: {exc}") from exc
 
 
 @router.post("/daily-kline/cache-sync")
@@ -1046,7 +1156,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                     if task.data_source == 'qmt':
                         symbols = task.symbols or []
                         total_stocks = len(symbols)
-                        logger.info(f"准备下载 {total_stocks} 只股票的1分钟K线数据 (使用QMT)")
+                        scope_text = f"{total_stocks} 只股票" if total_stocks > 0 else "全市场股票"
+                        logger.info(f"准备下载 {scope_text} 的1分钟K线数据 (使用QMT)")
                         async def qmt_progress_callback(progress: int, message: str):
                             with get_db_ctx() as db_update:
                                 db_update.execute(text("""
@@ -1062,7 +1173,10 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 })
                                 db_update.commit()
 
-                        await qmt_progress_callback(5, "QMT 连接检查通过，准备启动历史分钟线同步脚本（固定通道：paper_sim / 8710）")
+                        await qmt_progress_callback(
+                            5,
+                            f"QMT 连接检查通过，准备启动历史分钟线同步脚本（专用通道：{settings.qmt_minute_history_account_key or 'live_real'}）",
+                        )
 
                         result = await downloader.download_minute_kline_from_qmt(
                             start_date=task.date_range_start,
@@ -1144,6 +1258,74 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 db_update.commit()
 
                             await asyncio.sleep(2)
+
+                elif task.task_type == 'index_minute_kline':
+                    if task.data_source not in {'qmt', 'akshare'}:
+                        error_count += 1
+                        logger.error("指数1分钟K线当前仅支持QMT或AKShare数据源")
+                    else:
+                        index_symbols = task.symbols or []
+                        logger.info(f"准备下载 {len(index_symbols) or 8} 个指数的1分钟K线数据 (使用{task.data_source})")
+
+                        def index_progress_callback(progress: int, message: str):
+                            with get_db_ctx() as db_update:
+                                db_update.execute(text("""
+                                    UPDATE backtest_data_tasks
+                                    SET progress = :progress,
+                                        error_message = :error_message,
+                                        updated_at = NOW()
+                                    WHERE id = :task_id
+                                """), {
+                                    "task_id": task_id,
+                                    "progress": max(0, min(int(progress), 100)),
+                                    "error_message": message[:500] if message else None,
+                                })
+                                db_update.commit()
+
+                        index_progress_callback(
+                            5,
+                            f"QMT 指数分钟线历史同步已启动，专用通道：{settings.qmt_minute_history_account_key or 'live_real'}"
+                            if task.data_source == "qmt"
+                            else "AKShare 指数分钟线历史同步已启动（仅最近 5 个交易日可用）",
+                        )
+                        try:
+                            result = sync_index_minute_history(
+                                start_date=task.date_range_start.isoformat(),
+                                end_date=task.date_range_end.isoformat(),
+                                symbols=index_symbols,
+                                account_key=None,
+                                data_source=task.data_source,
+                                progress_callback=index_progress_callback,
+                            )
+                        except Exception as exc:
+                            result = {"success": False, "error": str(exc), "rows": 0}
+
+                        if result.get('success'):
+                            total_records += int(result.get('rows') or 0)
+                            success_count += len(result.get('symbols') or []) or 1
+                        else:
+                            error_count += 1
+                            logger.error(f"QMT 指数1分钟K线下载失败: {result.get('error', '未知错误')}")
+
+                        with get_db_ctx() as db_update:
+                            db_update.execute(text("""
+                                UPDATE backtest_data_tasks
+                                SET progress = :progress,
+                                    downloaded_records = :records,
+                                    error_message = :error_message,
+                                    updated_at = NOW()
+                                WHERE id = :task_id
+                            """), {
+                                "task_id": task_id,
+                                "progress": 100 if result.get('success') else 0,
+                                "records": total_records,
+                                "error_message": (
+                                    f"QMT 指数分钟线同步完成，区间记录约 {total_records} 条；缺失指数: {','.join(result.get('missing_symbols') or []) or '无'}"
+                                    if result.get('success')
+                                    else result.get('error')
+                                )
+                            })
+                            db_update.commit()
                 
                 elif task.task_type == 'chip_data':
                     # 筹码数据
@@ -1355,6 +1537,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             table_name = 'index_daily_data'
                         elif task.task_type == 'minute_kline':
                             table_name = 'stock_minute_kline'
+                        elif task.task_type == 'index_minute_kline':
+                            table_name = 'index_minute_kline'
                         
                         # 执行质量检查
                         quality_result = quality_manager.validate_database_integrity(
@@ -1531,7 +1715,23 @@ async def generate_quality_report(
                 "issues": ["表不存在"],
                 "stats": {}
             }
-        
+
+        try:
+            index_minute_result = quality_manager.validate_database_integrity(
+                db, "index_minute_kline", "index_minute_kline"
+            )
+            report["tables"]["index_minute_kline"] = {
+                "valid": index_minute_result['valid'],
+                "issues": index_minute_result['issues'],
+                "stats": index_minute_result['stats']
+            }
+        except Exception:
+            report["tables"]["index_minute_kline"] = {
+                "valid": False,
+                "issues": ["表不存在"],
+                "stats": {}
+            }
+
         return {
             "success": True,
             "report": report

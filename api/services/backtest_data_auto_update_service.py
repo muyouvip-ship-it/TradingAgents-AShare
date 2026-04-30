@@ -292,7 +292,7 @@ def _resolve_incremental_date_range(
 
     existing_end = stat.date_range_end or stat.last_updated_date
     last_updated_date = stat.last_updated_date
-    if data_type == "minute_kline":
+    if data_type in {"minute_kline", "index_minute_kline"}:
         if last_updated_date == target_date and existing_end == target_date:
             return None
         if existing_end and existing_end < target_date:
@@ -318,6 +318,7 @@ def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -
         "daily_kline": ("stock_daily_kline", "trade_date"),
         "index_data": ("index_daily_data", "trade_date"),
         "minute_kline": ("stock_minute_kline", "trade_time"),
+        "index_minute_kline": ("index_minute_kline", "trade_time"),
     }
     table_info = table_mapping.get(data_type)
     if table_info is None:

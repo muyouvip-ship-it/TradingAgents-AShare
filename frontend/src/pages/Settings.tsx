@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign, AlertCircle, CheckCircle, Radio, Play, Clock3 } from 'lucide-react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign, AlertCircle, CheckCircle, Radio, Play, Clock3, ChevronLeft, ChevronRight, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -55,6 +55,44 @@ function createDefaultQmtForm(role: 'paper' | 'live'): RuntimeQmtAccountConfig {
 }
 
 type SettingsSection = 'analysis' | 'backtest' | 'qmt' | 'system'
+
+type BacktestDataStatItem = {
+    data_type: string
+    total_records?: number
+    date_range_start?: string | null
+    date_range_end?: string | null
+    symbol_count?: number | null
+    trading_days?: number | null
+    last_table_updated_at?: string | null
+    updated_at?: string | null
+    data_quality_score?: number
+}
+
+type DailyKlineCoverageCalendarDay = {
+    date: string
+    day: number
+    weekday: number
+    has_data: boolean
+    symbol_count: number
+    row_count: number
+}
+
+type DailyKlineCoverageCalendarMonth = {
+    month: number
+    days: DailyKlineCoverageCalendarDay[]
+    days_in_month: number
+    days_with_data: number
+}
+
+type DailyKlineCoverageCalendarResponse = {
+    data_type: 'daily_kline'
+    year: number
+    min_year: number
+    max_year: number
+    available_years: number[]
+    total_days_with_data: number
+    months: DailyKlineCoverageCalendarMonth[]
+}
 
 const SETTINGS_SECTIONS = [
     { id: 'analysis' as const, label: '模型与分析', description: '模型接入、默认分析与推送', icon: Database },
@@ -120,12 +158,17 @@ export default function Settings() {
     const [onlyTradingDay, setOnlyTradingDay] = useState(true)
     const [downloading, setDownloading] = useState(false)
     const [downloadProgress, setDownloadProgress] = useState(0)
-    const [dataStats, setDataStats] = useState<any[]>([])  // 已下载数据统计
+    const [dataStats, setDataStats] = useState<BacktestDataStatItem[]>([])  // 已下载数据统计
     const [dataTasks, setDataTasks] = useState<any[]>([])  // 下载任务列表
     const [qualityCheckingType, setQualityCheckingType] = useState<string | null>(null)
     const [qualityCheckResults, setQualityCheckResults] = useState<Record<string, any>>({})
     const [loadingStats, setLoadingStats] = useState(false)
     const [dailyCacheSyncing, setDailyCacheSyncing] = useState(false)
+    const [dailyCalendarOpen, setDailyCalendarOpen] = useState(false)
+    const [dailyCalendarYear, setDailyCalendarYear] = useState(new Date().getFullYear())
+    const [dailyCalendarData, setDailyCalendarData] = useState<DailyKlineCoverageCalendarResponse | null>(null)
+    const [dailyCalendarLoading, setDailyCalendarLoading] = useState(false)
+    const [dailyCalendarError, setDailyCalendarError] = useState<string | null>(null)
     const [subscriptionActionMessage, setSubscriptionActionMessage] = useState<string | null>(null)
     const [backtestConfig, setBacktestConfig] = useState<BacktestDataConfigItem | null>(null)
     const [subscriptionStatus, setSubscriptionStatus] = useState<BacktestDataSubscriptionStatus | null>(null)
@@ -292,8 +335,23 @@ export default function Settings() {
         return []
     }
 
+    const ensureTaskPollingForActiveTasks = (tasks: any[]) => {
+        const activeTasks = (Array.isArray(tasks) ? tasks : []).filter(
+            task => task?.status === 'running' || task?.status === 'pending',
+        )
+        if (activeTasks.length === 0) {
+            return
+        }
+        if (pollingIntervalRef.current) {
+            return
+        }
+        const activeIds = activeTasks.map(task => Number(task.id)).filter(Number.isFinite)
+        setActiveDownloadTaskIds(activeIds)
+        startTaskPolling(activeIds, 'download')
+    }
+
     const loadBacktestStats = async () => {
-        const statsResponse = await api.request<{stats?: any[], total?: number}>('/v1/backtest-data/stats')
+        const statsResponse = await api.request<{stats?: BacktestDataStatItem[], total?: number}>('/v1/backtest-data/stats')
         const rawStats = statsResponse && Array.isArray(statsResponse.stats)
             ? statsResponse.stats
             : Array.isArray(statsResponse)
@@ -317,11 +375,12 @@ export default function Settings() {
     const loadBacktestDataInfo = async () => {
         setLoadingStats(true)
         try {
-            await Promise.all([
+            const [, , tasks] = await Promise.all([
                 loadBacktestConfigSnapshot({ syncForm: true }),
                 loadBacktestStats(),
                 loadBacktestTaskList(),
             ])
+            ensureTaskPollingForActiveTasks(tasks)
         } catch (err) {
             console.error('加载回测数据信息失败:', err)
             setDataStats([])
@@ -336,6 +395,38 @@ export default function Settings() {
         const date = new Date(value)
         if (Number.isNaN(date.getTime())) return value
         return date.toLocaleString('zh-CN', { hour12: false })
+    }
+
+    const loadDailyCalendarView = async (year: number) => {
+        setDailyCalendarLoading(true)
+        setDailyCalendarError(null)
+        try {
+            const result = await api.request<DailyKlineCoverageCalendarResponse>(`/v1/backtest-data/daily-kline/coverage-calendar?year=${year}`)
+            setDailyCalendarData(result)
+            setDailyCalendarYear(result.year)
+        } catch (err) {
+            console.error('加载日K覆盖视图失败:', err)
+            setDailyCalendarError(err instanceof Error ? err.message : '加载日K覆盖视图失败')
+            setDailyCalendarData(null)
+        } finally {
+            setDailyCalendarLoading(false)
+        }
+    }
+
+    const handleOpenDailyCalendarView = (stat: BacktestDataStatItem) => {
+        const fallbackYear = new Date().getFullYear()
+        const endYear = stat.date_range_end ? new Date(stat.date_range_end).getFullYear() : fallbackYear
+        const targetYear = Number.isFinite(endYear) ? endYear : fallbackYear
+        setDailyCalendarOpen(true)
+        setDailyCalendarYear(targetYear)
+        void loadDailyCalendarView(targetYear)
+    }
+
+    const handleChangeDailyCalendarYear = (nextYear: number) => {
+        if (!dailyCalendarData) return
+        if (nextYear < dailyCalendarData.min_year || nextYear > dailyCalendarData.max_year) return
+        setDailyCalendarYear(nextYear)
+        void loadDailyCalendarView(nextYear)
     }
 
     const getQualityCheckParams = (dataType: string) => {
@@ -2019,8 +2110,9 @@ export default function Settings() {
                             <div className="space-y-3">
                                 {dataStats.map((stat, index) => {
                                     const Icon = getDataTypeIcon(stat.data_type)
-                                    const isComplete = stat.data_quality_score >= 90
-                                    const hasIssues = stat.data_quality_score < 80
+                                    const qualityScore = stat.data_quality_score ?? 0
+                                    const isComplete = qualityScore >= 90
+                                    const hasIssues = qualityScore < 80
                                     const qualityResult = qualityCheckResults[stat.data_type]
                                     
                                     return (
@@ -2042,6 +2134,15 @@ export default function Settings() {
                                                     </span>
                                                 </div>
                                                 <div className="flex items-center gap-2">
+                                                    {stat.data_type === 'daily_kline' && (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleOpenDailyCalendarView(stat)}
+                                                            className="rounded-lg border border-emerald-200 px-2 py-1 text-xs font-medium text-emerald-700 transition hover:bg-emerald-50 dark:border-emerald-900/50 dark:text-emerald-300 dark:hover:bg-emerald-950/30"
+                                                        >
+                                                            数据视图
+                                                        </button>
+                                                    )}
                                                     <button
                                                         type="button"
                                                         onClick={() => handleCheckQuality(stat.data_type)}
@@ -2103,7 +2204,7 @@ export default function Settings() {
                                                         hasIssues ? 'text-amber-600 dark:text-amber-400' :
                                                         'text-slate-600 dark:text-slate-400'
                                                     }`}>
-                                                        {stat.data_quality_score || 0}/100
+                                                        {qualityScore}/100
                                                     </div>
                                                 </div>
                                                 <div className="col-span-2">
@@ -2283,6 +2384,115 @@ export default function Settings() {
                             <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                                 最近同步：{formatDateTime(qmtOverview?.last_synced_at || qmtOverview?.fetched_at)}
                             </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {dailyCalendarOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+                    <div className="flex max-h-[90vh] w-full max-w-7xl flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950">
+                        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5 dark:border-slate-800">
+                            <div>
+                                <div className="text-lg font-semibold text-slate-900 dark:text-slate-100">股票日 K 线数据视图</div>
+                                <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                                    3 x 4 月卡展示全年覆盖情况，绿色表示当天已有数据，灰色表示当天暂无数据。
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setDailyCalendarOpen(false)}
+                                className="rounded-xl border border-slate-200 p-2 text-slate-500 transition hover:bg-slate-50 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-900"
+                            >
+                                <X className="h-4 w-4" />
+                            </button>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4 dark:border-slate-800">
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => handleChangeDailyCalendarYear(dailyCalendarYear - 1)}
+                                    disabled={!dailyCalendarData || dailyCalendarYear <= dailyCalendarData.min_year || dailyCalendarLoading}
+                                    className="rounded-xl border border-slate-200 p-2 text-slate-600 transition hover:bg-slate-50 disabled:opacity-40 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-900"
+                                >
+                                    <ChevronLeft className="h-4 w-4" />
+                                </button>
+                                <div className="min-w-28 text-center">
+                                    <div className="text-2xl font-semibold text-slate-900 dark:text-slate-100">{dailyCalendarYear}</div>
+                                    <div className="text-xs text-slate-500 dark:text-slate-400">年度覆盖视图</div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => handleChangeDailyCalendarYear(dailyCalendarYear + 1)}
+                                    disabled={!dailyCalendarData || dailyCalendarYear >= dailyCalendarData.max_year || dailyCalendarLoading}
+                                    className="rounded-xl border border-slate-200 p-2 text-slate-600 transition hover:bg-slate-50 disabled:opacity-40 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-900"
+                                >
+                                    <ChevronRight className="h-4 w-4" />
+                                </button>
+                            </div>
+                            <div className="flex items-center gap-6 text-sm">
+                                <div>
+                                    <div className="text-xs text-slate-500 dark:text-slate-400">可选年份</div>
+                                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                                        {dailyCalendarData ? `${dailyCalendarData.min_year} - ${dailyCalendarData.max_year}` : '--'}
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="text-xs text-slate-500 dark:text-slate-400">有数据天数</div>
+                                    <div className="font-semibold text-emerald-600 dark:text-emerald-300">
+                                        {dailyCalendarData?.total_days_with_data ?? 0} 天
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="overflow-y-auto px-6 py-5">
+                            {dailyCalendarLoading ? (
+                                <div className="flex min-h-[320px] items-center justify-center text-slate-500 dark:text-slate-400">
+                                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                                    加载覆盖视图...
+                                </div>
+                            ) : dailyCalendarError ? (
+                                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
+                                    {dailyCalendarError}
+                                </div>
+                            ) : dailyCalendarData ? (
+                                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                                    {dailyCalendarData.months.map((month) => (
+                                        <div key={month.month} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+                                            <div className="mb-3 flex items-center justify-between">
+                                                <div>
+                                                    <div className="text-base font-semibold text-slate-900 dark:text-slate-100">{month.month} 月</div>
+                                                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                                                        {month.days_with_data} / {month.days_in_month} 天有数据
+                                                    </div>
+                                                </div>
+                                                <div className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                                                    {Math.round((month.days_with_data / month.days_in_month) * 100)}%
+                                                </div>
+                                            </div>
+                                            <div className="grid grid-cols-7 gap-1">
+                                                {month.days.map((day) => (
+                                                    <div
+                                                        key={day.date}
+                                                        title={`${day.date} · ${day.has_data ? `有数据（${day.symbol_count} 只股票）` : '暂无数据'}`}
+                                                        className={`flex aspect-square items-center justify-center rounded-lg text-xs font-medium transition ${
+                                                            day.has_data
+                                                                ? 'bg-emerald-500 text-white shadow-sm'
+                                                                : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                                                        }`}
+                                                    >
+                                                        {day.day}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <div className="text-sm text-slate-500 dark:text-slate-400">暂无可展示的年度覆盖数据。</div>
+                            )}
                         </div>
                     </div>
                 </div>

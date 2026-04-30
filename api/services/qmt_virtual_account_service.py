@@ -19,7 +19,6 @@ from api.core.stock_map import get_reverse_stock_map_cached_only
 from api.core.settings import settings
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, VirtualPositionStateDB
 from api.services import auth_service, portfolio_import_service
-from tradingagents.dataflows.interface import route_to_vendor
 
 
 logger = logging.getLogger(__name__)
@@ -1381,6 +1380,7 @@ def _apply_quote_metrics(
         today_pnl = round(float(price_change or 0.0) * float(item.get("current_position") or 0.0), 2) if price_change is not None else None
         today_pnl_pct = _to_float(quote.get("change_pct"))
         total_pnl = item.get("total_pnl")
+        total_pnl_pct = _to_float(item.get("total_pnl_pct"))
         avg_price = _to_float(item.get("average_cost"))
         if current_price is not None and avg_price not in (None, 0):
             total_pnl = round((current_price - avg_price) * float(item.get("current_position") or 0.0), 2)
@@ -1532,11 +1532,9 @@ def _fetch_live_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
     try:
-        raw = route_to_vendor("get_realtime_quotes", symbols)
-        if isinstance(raw, dict):
-            return raw
-        import json
-        return json.loads(raw)
+        from api.services.qmt_market_data_service import fetch_realtime_quotes
+
+        return fetch_realtime_quotes(symbols, account_key=settings.qmt_history_account_key)
     except Exception as exc:
         logger.warning("[qmt] realtime quote fetch failed: %s", exc)
         return {}

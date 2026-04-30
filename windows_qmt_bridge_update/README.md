@@ -73,6 +73,7 @@ curl -sS -H "Authorization: Bearer your-bridge-token" http://192.168.10.1:8711/h
 
 > 注意：如果要让 Windows Bridge 直接导入 Mac/PostgreSQL，`QMT_MINUTE_DATABASE_URL` 必须是 Windows 可以访问的数据库地址，不能写 `localhost`。例如 `postgresql://user:password@192.168.10.x:5432/trading_agents`。
 > 安全：Mac 后端会按 `QMT_HISTORY_ACCOUNT_KEY=paper_sim` 查找模拟仓 bridge，不会自动回退到实盘 bridge。
+> 如果希望跳过项目层 `parquet/csv` 中间文件、直接写 PostgreSQL，可设置 `QMT_MINUTE_SKIP_EXPORT=1`，或在脚本参数中显式加 `--skip-export`。QMT 自身的本地缓存目录仍会由 `xtdata` 使用，这一层不能完全绕过。
 
 ### 下载全市场分钟线
 
@@ -98,6 +99,13 @@ setx QMT_MINUTE_DATABASE_URL "postgresql://user:password@host:5432/dbname"
 ```
 
 重新打开 PowerShell 后执行：
+
+```powershell
+cd D:\QMT
+powershell -ExecutionPolicy Bypass -File .\install_qmt_history_import_deps.ps1
+```
+
+然后执行：
 
 ```powershell
 cd D:\QMT

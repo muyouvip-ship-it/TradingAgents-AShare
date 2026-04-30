@@ -321,6 +321,48 @@ export interface KlineResponse {
     source?: string
 }
 
+export interface MarketQuote {
+    symbol: string
+    name?: string | null
+    price?: number | null
+    open?: number | null
+    high?: number | null
+    low?: number | null
+    previous_close?: number | null
+    change?: number | null
+    change_pct?: number | null
+    volume?: number | null
+    amount?: number | null
+    quote_time?: string | null
+    source?: string | null
+}
+
+export interface MarketQuoteResponse {
+    symbol: string
+    quote: MarketQuote
+    source?: string
+}
+
+export interface IntradayBar {
+    symbol: string
+    trade_time: string
+    open?: number | null
+    high?: number | null
+    low?: number | null
+    close?: number | null
+    volume?: number | null
+    amount?: number | null
+}
+
+export interface IntradayResponse {
+    symbol: string
+    trade_date: string
+    period: string
+    items: IntradayBar[]
+    latest_quote?: MarketQuote | null
+    source?: string
+}
+
 export interface ChanlunPoint {
     date: string
     price: number
@@ -1608,6 +1650,12 @@ export interface RealtimeMonitor {
     }
     last_heartbeat_at?: string | null
     fused_reason?: string | null
+    manual_symbols?: string[]
+    resolved_symbols?: string[]
+    manual_symbol_count?: number
+    resolved_symbol_count?: number
+    display_symbols?: string[]
+    display_symbol_count?: number
     created_at?: string | null
     updated_at?: string | null
 }

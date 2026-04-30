@@ -45,9 +45,9 @@ try {
     )
 
     if ($pythonCommand.Name -eq "py.exe" -or $pythonCommand.Name -eq "py") {
-        py -3 @commonArgs
+        py -3 -u @commonArgs
     } else {
-        python @commonArgs
+        python -u @commonArgs
     }
 } catch {
     Write-Host "[ERROR] QMT minute history import failed." -ForegroundColor Red

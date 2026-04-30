@@ -50,8 +50,8 @@ def load_aggregated_minute_bars(
     frame = _try_load_minute_frame(normalized_symbols, trade_date)
     source = "postgresql:stock_minute_kline"
     if frame is None or frame.empty:
-        frame = _generate_synthetic_minute_frame(normalized_symbols, trade_date)
-        source = "synthetic:fallback"
+        frame = pd.DataFrame(columns=["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"])
+        source = "empty"
     aggregated = _aggregate_minute_frame(frame, timeframe)
     missing_symbols = sorted(set(normalized_symbols) - set(aggregated["symbol"].unique())) if not aggregated.empty else normalized_symbols
     cache_paths = _write_minute_cache(aggregated, trade_date=trade_date, timeframe=timeframe, source=source)
@@ -129,8 +129,8 @@ def evaluate_first_day_band_signals(
             if supplement_source:
                 source = f"{source}+{supplement_source}"
     if frame is None or frame.empty:
-        frame = _generate_synthetic_minute_frame(normalized_symbols, trade_date)
-        source = "synthetic:fallback"
+        frame = pd.DataFrame(columns=["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"])
+        source = "empty"
 
     aggregated = _aggregate_minute_frame(frame, timeframe)
     if aggregated.empty:

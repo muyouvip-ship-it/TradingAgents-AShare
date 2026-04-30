@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -51,6 +52,7 @@ class HistoryMinuteSyncRequest(BaseModel):
     output_root: str | None = None
     file_format: str = Field(default="parquet", pattern="^(parquet|csv)$")
     import_db: bool = True
+    skip_export: bool = False
     database_url: str | None = None
     force: bool = False
     window_days: int = Field(default=365, ge=1)
@@ -62,6 +64,16 @@ class MinuteBarsRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     trade_date: str = Field(..., min_length=10)
     period: str = Field(default="1m", min_length=2)
+
+
+class QuoteRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+
+
+class DailyBarsRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    start_date: str = Field(..., min_length=10)
+    end_date: str = Field(..., min_length=10)
 
 
 def _bridge_token() -> str:
@@ -585,6 +597,43 @@ def _handle_history_progress_line(job_id: str, line: str) -> None:
         return
     if "retry symbol=" in line:
         _update_history_job(job_id, progress=30, message=line.replace("[qmt-minute-sync] ", ""))
+        return
+    if "error symbol=" in line or "symbol worker timeout" in line or "exceeded failed window limit" in line:
+        _update_history_job(job_id, progress=30, message=line.replace("[qmt-minute-sync] ", ""))
+
+
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            process.terminate()
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            return
+
+
+def _pipe_reader(stream_name: str, stream, output_queue: "queue.Queue[tuple[str, str | None]]") -> None:
+    try:
+        for raw_line in iter(stream.readline, ""):
+            if raw_line == "":
+                break
+            output_queue.put((stream_name, raw_line.rstrip("\r\n")))
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        output_queue.put((stream_name, None))
 
 
 def _run_history_minute_job(job_id: str, request: HistoryMinuteSyncRequest) -> None:
@@ -600,6 +649,7 @@ def _run_history_minute_job(job_id: str, request: HistoryMinuteSyncRequest) -> N
 
     command = [
         sys.executable,
+        "-u",
         str(script_path),
         "--period",
         request.period,
@@ -624,11 +674,14 @@ def _run_history_minute_job(job_id: str, request: HistoryMinuteSyncRequest) -> N
         command.extend(["--sector", request.sector])
     if request.import_db:
         command.extend(["--import-db", "--database-url", database_url])
+    if request.skip_export:
+        command.append("--skip-export")
     if request.force:
         command.append("--force")
 
     _update_history_job(job_id, status="running", progress=10, message="已启动 QMT 历史分钟线脚本，正在解析股票池", command=command, started_at=_now_iso())
     try:
+        silence_timeout = max(float(os.getenv("QMT_HISTORY_SCRIPT_SILENCE_TIMEOUT_SECONDS", "180") or 180), 30.0)
         process = subprocess.Popen(
             command,
             cwd=str(Path(__file__).resolve().parents[1]),
@@ -640,15 +693,45 @@ def _run_history_minute_job(job_id: str, request: HistoryMinuteSyncRequest) -> N
         )
         assert process.stdout is not None
         assert process.stderr is not None
-        for line in process.stdout:
-            line = line.strip()
-            if not line:
+        output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        reader_threads = [
+            threading.Thread(target=_pipe_reader, args=("stdout", process.stdout, output_queue), daemon=True),
+            threading.Thread(target=_pipe_reader, args=("stderr", process.stderr, output_queue), daemon=True),
+        ]
+        for thread in reader_threads:
+            thread.start()
+
+        open_streams = {"stdout", "stderr"}
+        stderr_lines: list[str] = []
+        last_output_at = time.monotonic()
+        while open_streams:
+            try:
+                stream_name, line = output_queue.get(timeout=1.0)
+            except queue.Empty:
+                if process.poll() is None and (time.monotonic() - last_output_at) >= silence_timeout:
+                    message = f"QMT 历史分钟线脚本静默超时 {int(silence_timeout)} 秒，已终止"
+                    _append_history_log(job_id, message)
+                    _kill_process_tree(process)
+                    _update_history_job(job_id, status="failed", progress=0, message=message, error=message, finished_at=_now_iso())
+                    return
+                if process.poll() is not None and not any(thread.is_alive() for thread in reader_threads):
+                    break
                 continue
-            _append_history_log(job_id, line)
-            _handle_history_progress_line(job_id, line)
-        stderr_text = process.stderr.read().strip()
-        if stderr_text:
-            _append_history_log(job_id, stderr_text)
+
+            if line is None:
+                open_streams.discard(stream_name)
+                continue
+
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            last_output_at = time.monotonic()
+            _append_history_log(job_id, cleaned)
+            _handle_history_progress_line(job_id, cleaned)
+            if stream_name == "stderr":
+                stderr_lines.append(cleaned)
+
+        stderr_text = "\n".join(stderr_lines).strip()
         returncode = process.wait()
         if returncode != 0:
             message = stderr_text or f"QMT 历史分钟线脚本失败，exit_code={returncode}"
@@ -699,6 +782,114 @@ def _read_history_window_light(xtdata: Any, symbol: str, period: str, start_time
         return reader(fields, [symbol], period, start_time, end_time, -1, "none", False)
 
 
+def _read_full_kline_light(xtdata: Any, symbol: str, period: str, start_time: str, end_time: str):
+    reader = getattr(xtdata, "get_full_kline", None)
+    if reader is None:
+        return None
+    try:
+        return reader(
+            field_list=["time", "open", "high", "low", "close", "volume", "amount"],
+            stock_list=[symbol],
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type="none",
+            fill_data=False,
+        )
+    except TypeError:
+        try:
+            return reader(
+                ["time", "open", "high", "low", "close", "volume", "amount"],
+                [symbol],
+                period,
+                start_time,
+                end_time,
+                -1,
+                "none",
+                False,
+            )
+        except TypeError:
+            return None
+
+
+def _extract_field_dict_frame_light(payload: Any, symbol: str):
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise RuntimeError(f"缺少 pandas: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        return None
+    required_fields = ["time", "open", "high", "low", "close"]
+    if not any(field in payload for field in required_fields):
+        return None
+
+    def _pick_series(frame_like: Any, candidates: list[str]):
+        if isinstance(frame_like, pd.Series):
+            return frame_like
+        if not isinstance(frame_like, pd.DataFrame):
+            if isinstance(frame_like, dict):
+                frame_like = pd.DataFrame(frame_like)
+            else:
+                return None
+        if frame_like.empty:
+            return None
+        for candidate in candidates:
+            if candidate in frame_like.index:
+                return frame_like.loc[candidate]
+            candidate_lower = candidate.lower()
+            for index_value in frame_like.index:
+                if str(index_value).strip().lower() == candidate_lower:
+                    return frame_like.loc[index_value]
+        if len(frame_like.index) == 1:
+            return frame_like.iloc[0]
+        return None
+
+    normalized = _normalize_symbol(symbol)
+    candidates = [
+        normalized,
+        symbol,
+        normalized.split(".")[0],
+        normalized.lower(),
+        symbol.lower(),
+        normalized.replace(".", ""),
+        normalized.replace(".", "").lower(),
+    ]
+    time_source = payload.get("time")
+    if time_source is None:
+        time_source = payload.get("trade_time")
+    open_source = payload.get("open")
+    base_source = open_source if open_source is not None else time_source
+    base_series = _pick_series(base_source, candidates)
+    if base_series is None:
+        return None
+
+    columns = list(base_series.index)
+    time_series = _pick_series(time_source, candidates)
+    if time_series is not None and len(time_series.index) == len(columns):
+        time_values = list(time_series.values)
+    else:
+        time_values = columns
+
+    rows: list[dict[str, Any]] = []
+    for idx, time_value in enumerate(time_values):
+        row: dict[str, Any] = {"time": time_value}
+        has_payload = False
+        for field in ("open", "high", "low", "close", "volume", "amount"):
+            series = _pick_series(payload.get(field), candidates)
+            value = None
+            if series is not None and idx < len(series):
+                value = series.iloc[idx]
+                has_payload = True
+            row[field] = value
+        if has_payload:
+            rows.append(row)
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
 def _extract_symbol_frame_light(payload: Any, symbol: str):
     try:
         import pandas as pd
@@ -709,6 +900,9 @@ def _extract_symbol_frame_light(payload: Any, symbol: str):
         return None
     if isinstance(payload, pd.DataFrame):
         return payload
+    field_dict_frame = _extract_field_dict_frame_light(payload, symbol)
+    if field_dict_frame is not None:
+        return field_dict_frame
     if isinstance(payload, dict):
         candidates = [symbol, _normalize_symbol(symbol), symbol.split(".")[0], symbol.lower(), _normalize_symbol(symbol).lower()]
         for key in candidates:
@@ -772,6 +966,15 @@ def _normalize_time_value_light(value: Any) -> datetime | None:
         return None
 
 
+def _safe_float_light(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value), 4)
+    except Exception:
+        return None
+
+
 def _normalize_history_frame_light(payload: Any, symbol: str):
     try:
         import pandas as pd
@@ -818,6 +1021,134 @@ def _normalize_history_frame_light(payload: Any, symbol: str):
     return data[["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
 
 
+def _normalize_quote_time_light(value: Any) -> str | None:
+    parsed = _normalize_time_value_light(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_quote_item(symbol: str, payload: Any) -> dict[str, Any]:
+    item = payload if isinstance(payload, dict) else {}
+    price = _safe_float_light(
+        item.get("lastPrice")
+        or item.get("last_price")
+        or item.get("price")
+        or item.get("last")
+        or item.get("close")
+    )
+    previous_close = _safe_float_light(
+        item.get("lastClose")
+        or item.get("last_close")
+        or item.get("preClose")
+        or item.get("prevClose")
+        or item.get("previous_close")
+    )
+    change = _safe_float_light(item.get("change"))
+    if change is None and price is not None and previous_close not in (None, 0):
+        change = round(price - float(previous_close), 4)
+    change_pct = _safe_float_light(item.get("change_pct") or item.get("pct_chg"))
+    if change_pct is None and change is not None and previous_close not in (None, 0):
+        change_pct = round(change / float(previous_close) * 100, 4)
+    return {
+        "symbol": symbol,
+        "price": price,
+        "open": _safe_float_light(item.get("open")),
+        "high": _safe_float_light(item.get("high")),
+        "low": _safe_float_light(item.get("low")),
+        "previous_close": previous_close,
+        "change": change,
+        "change_pct": change_pct,
+        "volume": _safe_float_light(item.get("volume")),
+        "amount": _safe_float_light(item.get("amount") or item.get("turnover")),
+        "quote_time": _normalize_quote_time_light(item.get("time") or item.get("timetag")),
+        "source": "qmt_bridge",
+    }
+
+
+def _query_quotes(symbols: list[str]) -> dict[str, Any]:
+    try:
+        from xtquant import xtdata
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"实时行情能力不可用: {exc}") from exc
+
+    normalized_symbols: list[str] = []
+    seen: set[str] = set()
+    for item in symbols:
+        normalized = _normalize_symbol(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_symbols.append(normalized)
+    if not normalized_symbols:
+        raise HTTPException(status_code=400, detail="symbols is required")
+
+    raw = xtdata.get_full_tick(normalized_symbols) or {}
+    items: list[dict[str, Any]] = []
+    for symbol in normalized_symbols:
+        item = raw.get(symbol) if isinstance(raw, dict) else None
+        normalized_item = _normalize_quote_item(symbol, item)
+        if normalized_item.get("price") is None:
+            continue
+        items.append(normalized_item)
+    return {
+        "success": True,
+        "symbols": normalized_symbols,
+        "items": items,
+        "rows": len(items),
+    }
+
+
+def _query_daily_bars(symbols: list[str], start_date: str, end_date: str) -> dict[str, Any]:
+    try:
+        from xtquant import xtdata
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"日线能力不可用: {exc}") from exc
+
+    normalized_symbols: list[str] = []
+    seen: set[str] = set()
+    for item in symbols:
+        normalized = _normalize_symbol(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_symbols.append(normalized)
+    if not normalized_symbols:
+        raise HTTPException(status_code=400, detail="symbols is required")
+
+    start_day = str(start_date or "").replace("-", "").strip()
+    end_day = str(end_date or "").replace("-", "").strip()
+    if len(start_day) != 8 or len(end_day) != 8 or (not start_day.isdigit()) or (not end_day.isdigit()):
+        raise HTTPException(status_code=400, detail="start_date / end_date 格式应为 YYYY-MM-DD")
+
+    items: list[dict[str, Any]] = []
+    symbol_rows: dict[str, int] = {}
+    for symbol in normalized_symbols:
+        try:
+            _download_history_window_light(xtdata, symbol, "1d", f"{start_day}000000", f"{end_day}235959")
+            raw = _read_history_window_light(xtdata, symbol, "1d", f"{start_day}000000", f"{end_day}235959")
+            frame = _normalize_history_frame_light(raw, symbol)
+            if frame.empty:
+                symbol_rows[symbol] = 0
+                continue
+            dumped = frame.copy()
+            dumped["trade_date"] = dumped["trade_time"].dt.strftime("%Y-%m-%d")
+            dumped["symbol"] = symbol
+            records = dumped[["symbol", "trade_date", "open", "high", "low", "close", "volume", "amount"]].to_dict("records")
+            symbol_rows[symbol] = len(records)
+            items.extend(records)
+        except Exception as exc:
+            _log(f"query daily bars failed symbol={symbol}: {exc}")
+            symbol_rows[symbol] = 0
+    return {
+        "success": True,
+        "symbols": normalized_symbols,
+        "start_date": start_date,
+        "end_date": end_date,
+        "items": items,
+        "symbol_rows": symbol_rows,
+        "rows": len(items),
+    }
+
+
 def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") -> dict[str, Any]:
     try:
         from xtquant import xtdata
@@ -842,11 +1173,18 @@ def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") 
 
     items: list[dict[str, Any]] = []
     symbol_rows: dict[str, int] = {}
+    symbol_errors: dict[str, dict[str, Any]] = {}
     for symbol in normalized_symbols:
         try:
             _download_history_window_light(xtdata, symbol, period, start_time, end_time)
             raw = _read_history_window_light(xtdata, symbol, period, start_time, end_time)
             frame = _normalize_history_frame_light(raw, symbol)
+            if frame.empty:
+                full_kline_raw = _read_full_kline_light(xtdata, symbol, period, start_time, end_time)
+                if full_kline_raw is not None:
+                    frame = _normalize_history_frame_light(full_kline_raw, symbol)
+                    if not frame.empty:
+                        _log(f"query minute bars fallback get_full_kline hit symbol={symbol} rows={len(frame)}")
             if frame.empty:
                 symbol_rows[symbol] = 0
                 continue
@@ -858,6 +1196,12 @@ def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") 
         except Exception as exc:
             _log(f"query minute bars failed symbol={symbol}: {exc}")
             symbol_rows[symbol] = 0
+            message = str(exc)
+            lower_message = message.lower()
+            symbol_errors[symbol] = {
+                "message": message,
+                "unsupported": "function not realize" in lower_message or "未支持此功能" in message or "errorid" in lower_message and "300000" in lower_message,
+            }
     return {
         "success": True,
         "trade_date": trade_date,
@@ -865,6 +1209,7 @@ def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") 
         "symbols": normalized_symbols,
         "items": items,
         "symbol_rows": symbol_rows,
+        "symbol_errors": symbol_errors,
         "rows": len(items),
     }
 
@@ -955,6 +1300,18 @@ def start_history_minute_sync(body: HistoryMinuteSyncRequest, authorization: str
     thread = threading.Thread(target=_run_history_minute_job, args=(job_id, body), daemon=True)
     thread.start()
     return _HISTORY_JOBS[job_id]
+
+
+@app.post("/market/quotes")
+def get_market_quotes(body: QuoteRequest, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    return _query_quotes(body.symbols)
+
+
+@app.post("/market/daily-bars")
+def get_market_daily_bars(body: DailyBarsRequest, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    return _query_daily_bars(body.symbols, body.start_date, body.end_date)
 
 
 @app.post("/market/minute-bars")
