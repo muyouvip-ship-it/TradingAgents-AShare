@@ -116,7 +116,9 @@ def create_risk_manager(llm, memory):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
             full_content += content
             if tracker:
-                tracker._emit_token("Risk Manager", "risk_report", content)
+                tracker._emit_token("Portfolio Manager", "final_trade_decision", content)
+        if tracker:
+            tracker.complete_agent("Portfolio Manager", analysis_stage="portfolio_decision")
         
         # ━━━ 提取决策 ━━━
         risk_level = _extract_risk_level(full_content)
@@ -125,6 +127,7 @@ def create_risk_manager(llm, memory):
         
         return {
             "risk_report": full_content,
+            "final_trade_decision": full_content,
             "risk_metrics": risk_metrics,
             "risk_level": risk_level,
             "position_suggestion": position_suggestion,

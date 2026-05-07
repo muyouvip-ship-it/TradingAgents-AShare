@@ -146,6 +146,15 @@ const initialAgents: Agent[] = [
     { id: 'portfolio_manager', name: 'Portfolio Manager', team: 'Portfolio Management', status: 'pending' },
 ]
 
+const AGENT_NAME_ALIASES: Record<string, string> = {
+    'Risk Judge': 'Portfolio Manager',
+    'Risk Manager': 'Portfolio Manager',
+}
+
+function normalizeAgentName(name: string): string {
+    return AGENT_NAME_ALIASES[name] ?? name
+}
+
 // Debounced localStorage storage to avoid blocking the main thread on every token
 function createDebouncedStorage(delay = 800) {
     let pending: [string, string] | null = null
@@ -196,7 +205,7 @@ export const useAnalysisStore = create<AnalysisState>()(persist((set) => ({
     streamingSections: {},
     milestones: [],
     debateMessages: {},
-        debateScrollTick: 0,
+    debateScrollTick: 0,
     chatMessages: createInitialChatMessages(),
     logs: [],
     isAnalyzing: false,
@@ -211,23 +220,30 @@ export const useAnalysisStore = create<AnalysisState>()(persist((set) => ({
 
     setJobStatus: (status) => set({ jobStatus: status }),
 
-    updateAgentStatus: (event) => set((state) => ({
-        agents: state.agents.map(agent => {
-            if (agent.name !== event.agent) return agent
-            const updates: Partial<Agent> = { status: event.status }
-            if (event.status === 'in_progress' && !agent.startedAt) updates.startedAt = Date.now()
-            if ((event.status === 'completed' || event.status === 'skipped') && !agent.finishedAt) updates.finishedAt = Date.now()
-            return { ...agent, ...updates }
-        })
-    })),
+    updateAgentStatus: (event) => set((state) => {
+        const eventAgent = normalizeAgentName(event.agent)
+        return {
+            agents: state.agents.map(agent => {
+                if (agent.name !== eventAgent) return agent
+                const updates: Partial<Agent> = { status: event.status }
+                if (event.status === 'in_progress' && !agent.startedAt) updates.startedAt = Date.now()
+                if ((event.status === 'completed' || event.status === 'skipped') && !agent.finishedAt) updates.finishedAt = Date.now()
+                return { ...agent, ...updates }
+            })
+        }
+    }),
 
     updateAgentSnapshot: (event) => set((state) => {
-        const agentMap = new Map(event.agents.map(a => [a.agent, a.status]))
+        const agentMap = new Map(event.agents.map(a => [normalizeAgentName(a.agent), a.status] as const))
         return {
-            agents: state.agents.map(agent => ({
-                ...agent,
-                status: agentMap.get(agent.name) || agent.status
-            }))
+            agents: state.agents.map(agent => {
+                const status = agentMap.get(agent.name)
+                if (!status) return agent
+                const updates: Partial<Agent> = { status }
+                if (status === 'in_progress' && !agent.startedAt) updates.startedAt = Date.now()
+                if ((status === 'completed' || status === 'skipped') && !agent.finishedAt) updates.finishedAt = Date.now()
+                return { ...agent, ...updates }
+            })
         }
     }),
 
@@ -497,7 +513,7 @@ export const useAnalysisStore = create<AnalysisState>()(persist((set) => ({
             agents: initialAgents.map(a => ({ ...a, status: 'pending' })),
             streamingSections: {},
             debateMessages: {},
-        debateScrollTick: 0,
+            debateScrollTick: 0,
             milestones: [],
             logs: [],
             isAnalyzing: false,

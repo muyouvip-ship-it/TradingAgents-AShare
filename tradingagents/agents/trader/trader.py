@@ -65,6 +65,8 @@ def create_trader(llm, memory):
             full_content += content
             if tracker:
                 tracker._emit_token("Trader", "trader_investment_plan", content)
+        if tracker:
+            tracker.complete_agent("Trader", analysis_stage="trade_planning")
 
         result = AIMessage(content=full_content)
         updated_feedback_state = dict(risk_feedback_state)

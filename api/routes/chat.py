@@ -686,6 +686,7 @@ def _section_definitions() -> list[tuple[str, str]]:
         ("Volume Price Analyst", "volume_price_report"),
         ("Research Manager", "investment_plan"),
         ("Trader", "trader_investment_plan"),
+        ("Portfolio Manager", "final_trade_decision"),
     ]
 
 

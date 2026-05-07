@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
 
-from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.agents.utils.agent_states import AgentState, current_tracker_var
 
 from .conditional_logic import ConditionalLogic
 
@@ -102,57 +102,63 @@ class GraphSetup:
         tool_nodes = {}
         done_nodes = {}
 
-        def analyst_done_node(_state):
-            return {}
+        def make_analyst_done_node(agent_name: str):
+            def analyst_done_node(_state):
+                tracker = current_tracker_var.get()
+                if tracker:
+                    tracker.complete_agent(agent_name)
+                return {}
+
+            return analyst_done_node
 
         if "market" in selected_analysts:
             analyst_nodes["market"] = factories["create_market_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["market"] = self.tool_nodes["market"]
-            done_nodes["market"] = analyst_done_node
+            done_nodes["market"] = make_analyst_done_node("Market Analyst")
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = factories["create_social_media_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["social"] = self.tool_nodes["social"]
-            done_nodes["social"] = analyst_done_node
+            done_nodes["social"] = make_analyst_done_node("Social Analyst")
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = factories["create_news_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["news"] = self.tool_nodes["news"]
-            done_nodes["news"] = analyst_done_node
+            done_nodes["news"] = make_analyst_done_node("News Analyst")
 
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = factories["create_fundamentals_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
-            done_nodes["fundamentals"] = analyst_done_node
+            done_nodes["fundamentals"] = make_analyst_done_node("Fundamentals Analyst")
 
         if "macro" in selected_analysts:
             analyst_nodes["macro"] = factories["create_macro_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["macro"] = self.tool_nodes["macro"]
-            done_nodes["macro"] = analyst_done_node
+            done_nodes["macro"] = make_analyst_done_node("Macro Analyst")
 
         if "smart_money" in selected_analysts:
             analyst_nodes["smart_money"] = factories["create_smart_money_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["smart_money"] = self.tool_nodes["smart_money"]
-            done_nodes["smart_money"] = analyst_done_node
+            done_nodes["smart_money"] = make_analyst_done_node("Smart Money Analyst")
 
         if "volume_price" in selected_analysts:
             analyst_nodes["volume_price"] = factories["create_volume_price_analyst"](
                 self.quick_thinking_llm, self.data_collector
             )
             tool_nodes["volume_price"] = self.tool_nodes["volume_price"]
-            done_nodes["volume_price"] = analyst_done_node
+            done_nodes["volume_price"] = make_analyst_done_node("Volume Price Analyst")
 
         # Create researcher and manager nodes
         bull_researcher_node = factories["create_bull_researcher"](

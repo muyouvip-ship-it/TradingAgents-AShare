@@ -66,10 +66,11 @@ class AgentProgressTracker:
         if not token:
             return
         report_key = (agent, report)
-        if report_key not in self._started_reports:
-            self._started_reports.add(report_key)
+        if self.status.get(agent) != "in_progress":
             self._set_status(agent, "in_progress")
             self._emit("agent.status", {"agent": agent, "status": "in_progress"})
+        if report_key not in self._started_reports:
+            self._started_reports.add(report_key)
         self.has_streamed_content = True
         self.current_agent = agent
         self.current_stage = "streaming_report"
@@ -81,6 +82,9 @@ class AgentProgressTracker:
     def emit_debate_token(self, debate: str, agent: str, round_num: int, token: str) -> None:
         if not token:
             return
+        if self.status.get(agent) != "in_progress":
+            self._set_status(agent, "in_progress")
+            self._emit("agent.status", {"agent": agent, "status": "in_progress"})
         self.has_streamed_content = True
         self.current_agent = agent
         self.current_stage = "debating"
@@ -112,6 +116,7 @@ class AgentProgressTracker:
         is_verdict: bool = False,
     ) -> None:
         if not content:
+            self.complete_agent(agent, analysis_stage="research_debate" if debate == "research" else "risk_debate")
             return
         self.has_streamed_content = True
         self.current_agent = agent
@@ -134,6 +139,7 @@ class AgentProgressTracker:
                 "is_verdict": is_verdict,
             },
         )
+        self.complete_agent(agent, analysis_stage=self.analysis_stage)
 
     def finalize_report(self, agent: str, section: str, content: str) -> list[tuple[str, dict[str, Any]]]:
         if not content or section in self._completed_reports:
@@ -154,6 +160,17 @@ class AgentProgressTracker:
         events.append(("agent.status", {"agent": agent, "status": "completed"}))
         self._completed_reports.add(section)
         return events
+
+    def complete_agent(self, agent: str, analysis_stage: str | None = None) -> None:
+        if not agent or self.status.get(agent) == "completed":
+            return
+        self.status[agent] = "completed"
+        self.current_agent = agent
+        self.current_stage = "agent_completed"
+        if analysis_stage is not None:
+            self.analysis_stage = analysis_stage
+        self._notify()
+        self._emit("agent.status", {"agent": agent, "status": "completed"})
 
     def mark_stage(self, current_stage: str, analysis_stage: str, current_agent: str | None = None) -> None:
         self.current_stage = current_stage
@@ -177,6 +194,9 @@ class AgentProgressTracker:
             "smart_money_report": "smart_money_analysis",
             "volume_price_report": "volume_price_analysis",
             "investment_plan": "research_synthesis",
+            "investment_debate_state": "research_debate",
             "trader_investment_plan": "trade_planning",
+            "risk_debate_state": "risk_debate",
+            "final_trade_decision": "portfolio_decision",
         }
         return mapping.get(report, "analysis")
