@@ -1,21 +1,16 @@
 """Test watchlist and scheduled analysis services."""
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
+from tests.postgres_test_utils import isolated_postgres_session
 from api.database import Base
 from api.services import watchlist_service, scheduled_service
 
 
 @pytest.fixture
 def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-    yield session
-    session.close()
+    with isolated_postgres_session(Base, schema_prefix="ta_watchlist") as session:
+        yield session
 
 
 class TestWatchlist:

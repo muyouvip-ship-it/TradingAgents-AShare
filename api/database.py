@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 from datetime import datetime, timezone
 from typing import Generator
 
@@ -16,15 +15,14 @@ load_project_env()
 # Database URL - PostgreSQL only
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "sqlite:///./app.db" if "pytest" in sys.modules else "postgresql://localhost/trading_agents"
-
-IS_SQLITE = DATABASE_URL.startswith("sqlite")
+    raise RuntimeError("DATABASE_URL is required. This project now supports PostgreSQL only.")
+if not (DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("postgres://")):
+    raise RuntimeError("DATABASE_URL must point to PostgreSQL.")
 
 # Create engine
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    connect_args={"check_same_thread": False} if IS_SQLITE else {},
 )
 
 # Session factory
@@ -33,20 +31,15 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Base class for models
 Base = declarative_base()
 logger = logging.getLogger(__name__)
-_sqlite_schema_ready = False
+_init_db_completed_for: str | None = None
 
 
-def _ensure_sqlite_schema_ready() -> None:
-    global _sqlite_schema_ready
-    if not IS_SQLITE or _sqlite_schema_ready:
-        return
-    init_db()
-    _sqlite_schema_ready = True
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_db() -> Generator[Session, None, None]:
     """Get database session (for FastAPI Depends)."""
-    _ensure_sqlite_schema_ready()
     db = SessionLocal()
     try:
         yield db
@@ -66,7 +59,6 @@ class get_db_ctx:
         self.db: Session | None = None
 
     def __enter__(self) -> Session:
-        _ensure_sqlite_schema_ready()
         self.db = SessionLocal()
         return self.db
 
@@ -77,13 +69,23 @@ class get_db_ctx:
             self.db.close()
 
 
-def init_db() -> None:
+def init_db(*, force: bool = False) -> None:
     """Initialize database tables."""
+    global _init_db_completed_for
+    if _env_flag("TA_SKIP_STARTUP_DDL", "0") and not force:
+        logger.info("Database schema initialization skipped by TA_SKIP_STARTUP_DDL.")
+        return
+    init_signature = str(engine.url)
+    if not force and _init_db_completed_for == init_signature:
+        return
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_daily_review_schema()
     _ensure_market_data_schema()
+    _ensure_market_data_pipeline_schema()
     _ensure_backtest_data_schema()
+    _init_db_completed_for = init_signature
 
 
 def _ensure_market_data_schema() -> None:
@@ -91,145 +93,605 @@ def _ensure_market_data_schema() -> None:
     try:
         with engine.begin() as conn:
             inspector = inspect(engine)
-            if IS_SQLITE:
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS index_daily_kline (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        symbol VARCHAR(20) NOT NULL,
-                        trade_date DATE NOT NULL,
-                        open DOUBLE,
-                        high DOUBLE,
-                        low DOUBLE,
-                        close DOUBLE,
-                        volume DOUBLE,
-                        amount DOUBLE,
-                        source VARCHAR(32) DEFAULT 'qmt',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """))
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS index_minute_kline (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        symbol VARCHAR(20) NOT NULL,
-                        trade_time TIMESTAMP NOT NULL,
-                        open DOUBLE,
-                        high DOUBLE,
-                        low DOUBLE,
-                        close DOUBLE,
-                        volume BIGINT,
-                        amount DOUBLE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """))
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
-                if inspector.has_table("stock_minute_kline"):
-                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
-            else:
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS index_daily_kline (
-                        id BIGSERIAL PRIMARY KEY,
-                        symbol VARCHAR(20) NOT NULL,
-                        trade_date DATE NOT NULL,
-                        open DOUBLE PRECISION,
-                        high DOUBLE PRECISION,
-                        low DOUBLE PRECISION,
-                        close DOUBLE PRECISION,
-                        volume DOUBLE PRECISION,
-                        amount DOUBLE PRECISION,
-                        source VARCHAR(32) DEFAULT 'qmt',
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW()
-                    )
-                """))
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS index_minute_kline (
-                        id BIGSERIAL PRIMARY KEY,
-                        symbol VARCHAR(20) NOT NULL,
-                        trade_time TIMESTAMP NOT NULL,
-                        open DOUBLE PRECISION,
-                        high DOUBLE PRECISION,
-                        low DOUBLE PRECISION,
-                        close DOUBLE PRECISION,
-                        volume BIGINT,
-                        amount DOUBLE PRECISION,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW()
-                    )
-                """))
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
-                if inspector.has_table("stock_minute_kline"):
-                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_daily_kline (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    amount DOUBLE PRECISION,
+                    turnover_rate DOUBLE PRECISION,
+                    pre_close DOUBLE PRECISION,
+                    float_market_cap DOUBLE PRECISION,
+                    total_market_cap DOUBLE PRECISION,
+                    net_profit_ttm DOUBLE PRECISION,
+                    sw_industry_l1 VARCHAR(128),
+                    sw_industry_l2 VARCHAR(128),
+                    sw_industry_l3 VARCHAR(128),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_minute_kline (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_time TIMESTAMP NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume BIGINT,
+                    amount DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS index_daily_kline (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    amount DOUBLE PRECISION,
+                    source VARCHAR(32) DEFAULT 'qmt',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS index_minute_kline (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_time TIMESTAMP NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume BIGINT,
+                    amount DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_daily_kline_symbol_date ON stock_daily_kline(symbol, trade_date)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
+            if inspector.has_table("stock_minute_kline"):
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
             current_inspector = inspect(conn)
+            if current_inspector.has_table("stock_daily_kline"):
+                stock_daily_columns = {column["name"] for column in current_inspector.get_columns("stock_daily_kline")}
+                for column_name, ddl in (
+                    ("turnover_rate", "ALTER TABLE stock_daily_kline ADD COLUMN turnover_rate DOUBLE PRECISION"),
+                    ("pre_close", "ALTER TABLE stock_daily_kline ADD COLUMN pre_close DOUBLE PRECISION"),
+                    ("float_market_cap", "ALTER TABLE stock_daily_kline ADD COLUMN float_market_cap DOUBLE PRECISION"),
+                    ("total_market_cap", "ALTER TABLE stock_daily_kline ADD COLUMN total_market_cap DOUBLE PRECISION"),
+                    ("net_profit_ttm", "ALTER TABLE stock_daily_kline ADD COLUMN net_profit_ttm DOUBLE PRECISION"),
+                    ("cash_flow_ttm", "ALTER TABLE stock_daily_kline ADD COLUMN cash_flow_ttm DOUBLE PRECISION"),
+                    ("net_assets", "ALTER TABLE stock_daily_kline ADD COLUMN net_assets DOUBLE PRECISION"),
+                    ("total_assets", "ALTER TABLE stock_daily_kline ADD COLUMN total_assets DOUBLE PRECISION"),
+                    ("total_liabilities", "ALTER TABLE stock_daily_kline ADD COLUMN total_liabilities DOUBLE PRECISION"),
+                    ("net_profit_quarter", "ALTER TABLE stock_daily_kline ADD COLUMN net_profit_quarter DOUBLE PRECISION"),
+                    ("medium_buy", "ALTER TABLE stock_daily_kline ADD COLUMN medium_buy DOUBLE PRECISION"),
+                    ("medium_sell", "ALTER TABLE stock_daily_kline ADD COLUMN medium_sell DOUBLE PRECISION"),
+                    ("large_buy", "ALTER TABLE stock_daily_kline ADD COLUMN large_buy DOUBLE PRECISION"),
+                    ("large_sell", "ALTER TABLE stock_daily_kline ADD COLUMN large_sell DOUBLE PRECISION"),
+                    ("retail_buy", "ALTER TABLE stock_daily_kline ADD COLUMN retail_buy DOUBLE PRECISION"),
+                    ("retail_sell", "ALTER TABLE stock_daily_kline ADD COLUMN retail_sell DOUBLE PRECISION"),
+                    ("institution_buy", "ALTER TABLE stock_daily_kline ADD COLUMN institution_buy DOUBLE PRECISION"),
+                    ("institution_sell", "ALTER TABLE stock_daily_kline ADD COLUMN institution_sell DOUBLE PRECISION"),
+                    ("is_hs300", "ALTER TABLE stock_daily_kline ADD COLUMN is_hs300 BOOLEAN DEFAULT FALSE"),
+                    ("is_sz50", "ALTER TABLE stock_daily_kline ADD COLUMN is_sz50 BOOLEAN DEFAULT FALSE"),
+                    ("is_zz500", "ALTER TABLE stock_daily_kline ADD COLUMN is_zz500 BOOLEAN DEFAULT FALSE"),
+                    ("is_zz1000", "ALTER TABLE stock_daily_kline ADD COLUMN is_zz1000 BOOLEAN DEFAULT FALSE"),
+                    ("is_zz2000", "ALTER TABLE stock_daily_kline ADD COLUMN is_zz2000 BOOLEAN DEFAULT FALSE"),
+                    ("is_cyb", "ALTER TABLE stock_daily_kline ADD COLUMN is_cyb BOOLEAN DEFAULT FALSE"),
+                    ("sw_industry_l1", "ALTER TABLE stock_daily_kline ADD COLUMN sw_industry_l1 VARCHAR(128)"),
+                    ("sw_industry_l2", "ALTER TABLE stock_daily_kline ADD COLUMN sw_industry_l2 VARCHAR(128)"),
+                    ("sw_industry_l3", "ALTER TABLE stock_daily_kline ADD COLUMN sw_industry_l3 VARCHAR(128)"),
+                    ("close_0935", "ALTER TABLE stock_daily_kline ADD COLUMN close_0935 DOUBLE PRECISION"),
+                    ("close_0945", "ALTER TABLE stock_daily_kline ADD COLUMN close_0945 DOUBLE PRECISION"),
+                    ("close_0955", "ALTER TABLE stock_daily_kline ADD COLUMN close_0955 DOUBLE PRECISION"),
+                    ("created_at", "ALTER TABLE stock_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"),
+                    ("updated_at", "ALTER TABLE stock_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"),
+                ):
+                    if column_name not in stock_daily_columns:
+                        conn.execute(text(ddl))
             if current_inspector.has_table("index_daily_kline"):
                 index_daily_columns = {column["name"] for column in current_inspector.get_columns("index_daily_kline")}
                 if "source" not in index_daily_columns:
-                    conn.execute(text(
-                        "ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"
-                        if IS_SQLITE
-                        else "ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"
-                    ))
+                    conn.execute(text("ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"))
                 if "created_at" not in index_daily_columns:
-                    conn.execute(text(
-                        "ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
                 if "updated_at" not in index_daily_columns:
-                    conn.execute(text(
-                        "ALTER TABLE index_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE index_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE index_daily_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"))
             if current_inspector.has_table("index_minute_kline"):
                 index_minute_columns = {column["name"] for column in current_inspector.get_columns("index_minute_kline")}
                 if "created_at" not in index_minute_columns:
-                    conn.execute(text(
-                        "ALTER TABLE index_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE index_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE index_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
                 if "updated_at" not in index_minute_columns:
-                    conn.execute(text(
-                        "ALTER TABLE index_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE index_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE index_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"))
             if current_inspector.has_table("stock_minute_kline"):
                 stock_minute_columns = {column["name"] for column in current_inspector.get_columns("stock_minute_kline")}
                 if "created_at" not in stock_minute_columns:
-                    conn.execute(text(
-                        "ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
                 if "updated_at" not in stock_minute_columns:
-                    conn.execute(text(
-                        "ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                        if IS_SQLITE
-                        else "ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"
-                    ))
+                    conn.execute(text("ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"))
     except Exception as e:
         logger.error("Failed to ensure market data schema: %s", e)
 
 
-def _ensure_report_schema() -> None:
-    """Add lightweight columns for existing SQLite deployments without migrations."""
+def _ensure_market_data_pipeline_schema() -> None:
+    """Ensure raw/normalized/published/reconciliation market data tables exist."""
     try:
         with engine.begin() as conn:
-            if IS_SQLITE:
-                columns = {row[1] for row in conn.execute(text("PRAGMA table_info(reports)"))}
-            else:
-                # PostgreSQL使用information_schema
-                result = conn.execute(text("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'reports' AND table_schema = 'public'
+            daily_raw_tables = [
+                "raw_stock_daily_kline_postgresql",
+                "raw_stock_daily_kline_quantclass",
+                "raw_stock_daily_kline_akshare",
+                "raw_stock_daily_kline_baostock",
+                "raw_stock_daily_kline_efinance",
+            ]
+            minute_raw_tables = [
+                "raw_stock_minute_kline_postgresql",
+                "raw_stock_minute_kline_qmt",
+                "raw_stock_minute_kline_tdx",
+                "raw_stock_minute_kline_akshare",
+            ]
+            timestamp_default = "CURRENT_TIMESTAMP"
+            float_type = "DOUBLE PRECISION"
+            bigint_type = "BIGINT"
+            text_json_type = "TEXT"
+            id_type = "BIGSERIAL PRIMARY KEY"
+
+            for table_name in daily_raw_tables:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        id {id_type},
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_date DATE NOT NULL,
+                        open {float_type},
+                        high {float_type},
+                        low {float_type},
+                        close {float_type},
+                        volume {float_type},
+                        amount {float_type},
+                        turnover_rate {float_type},
+                        pre_close {float_type},
+                        float_market_cap {float_type},
+                        total_market_cap {float_type},
+                        net_profit_ttm {float_type},
+                        sw_industry_l1 VARCHAR(128),
+                        sw_industry_l2 VARCHAR(128),
+                        sw_industry_l3 VARCHAR(128),
+                        batch_id VARCHAR(64),
+                        fetched_at TIMESTAMP DEFAULT {timestamp_default},
+                        created_at TIMESTAMP DEFAULT {timestamp_default},
+                        updated_at TIMESTAMP DEFAULT {timestamp_default}
+                    )
                 """))
-                columns = {row[0] for row in result}
+                conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table_name}_symbol_date ON {table_name}(symbol, trade_date)"))
+
+            for table_name in minute_raw_tables:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        id {id_type},
+                        symbol VARCHAR(20) NOT NULL,
+                        trade_time TIMESTAMP NOT NULL,
+                        trade_date DATE NOT NULL,
+                        open {float_type},
+                        high {float_type},
+                        low {float_type},
+                        close {float_type},
+                        volume {float_type},
+                        amount {float_type},
+                        batch_id VARCHAR(64),
+                        fetched_at TIMESTAMP DEFAULT {timestamp_default},
+                        created_at TIMESTAMP DEFAULT {timestamp_default},
+                        updated_at TIMESTAMP DEFAULT {timestamp_default}
+                    )
+                """))
+                conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table_name}_symbol_time ON {table_name}(symbol, trade_time)"))
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_trade_date ON {table_name}(trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS norm_stock_daily_kline (
+                    id {id_type},
+                    source VARCHAR(32) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open {float_type},
+                    high {float_type},
+                    low {float_type},
+                    close {float_type},
+                    volume {float_type},
+                    amount {float_type},
+                    turnover_rate {float_type},
+                    pre_close {float_type},
+                    float_market_cap {float_type},
+                    total_market_cap {float_type},
+                    net_profit_ttm {float_type},
+                    sw_industry_l1 VARCHAR(128),
+                    sw_industry_l2 VARCHAR(128),
+                    sw_industry_l3 VARCHAR(128),
+                    batch_id VARCHAR(64),
+                    fetched_at TIMESTAMP DEFAULT {timestamp_default},
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_norm_stock_daily_source_symbol_date ON norm_stock_daily_kline(source, symbol, trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS norm_stock_minute_kline (
+                    id {id_type},
+                    source VARCHAR(32) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_time TIMESTAMP NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open {float_type},
+                    high {float_type},
+                    low {float_type},
+                    close {float_type},
+                    volume {float_type},
+                    amount {float_type},
+                    batch_id VARCHAR(64),
+                    fetched_at TIMESTAMP DEFAULT {timestamp_default},
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_norm_stock_minute_source_symbol_time ON norm_stock_minute_kline(source, symbol, trade_time)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_norm_stock_minute_trade_date ON norm_stock_minute_kline(trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS pub_stock_daily_kline (
+                    id {id_type},
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open {float_type},
+                    high {float_type},
+                    low {float_type},
+                    close {float_type},
+                    volume {float_type},
+                    amount {float_type},
+                    turnover_rate {float_type},
+                    pre_close {float_type},
+                    float_market_cap {float_type},
+                    total_market_cap {float_type},
+                    net_profit_ttm {float_type},
+                    sw_industry_l1 VARCHAR(128),
+                    sw_industry_l2 VARCHAR(128),
+                    sw_industry_l3 VARCHAR(128),
+                    source VARCHAR(32),
+                    source_summary {text_json_type},
+                    quality_status VARCHAR(32),
+                    publish_status VARCHAR(32),
+                    freshness_status VARCHAR(32),
+                    coverage_ratio {float_type},
+                    validation_sources TEXT,
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_pub_stock_daily_symbol_date ON pub_stock_daily_kline(symbol, trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS pub_stock_minute_kline (
+                    id {id_type},
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_time TIMESTAMP NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open {float_type},
+                    high {float_type},
+                    low {float_type},
+                    close {float_type},
+                    volume {float_type},
+                    amount {float_type},
+                    primary_source VARCHAR(32),
+                    source_mix TEXT,
+                    quality_status VARCHAR(32),
+                    publish_status VARCHAR(32),
+                    freshness_status VARCHAR(32),
+                    coverage_ratio {float_type},
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_pub_stock_minute_symbol_time ON pub_stock_minute_kline(symbol, trade_time)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_pub_stock_minute_trade_date ON pub_stock_minute_kline(trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS daily_kline_reconciliation_runs (
+                    id {id_type},
+                    run_id VARCHAR(64) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    published_count INTEGER DEFAULT 0,
+                    warning_count INTEGER DEFAULT 0,
+                    missing_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_kline_reconciliation_run_id ON daily_kline_reconciliation_runs(run_id)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS daily_kline_reconciliation_items (
+                    id {id_type},
+                    run_id VARCHAR(64) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    chosen_source VARCHAR(32),
+                    publish_status VARCHAR(32),
+                    quality_status VARCHAR(32),
+                    coverage_ratio {float_type},
+                    issues {text_json_type},
+                    source_summary {text_json_type},
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_kline_reconciliation_item_key ON daily_kline_reconciliation_items(run_id, symbol, trade_date)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS minute_kline_reconciliation_runs (
+                    id {id_type},
+                    run_id VARCHAR(64) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    published_count INTEGER DEFAULT 0,
+                    warning_count INTEGER DEFAULT 0,
+                    missing_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_minute_kline_reconciliation_run_id ON minute_kline_reconciliation_runs(run_id)"))
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS minute_kline_reconciliation_items (
+                    id {id_type},
+                    run_id VARCHAR(64) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    chosen_source VARCHAR(32),
+                    publish_status VARCHAR(32),
+                    quality_status VARCHAR(32),
+                    coverage_ratio {float_type},
+                    expected_bars INTEGER DEFAULT 0,
+                    actual_bars INTEGER DEFAULT 0,
+                    missing_times {text_json_type},
+                    issues {text_json_type},
+                    source_summary {text_json_type},
+                    created_at TIMESTAMP DEFAULT {timestamp_default},
+                    updated_at TIMESTAMP DEFAULT {timestamp_default}
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_minute_kline_reconciliation_item_key ON minute_kline_reconciliation_items(run_id, symbol, trade_date)"))
+
+            inspector = inspect(conn)
+            daily_enrichment_columns = (
+                ("float_market_cap", f"ALTER TABLE {{table_name}} ADD COLUMN float_market_cap {float_type}"),
+                ("total_market_cap", f"ALTER TABLE {{table_name}} ADD COLUMN total_market_cap {float_type}"),
+                ("net_profit_ttm", f"ALTER TABLE {{table_name}} ADD COLUMN net_profit_ttm {float_type}"),
+                ("sw_industry_l1", "ALTER TABLE {table_name} ADD COLUMN sw_industry_l1 VARCHAR(128)"),
+                ("sw_industry_l2", "ALTER TABLE {table_name} ADD COLUMN sw_industry_l2 VARCHAR(128)"),
+                ("sw_industry_l3", "ALTER TABLE {table_name} ADD COLUMN sw_industry_l3 VARCHAR(128)"),
+            )
+            for table_name in [*daily_raw_tables, "norm_stock_daily_kline"]:
+                if inspector.has_table(table_name):
+                    existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+                    for column_name, ddl_template in daily_enrichment_columns:
+                        if column_name not in existing_columns:
+                            conn.execute(text(ddl_template.format(table_name=table_name)))
+            if inspector.has_table("pub_stock_daily_kline"):
+                pub_daily_columns = {column["name"] for column in inspector.get_columns("pub_stock_daily_kline")}
+                for column_name, ddl in (
+                    ("float_market_cap", f"ALTER TABLE pub_stock_daily_kline ADD COLUMN float_market_cap {float_type}"),
+                    ("total_market_cap", f"ALTER TABLE pub_stock_daily_kline ADD COLUMN total_market_cap {float_type}"),
+                    ("net_profit_ttm", f"ALTER TABLE pub_stock_daily_kline ADD COLUMN net_profit_ttm {float_type}"),
+                    ("sw_industry_l1", "ALTER TABLE pub_stock_daily_kline ADD COLUMN sw_industry_l1 VARCHAR(128)"),
+                    ("sw_industry_l2", "ALTER TABLE pub_stock_daily_kline ADD COLUMN sw_industry_l2 VARCHAR(128)"),
+                    ("sw_industry_l3", "ALTER TABLE pub_stock_daily_kline ADD COLUMN sw_industry_l3 VARCHAR(128)"),
+                ):
+                    if column_name not in pub_daily_columns:
+                        conn.execute(text(ddl))
+            _ensure_market_data_increment_views(conn)
+    except Exception as e:
+        logger.error("Failed to ensure market data pipeline schema: %s", e)
+
+
+def _ensure_market_data_increment_views(conn) -> None:
+    """Expose legacy K-line tables plus incremental published rows without mutating legacy data."""
+    conn.execute(text("DROP VIEW IF EXISTS market_stock_daily_kline"))
+    conn.execute(text("DROP VIEW IF EXISTS market_stock_minute_kline"))
+    false_expr = "'false'"
+    pub_daily_symbol_key = "split_part(p.symbol, '.', 1)"
+    legacy_daily_symbol_key = "split_part(s.symbol, '.', 1)"
+    pub_minute_symbol_key = pub_daily_symbol_key
+    legacy_minute_symbol_key = legacy_daily_symbol_key
+
+    conn.execute(text(f"""
+        CREATE VIEW market_stock_daily_kline AS
+        SELECT
+            -p.id AS id,
+            p.symbol,
+            p.trade_date,
+            p.open,
+            p.high,
+            p.low,
+            p.close,
+            p.volume,
+            p.amount,
+            p.turnover_rate,
+            p.created_at,
+            p.updated_at,
+            p.pre_close,
+            p.float_market_cap,
+            p.total_market_cap,
+            p.net_profit_ttm,
+            CAST(NULL AS DOUBLE PRECISION) AS cash_flow_ttm,
+            CAST(NULL AS DOUBLE PRECISION) AS net_assets,
+            CAST(NULL AS DOUBLE PRECISION) AS total_assets,
+            CAST(NULL AS DOUBLE PRECISION) AS total_liabilities,
+            CAST(NULL AS DOUBLE PRECISION) AS net_profit_quarter,
+            CAST(NULL AS DOUBLE PRECISION) AS medium_buy,
+            CAST(NULL AS DOUBLE PRECISION) AS medium_sell,
+            CAST(NULL AS DOUBLE PRECISION) AS large_buy,
+            CAST(NULL AS DOUBLE PRECISION) AS large_sell,
+            CAST(NULL AS DOUBLE PRECISION) AS retail_buy,
+            CAST(NULL AS DOUBLE PRECISION) AS retail_sell,
+            CAST(NULL AS DOUBLE PRECISION) AS institution_buy,
+            CAST(NULL AS DOUBLE PRECISION) AS institution_sell,
+            CAST({false_expr} AS VARCHAR) AS is_hs300,
+            CAST({false_expr} AS VARCHAR) AS is_sz50,
+            CAST({false_expr} AS VARCHAR) AS is_zz500,
+            CAST({false_expr} AS VARCHAR) AS is_zz1000,
+            CAST({false_expr} AS VARCHAR) AS is_zz2000,
+            CAST({false_expr} AS VARCHAR) AS is_cyb,
+            p.sw_industry_l1,
+            p.sw_industry_l2,
+            p.sw_industry_l3,
+            CAST(NULL AS DOUBLE PRECISION) AS close_0935,
+            CAST(NULL AS DOUBLE PRECISION) AS close_0945,
+            CAST(NULL AS DOUBLE PRECISION) AS close_0955,
+            p.source,
+            p.source_summary,
+            p.quality_status,
+            p.publish_status,
+            p.freshness_status,
+            p.coverage_ratio,
+            p.validation_sources
+        FROM pub_stock_daily_kline p
+        UNION ALL
+        SELECT
+            s.id,
+            s.symbol,
+            s.trade_date,
+            s.open,
+            s.high,
+            s.low,
+            s.close,
+            s.volume,
+            s.amount,
+            s.turnover_rate,
+            s.created_at,
+            s.updated_at,
+            s.pre_close,
+            s.float_market_cap,
+            s.total_market_cap,
+            s.net_profit_ttm,
+            s.cash_flow_ttm,
+            s.net_assets,
+            s.total_assets,
+            s.total_liabilities,
+            s.net_profit_quarter,
+            s.medium_buy,
+            s.medium_sell,
+            s.large_buy,
+            s.large_sell,
+            s.retail_buy,
+            s.retail_sell,
+            s.institution_buy,
+            s.institution_sell,
+            CAST(s.is_hs300 AS VARCHAR) AS is_hs300,
+            CAST(s.is_sz50 AS VARCHAR) AS is_sz50,
+            CAST(s.is_zz500 AS VARCHAR) AS is_zz500,
+            CAST(s.is_zz1000 AS VARCHAR) AS is_zz1000,
+            CAST(s.is_zz2000 AS VARCHAR) AS is_zz2000,
+            CAST(s.is_cyb AS VARCHAR) AS is_cyb,
+            s.sw_industry_l1,
+            s.sw_industry_l2,
+            s.sw_industry_l3,
+            s.close_0935,
+            s.close_0945,
+            s.close_0955,
+            'postgresql' AS source,
+            '{{"source_mix":["postgresql"],"legacy_table":"stock_daily_kline"}}' AS source_summary,
+            'legacy' AS quality_status,
+            'legacy' AS publish_status,
+            'historical' AS freshness_status,
+            1.0 AS coverage_ratio,
+            'postgresql' AS validation_sources
+        FROM stock_daily_kline s
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM pub_stock_daily_kline p
+            WHERE {pub_daily_symbol_key} = {legacy_daily_symbol_key}
+              AND p.trade_date = s.trade_date
+        )
+    """))
+
+    conn.execute(text(f"""
+        CREATE VIEW market_stock_minute_kline AS
+        SELECT
+            -p.id AS id,
+            p.symbol,
+            p.trade_time,
+            p.trade_date,
+            p.open,
+            p.high,
+            p.low,
+            p.close,
+            p.volume,
+            p.amount,
+            p.created_at,
+            p.updated_at,
+            p.primary_source,
+            p.source_mix,
+            p.quality_status,
+            p.publish_status,
+            p.freshness_status,
+            p.coverage_ratio
+        FROM pub_stock_minute_kline p
+        UNION ALL
+        SELECT
+            s.id,
+            s.symbol,
+            s.trade_time,
+            DATE(s.trade_time) AS trade_date,
+            s.open,
+            s.high,
+            s.low,
+            s.close,
+            s.volume,
+            s.amount,
+            s.created_at,
+            s.updated_at,
+            'postgresql' AS primary_source,
+            'postgresql' AS source_mix,
+            'legacy' AS quality_status,
+            'legacy' AS publish_status,
+            'historical' AS freshness_status,
+            1.0 AS coverage_ratio
+        FROM stock_minute_kline s
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM pub_stock_minute_kline p
+            WHERE {pub_minute_symbol_key} = {legacy_minute_symbol_key}
+              AND p.trade_time = s.trade_time
+        )
+    """))
+
+
+def _ensure_report_schema() -> None:
+    """Add lightweight report columns for existing deployments without migrations."""
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'reports' AND table_schema = 'public'
+            """))
+            columns = {row[0] for row in result}
             
             if "direction" not in columns:
                 conn.execute(text("ALTER TABLE reports ADD COLUMN direction VARCHAR(50)"))
@@ -252,27 +714,22 @@ def _ensure_report_schema() -> None:
 
 
 def _ensure_user_schema() -> None:
-    """Add columns to users table for existing SQLite deployments without migrations."""
+    """Add user columns for existing deployments without migrations."""
     try:
         with engine.begin() as conn:
-            if IS_SQLITE:
-                columns = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
-                llm_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(user_llm_configs)"))}
-            else:
-                # PostgreSQL使用information_schema
-                user_result = conn.execute(text("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'users' AND table_schema = 'public'
-                """))
-                columns = {row[0] for row in user_result}
+            user_result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'users' AND table_schema = 'public'
+            """))
+            columns = {row[0] for row in user_result}
 
-                llm_result = conn.execute(text("""
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_name = 'user_llm_configs' AND table_schema = 'public'
-                """))
-                llm_columns = {row[0] for row in llm_result}
+            llm_result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'user_llm_configs' AND table_schema = 'public'
+            """))
+            llm_columns = {row[0] for row in llm_result}
             
             if "last_login_ip" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45)"))
@@ -288,6 +745,14 @@ def _ensure_user_schema() -> None:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN qmt_paper_account_config TEXT"))
             if "qmt_live_account_config" not in llm_columns:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN qmt_live_account_config TEXT"))
+            if "news_llm_provider" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN news_llm_provider VARCHAR(50)"))
+            if "news_backend_url" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN news_backend_url VARCHAR(500)"))
+            if "news_analysis_llm" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN news_analysis_llm VARCHAR(255)"))
+            if "news_api_key_encrypted" not in llm_columns:
+                conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN news_api_key_encrypted TEXT"))
     except Exception as e:
         logger.error("Failed to ensure user schema: %s", e)
 
@@ -295,194 +760,186 @@ def _ensure_user_schema() -> None:
     _migrate_api_keys_reencrypt()
 
 
+def _ensure_daily_review_schema() -> None:
+    """Ensure daily review tables exist and contain required columns."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS daily_reviews (
+                    id VARCHAR(36) PRIMARY KEY,
+                    user_id VARCHAR(64) NOT NULL,
+                    trade_date VARCHAR(10) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'completed',
+                    market_summary JSON,
+                    portfolio_summary JSON,
+                    current_main_themes JSON,
+                    current_key_stocks JSON,
+                    next_main_themes JSON,
+                    next_candidate_stocks JSON,
+                    risk_watchpoints JSON,
+                    raw_result_data JSON,
+                    push_status VARCHAR(20),
+                    push_error TEXT,
+                    last_pushed_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_reviews_user_date ON daily_reviews(user_id, trade_date)"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_daily_review_configs (
+                    user_id VARCHAR(36) PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    trigger_time VARCHAR(5) NOT NULL DEFAULT '21:10',
+                    push_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    last_run_date VARCHAR(10),
+                    last_run_status VARCHAR(20),
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+
+            current_inspector = inspect(conn)
+            if current_inspector.has_table("daily_reviews"):
+                columns = {column["name"] for column in current_inspector.get_columns("daily_reviews")}
+                for column_name, ddl in (
+                    ("status", "ALTER TABLE daily_reviews ADD COLUMN status VARCHAR(20) DEFAULT 'completed'"),
+                    ("market_summary", "ALTER TABLE daily_reviews ADD COLUMN market_summary JSON"),
+                    ("portfolio_summary", "ALTER TABLE daily_reviews ADD COLUMN portfolio_summary JSON"),
+                    ("current_main_themes", "ALTER TABLE daily_reviews ADD COLUMN current_main_themes JSON"),
+                    ("current_key_stocks", "ALTER TABLE daily_reviews ADD COLUMN current_key_stocks JSON"),
+                    ("next_main_themes", "ALTER TABLE daily_reviews ADD COLUMN next_main_themes JSON"),
+                    ("next_candidate_stocks", "ALTER TABLE daily_reviews ADD COLUMN next_candidate_stocks JSON"),
+                    ("risk_watchpoints", "ALTER TABLE daily_reviews ADD COLUMN risk_watchpoints JSON"),
+                    ("raw_result_data", "ALTER TABLE daily_reviews ADD COLUMN raw_result_data JSON"),
+                    ("push_status", "ALTER TABLE daily_reviews ADD COLUMN push_status VARCHAR(20)"),
+                    ("push_error", "ALTER TABLE daily_reviews ADD COLUMN push_error TEXT"),
+                    ("last_pushed_at", "ALTER TABLE daily_reviews ADD COLUMN last_pushed_at TIMESTAMP"),
+                ):
+                    if column_name not in columns:
+                        conn.execute(text(ddl))
+            if current_inspector.has_table("user_daily_review_configs"):
+                columns = {column["name"] for column in current_inspector.get_columns("user_daily_review_configs")}
+                for column_name, ddl in (
+                    ("enabled", "ALTER TABLE user_daily_review_configs ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT FALSE"),
+                    ("trigger_time", "ALTER TABLE user_daily_review_configs ADD COLUMN trigger_time VARCHAR(5) NOT NULL DEFAULT '21:10'"),
+                    ("push_enabled", "ALTER TABLE user_daily_review_configs ADD COLUMN push_enabled BOOLEAN NOT NULL DEFAULT TRUE"),
+                    ("last_run_date", "ALTER TABLE user_daily_review_configs ADD COLUMN last_run_date VARCHAR(10)"),
+                    ("last_run_status", "ALTER TABLE user_daily_review_configs ADD COLUMN last_run_status VARCHAR(20)"),
+                    ("last_error", "ALTER TABLE user_daily_review_configs ADD COLUMN last_error TEXT"),
+                ):
+                    if column_name not in columns:
+                        conn.execute(text(ddl))
+    except Exception as e:
+        logger.error("Failed to ensure daily review schema: %s", e)
+
+
 def _ensure_backtest_data_schema() -> None:
     """Ensure backtest subscription/config/task tables exist and contain required columns."""
     try:
         with engine.begin() as conn:
-            if IS_SQLITE:
-                array_type = "TEXT"
-                json_default = "'[]'"
-                create_tasks = f"""
-                    CREATE TABLE IF NOT EXISTS backtest_data_tasks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id VARCHAR(36) NOT NULL,
-                        task_type VARCHAR(50) NOT NULL,
-                        data_source VARCHAR(100),
-                        date_range_start DATE NOT NULL,
-                        date_range_end DATE NOT NULL,
-                        symbols {array_type},
-                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                        progress INTEGER DEFAULT 0,
-                        total_records INTEGER DEFAULT 0,
-                        downloaded_records INTEGER DEFAULT 0,
-                        error_message TEXT,
-                        subscription_config_id INTEGER,
-                        trigger_mode VARCHAR(20) DEFAULT 'manual',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        completed_at TIMESTAMP
-                    )
-                """
-                create_configs = f"""
-                    CREATE TABLE IF NOT EXISTS backtest_data_configs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id VARCHAR(36) NOT NULL,
-                        config_name VARCHAR(100) NOT NULL,
-                        enabled_data_types {array_type} NOT NULL DEFAULT {json_default},
-                        default_date_range_days INTEGER DEFAULT 365,
-                        default_symbols {array_type} DEFAULT {json_default},
-                        data_source_preference VARCHAR(100) DEFAULT 'akshare',
-                        auto_download BOOLEAN DEFAULT FALSE,
-                        update_frequency VARCHAR(20),
-                        schedule_time VARCHAR(8) DEFAULT '18:30',
-                        timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
-                        only_trading_day BOOLEAN DEFAULT 1,
-                        last_run_at TIMESTAMP,
-                        last_success_at TIMESTAMP,
-                        last_updated_at TIMESTAMP,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """
-                create_stats = f"""
-                    CREATE TABLE IF NOT EXISTS backtest_data_stats (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        data_type VARCHAR(50) NOT NULL,
-                        symbol VARCHAR(20),
-                        date_range_start DATE,
-                        date_range_end DATE,
-                        total_records BIGINT DEFAULT 0,
-                        last_updated_date DATE,
-                        data_quality_score INTEGER DEFAULT 100,
-                        missing_dates {array_type},
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """
-                create_watermarks = """
-                    CREATE TABLE IF NOT EXISTS backtest_data_watermarks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id VARCHAR(36) NOT NULL,
-                        config_id INTEGER,
-                        data_type VARCHAR(50) NOT NULL,
-                        data_source VARCHAR(100),
-                        scope_key TEXT NOT NULL,
-                        last_data_date DATE,
-                        last_run_started_at TIMESTAMP,
-                        last_success_at TIMESTAMP,
-                        last_status VARCHAR(20),
-                        last_error TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """
-            else:
-                create_tasks = """
-                    CREATE TABLE IF NOT EXISTS backtest_data_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(36) NOT NULL,
-                        task_type VARCHAR(50) NOT NULL,
-                        data_source VARCHAR(100),
-                        date_range_start DATE NOT NULL,
-                        date_range_end DATE NOT NULL,
-                        symbols TEXT[],
-                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                        progress INTEGER DEFAULT 0,
-                        total_records INTEGER DEFAULT 0,
-                        downloaded_records INTEGER DEFAULT 0,
-                        error_message TEXT,
-                        subscription_config_id INTEGER,
-                        trigger_mode VARCHAR(20) DEFAULT 'manual',
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW(),
-                        completed_at TIMESTAMP
-                    )
-                """
-                create_configs = """
-                    CREATE TABLE IF NOT EXISTS backtest_data_configs (
-                        id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(36) NOT NULL,
-                        config_name VARCHAR(100) NOT NULL,
-                        enabled_data_types TEXT[] NOT NULL DEFAULT '{}',
-                        default_date_range_days INTEGER DEFAULT 365,
-                        default_symbols TEXT[] DEFAULT '{}',
-                        data_source_preference VARCHAR(100) DEFAULT 'akshare',
-                        auto_download BOOLEAN DEFAULT FALSE,
-                        update_frequency VARCHAR(20),
-                        schedule_time VARCHAR(8) DEFAULT '18:30',
-                        timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
-                        only_trading_day BOOLEAN DEFAULT TRUE,
-                        last_run_at TIMESTAMP,
-                        last_success_at TIMESTAMP,
-                        last_updated_at TIMESTAMP,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW(),
-                        CONSTRAINT unique_user_config_name UNIQUE (user_id, config_name)
-                    )
-                """
-                create_stats = """
-                    CREATE TABLE IF NOT EXISTS backtest_data_stats (
-                        id SERIAL PRIMARY KEY,
-                        data_type VARCHAR(50) NOT NULL,
-                        symbol VARCHAR(20),
-                        date_range_start DATE,
-                        date_range_end DATE,
-                        total_records BIGINT DEFAULT 0,
-                        last_updated_date DATE,
-                        data_quality_score INTEGER DEFAULT 100,
-                        missing_dates DATE[],
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW(),
-                        CONSTRAINT unique_data_stats UNIQUE (data_type, symbol)
-                    )
-                """
-                create_watermarks = """
-                    CREATE TABLE IF NOT EXISTS backtest_data_watermarks (
-                        id SERIAL PRIMARY KEY,
-                        user_id VARCHAR(36) NOT NULL,
-                        config_id INTEGER,
-                        data_type VARCHAR(50) NOT NULL,
-                        data_source VARCHAR(100),
-                        scope_key TEXT NOT NULL,
-                        last_data_date DATE,
-                        last_run_started_at TIMESTAMP,
-                        last_success_at TIMESTAMP,
-                        last_status VARCHAR(20),
-                        last_error TEXT,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW(),
-                        CONSTRAINT uq_backtest_watermark UNIQUE (user_id, config_id, data_type, data_source, scope_key)
-                    )
-                """
+            create_tasks = """
+                CREATE TABLE IF NOT EXISTS backtest_data_tasks (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(36) NOT NULL,
+                    task_type VARCHAR(50) NOT NULL,
+                    data_source VARCHAR(100),
+                    date_range_start DATE NOT NULL,
+                    date_range_end DATE NOT NULL,
+                    symbols TEXT[],
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    progress INTEGER DEFAULT 0,
+                    total_records INTEGER DEFAULT 0,
+                    downloaded_records INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    subscription_config_id INTEGER,
+                    trigger_mode VARCHAR(20) DEFAULT 'manual',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    completed_at TIMESTAMP
+                )
+            """
+            create_configs = """
+                CREATE TABLE IF NOT EXISTS backtest_data_configs (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(36) NOT NULL,
+                    config_name VARCHAR(100) NOT NULL,
+                    enabled_data_types TEXT[] NOT NULL DEFAULT '{}',
+                    default_date_range_days INTEGER DEFAULT 365,
+                    default_symbols TEXT[] DEFAULT '{}',
+                    data_source_preference VARCHAR(100) DEFAULT 'akshare',
+                    auto_download BOOLEAN DEFAULT FALSE,
+                    update_frequency VARCHAR(20),
+                    schedule_time VARCHAR(8) DEFAULT '18:30',
+                    timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
+                    only_trading_day BOOLEAN DEFAULT TRUE,
+                    last_run_at TIMESTAMP,
+                    last_success_at TIMESTAMP,
+                    last_updated_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT unique_user_config_name UNIQUE (user_id, config_name)
+                )
+            """
+            create_stats = """
+                CREATE TABLE IF NOT EXISTS backtest_data_stats (
+                    id SERIAL PRIMARY KEY,
+                    data_type VARCHAR(50) NOT NULL,
+                    symbol VARCHAR(20),
+                    date_range_start DATE,
+                    date_range_end DATE,
+                    total_records BIGINT DEFAULT 0,
+                    last_updated_date DATE,
+                    data_quality_score INTEGER DEFAULT 100,
+                    missing_dates DATE[],
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT unique_data_stats UNIQUE (data_type, symbol)
+                )
+            """
+            create_watermarks = """
+                CREATE TABLE IF NOT EXISTS backtest_data_watermarks (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(36) NOT NULL,
+                    config_id INTEGER,
+                    data_type VARCHAR(50) NOT NULL,
+                    data_source VARCHAR(100),
+                    scope_key TEXT NOT NULL,
+                    last_data_date DATE,
+                    last_run_started_at TIMESTAMP,
+                    last_success_at TIMESTAMP,
+                    last_status VARCHAR(20),
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT uq_backtest_watermark UNIQUE (user_id, config_id, data_type, data_source, scope_key)
+                )
+            """
 
             conn.execute(text(create_tasks))
             conn.execute(text(create_configs))
             conn.execute(text(create_stats))
             conn.execute(text(create_watermarks))
 
-            if IS_SQLITE:
-                task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_tasks)"))}
-                config_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_configs)"))}
-                watermark_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(backtest_data_watermarks)"))}
-            else:
-                task_columns = {
-                    row[0] for row in conn.execute(text("""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_name = 'backtest_data_tasks' AND table_schema = 'public'
-                    """))
-                }
-                config_columns = {
-                    row[0] for row in conn.execute(text("""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_name = 'backtest_data_configs' AND table_schema = 'public'
-                    """))
-                }
-                watermark_columns = {
-                    row[0] for row in conn.execute(text("""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_name = 'backtest_data_watermarks' AND table_schema = 'public'
-                    """))
-                }
+            task_columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'backtest_data_tasks' AND table_schema = 'public'
+                """))
+            }
+            config_columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'backtest_data_configs' AND table_schema = 'public'
+                """))
+            }
+            watermark_columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'backtest_data_watermarks' AND table_schema = 'public'
+                """))
+            }
 
             if "subscription_config_id" not in task_columns:
                 conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN subscription_config_id INTEGER"))
@@ -495,6 +952,10 @@ def _ensure_backtest_data_schema() -> None:
                 conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN timezone VARCHAR(64) DEFAULT 'Asia/Shanghai'"))
             if "only_trading_day" not in config_columns:
                 conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN only_trading_day BOOLEAN DEFAULT TRUE"))
+            if "daily_kline_policy" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN daily_kline_policy TEXT"))
+            if "minute_kline_policy" not in config_columns:
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN minute_kline_policy TEXT"))
             if "last_run_at" not in config_columns:
                 conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN last_run_at TIMESTAMP"))
             if "last_success_at" not in config_columns:
@@ -513,11 +974,10 @@ def _ensure_backtest_data_schema() -> None:
             if "last_error" not in watermark_columns:
                 conn.execute(text("ALTER TABLE backtest_data_watermarks ADD COLUMN last_error TEXT"))
 
-            if not IS_SQLITE:
-                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_user_id ON backtest_data_tasks(user_id)"))
-                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_status ON backtest_data_tasks(status)"))
-                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_configs_user_id ON backtest_data_configs(user_id)"))
-                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_watermarks_lookup ON backtest_data_watermarks(user_id, config_id, data_type)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_user_id ON backtest_data_tasks(user_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_tasks_status ON backtest_data_tasks(status)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_configs_user_id ON backtest_data_configs(user_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_watermarks_lookup ON backtest_data_watermarks(user_id, config_id, data_type)"))
     except Exception as e:
         logger.error("Failed to ensure backtest data schema: %s", e)
 
@@ -527,17 +987,12 @@ def _migrate_tokens_to_hashed() -> None:
     import hashlib, hmac
     try:
         with engine.begin() as conn:
-            # Add token_hint column if missing
-            if IS_SQLITE:
-                token_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_tokens)"))}
-            else:
-                # PostgreSQL使用information_schema
-                result = conn.execute(text("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'user_tokens' AND table_schema = 'public'
-                """))
-                token_cols = {row[0] for row in result}
+            result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'user_tokens' AND table_schema = 'public'
+            """))
+            token_cols = {row[0] for row in result}
             
             if "token_hint" not in token_cols:
                 conn.execute(text("ALTER TABLE user_tokens ADD COLUMN token_hint VARCHAR(8)"))
@@ -717,8 +1172,8 @@ class UserDB(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     last_login_at = Column(DateTime, nullable=True)
     last_login_ip = Column(String(45), nullable=True)
-    email_report_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
-    wecom_report_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    email_report_enabled = Column(Boolean, default=True, nullable=False, server_default=text("true"))
+    wecom_report_enabled = Column(Boolean, default=True, nullable=False, server_default=text("true"))
 
 
 class EmailVerificationCodeDB(Base):
@@ -748,6 +1203,10 @@ class UserLLMConfigDB(Base):
     default_analysts = Column(Text, nullable=True)  # JSON list, e.g. '["market","social",...]'
     qmt_paper_account_config = Column(Text, nullable=True)
     qmt_live_account_config = Column(Text, nullable=True)
+    news_llm_provider = Column(String(50), nullable=True)
+    news_backend_url = Column(String(500), nullable=True)
+    news_analysis_llm = Column(String(255), nullable=True)
+    news_api_key_encrypted = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -806,6 +1265,44 @@ class ScheduledAnalysisDB(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (UniqueConstraint('user_id', 'symbol', name='uq_scheduled_user_symbol'),)
+
+
+class DailyReviewDB(Base):
+    __tablename__ = "daily_reviews"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    trade_date = Column(String(10), nullable=False, index=True)
+    status = Column(String(20), default="completed", nullable=False)
+    market_summary = Column(JSON, nullable=True)
+    portfolio_summary = Column(JSON, nullable=True)
+    current_main_themes = Column(JSON, nullable=True)
+    current_key_stocks = Column(JSON, nullable=True)
+    next_main_themes = Column(JSON, nullable=True)
+    next_candidate_stocks = Column(JSON, nullable=True)
+    risk_watchpoints = Column(JSON, nullable=True)
+    raw_result_data = Column(JSON, nullable=True)
+    push_status = Column(String(20), nullable=True)
+    push_error = Column(Text, nullable=True)
+    last_pushed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (UniqueConstraint("user_id", "trade_date", name="uq_daily_reviews_user_date"),)
+
+
+class UserDailyReviewConfigDB(Base):
+    __tablename__ = "user_daily_review_configs"
+
+    user_id = Column(String(36), primary_key=True, index=True)
+    enabled = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    trigger_time = Column(String(5), default="21:10", nullable=False)
+    push_enabled = Column(Boolean, default=True, nullable=False, server_default=text("true"))
+    last_run_date = Column(String(10), nullable=True)
+    last_run_status = Column(String(20), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
 class SponsorDB(Base):

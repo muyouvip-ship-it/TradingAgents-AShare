@@ -5,13 +5,6 @@ docs/
 graph_checkpoints.db
 graph_checkpoints.db-shm
 graph_checkpoints.db-wal
-/app.db
-/tradingagents.db
-/data/*.db
-/data/*.sqlite
-/data/*.sqlite3
-/backups/sqlite_legacy/
-/.sqlite_legacy_backup_path
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -73,8 +66,6 @@ cover/
 # Django stuff:
 *.log
 local_settings.py
-db.sqlite3
-db.sqlite3-journal
 
 # Flask stuff:
 instance/
@@ -246,9 +237,6 @@ deploy/
 .DS_Store
 .vscode/
 /plans/
-tradingagents.db
-tradingagents.db-shm
-tradingagents.db-wal
 deploy/deploy.env
 
 .playwright-cli/

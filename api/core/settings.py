@@ -21,7 +21,6 @@ class Settings:
     ta_app_secret_key: str = os.getenv("TA_APP_SECRET_KEY", "")
     database_url: str = os.getenv("DATABASE_URL", "")
     strategy_database_url: str = os.getenv("STRATEGY_DATABASE_URL", os.getenv("DATABASE_URL", ""))
-    strategy_db_path: str = os.getenv("STRATEGY_DB_PATH", "data/strategy_management.db")
     qmt_enabled: bool = os.getenv("QMT_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
     qmt_host: str = os.getenv("QMT_HOST", "192.168.10.1")
     qmt_port: int = int(os.getenv("QMT_PORT", "58610"))

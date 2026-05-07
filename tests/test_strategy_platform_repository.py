@@ -1,6 +1,6 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+import pytest
 
+from tests.postgres_test_utils import isolated_postgres_session
 from api.models.strategy_models import Base
 from api.services.factor_registry import get_factor_registry_item, list_factor_registry
 from api.services.strategy_platform_repository import (
@@ -18,15 +18,13 @@ from api.services.strategy_platform_repository import (
 )
 
 
-def _session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(bind=engine)
-    return SessionLocal()
+@pytest.fixture
+def db():
+    with isolated_postgres_session(Base, schema_prefix="ta_strategy_repo") as session:
+        yield session
 
 
-def test_strategy_platform_repository_persists_strategy_payload():
-    db = _session()
+def test_strategy_platform_repository_persists_strategy_payload(db):
     saved = save_platform_strategy(
         db,
         {
@@ -66,8 +64,7 @@ def test_strategy_platform_repository_persists_strategy_payload():
     assert len(items) == 1
 
 
-def test_strategy_platform_repository_persists_backtest_and_updates_metrics():
-    db = _session()
+def test_strategy_platform_repository_persists_backtest_and_updates_metrics(db):
     save_platform_strategy(
         db,
         {
@@ -148,8 +145,7 @@ def test_strategy_platform_repository_persists_backtest_and_updates_metrics():
     assert updated["performance"]["total_return"] == 0.21
 
 
-def test_factor_registry_syncs_builtin_metadata():
-    db = _session()
+def test_factor_registry_syncs_builtin_metadata(db):
     items = list_factor_registry(db)
     money_flow = get_factor_registry_item(db, "money_flow_strength_20d")
 
@@ -161,8 +157,7 @@ def test_factor_registry_syncs_builtin_metadata():
     assert "polars" in money_flow["backend_support"]
 
 
-def test_evolution_experiment_repository_persists_candidates():
-    db = _session()
+def test_evolution_experiment_repository_persists_candidates(db):
     save_platform_strategy(
         db,
         {

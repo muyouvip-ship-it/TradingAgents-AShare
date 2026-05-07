@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import threading
+from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from statistics import mean
@@ -14,12 +18,65 @@ from sqlalchemy import text
 
 from api.core.progress_tracker import AgentProgressTracker
 from api.database import get_db_ctx
+from api.services.market_data_pipeline_service import preferred_daily_kline_table
 from api.deps import require_api_user
 from api.schemas.analysis import AnalyzeRequest
 from api.services import report_service
 
 router = APIRouter(prefix="/v1", tags=["Chat"])
 logger = logging.getLogger(__name__)
+_GRAPH_CACHE_MAX_SIZE = int(os.getenv("TRADING_GRAPH_CACHE_SIZE", "4"))
+_GRAPH_CACHE: OrderedDict[str, Any] = OrderedDict()
+_GRAPH_CACHE_LOCK = threading.Lock()
+
+
+def _get_deep_analysis_graph(selected_analysts: list[str], config: dict[str, Any]):
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    if _GRAPH_CACHE_MAX_SIZE <= 0:
+        return TradingAgentsGraph(
+            selected_analysts=selected_analysts,
+            debug=False,
+            config=dict(config),
+        )
+
+    cache_key = _trading_graph_cache_key(selected_analysts, config)
+    with _GRAPH_CACHE_LOCK:
+        cached = _GRAPH_CACHE.get(cache_key)
+        if cached is not None:
+            _GRAPH_CACHE.move_to_end(cache_key)
+            return cached
+
+    graph = TradingAgentsGraph(
+        selected_analysts=selected_analysts,
+        debug=False,
+        config=dict(config),
+    )
+    with _GRAPH_CACHE_LOCK:
+        existing = _GRAPH_CACHE.get(cache_key)
+        if existing is not None:
+            return existing
+        _GRAPH_CACHE[cache_key] = graph
+        _GRAPH_CACHE.move_to_end(cache_key)
+        while len(_GRAPH_CACHE) > _GRAPH_CACHE_MAX_SIZE:
+            _GRAPH_CACHE.popitem(last=False)
+    return graph
+
+
+def _trading_graph_cache_key(selected_analysts: list[str], config: dict[str, Any]) -> str:
+    api_key = str(config.get("api_key") or "")
+    payload = {
+        "selected_analysts": sorted({str(item) for item in selected_analysts}),
+        "llm_provider": config.get("llm_provider"),
+        "deep_think_llm": config.get("deep_think_llm"),
+        "quick_think_llm": config.get("quick_think_llm"),
+        "backend_url": config.get("backend_url"),
+        "api_key_hash": hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else "",
+        "max_debate_rounds": config.get("max_debate_rounds"),
+        "max_risk_discuss_rounds": config.get("max_risk_discuss_rounds"),
+        "max_recur_limit": config.get("max_recur_limit"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 @router.post("/chat/completions")
@@ -419,10 +476,13 @@ async def _run_background_analysis_job(
         tracker.mark_stage("completed", "completed")
     except Exception as exc:
         logger.exception("Background chat analysis failed for %s", symbol)
+        error_message = f"智能分析失败：{exc}"
+        with get_db_ctx() as db:
+            report_service.update_report_partial(db, job_id, status="failed", error=error_message)
         compat._set_job(
             job_id,
             status="failed",
-            error=f"智能分析失败：{exc}",
+            error=error_message,
             symbol=symbol,
             trade_date=trade_date,
         )
@@ -441,17 +501,13 @@ async def _run_deep_analysis_pipeline(
     from api import main as compat
     from tradingagents.agents.utils.agent_states import current_tracker_var
     from tradingagents.graph.intent_parser import parse_intent
-    from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     config = compat._build_runtime_config({}, user_id=user_id)
     merged_user_context = _build_user_context_snapshot(symbol, user_id)
-    graph = TradingAgentsGraph(
-        selected_analysts=selected_analysts,
-        debug=False,
-        config=config,
-    )
+    graph = _get_deep_analysis_graph(selected_analysts, config)
 
     tracker_token = current_tracker_var.set(tracker)
+    graph.data_collector.ref(symbol, trade_date)
     try:
         user_intent = parse_intent(query or f"分析 {symbol}", graph.quick_thinking_llm, fallback_ticker=symbol)
         user_intent["user_context"] = _merge_user_contexts(
@@ -459,7 +515,12 @@ async def _run_deep_analysis_pipeline(
             user_intent.get("user_context") or {},
         )
 
-        await asyncio.to_thread(graph.data_collector.collect, symbol, trade_date)
+        await asyncio.to_thread(
+            graph.data_collector.collect,
+            symbol,
+            trade_date,
+            selected_analysts=selected_analysts,
+        )
         state = graph.propagator.create_initial_state(
             company_name=symbol,
             trade_date=trade_date,
@@ -689,10 +750,11 @@ def _build_user_context_snapshot(symbol: str, user_id: str) -> dict:
 def _load_recent_daily_rows(code: str, symbol: str) -> list[dict]:
     try:
         with get_db_ctx() as db:
-            columns = _get_table_columns(db, "stock_daily_kline")
+            table_name = preferred_daily_kline_table()
+            columns = _get_table_columns(db, table_name)
             required_columns = {"symbol", "trade_date", "close"}
             if not required_columns.issubset(columns):
-                logger.warning("stock_daily_kline is unavailable or missing required columns: %s", sorted(required_columns - columns))
+                logger.warning("%s is unavailable or missing required columns: %s", table_name, sorted(required_columns - columns))
                 return []
 
             selected_columns = [
@@ -712,7 +774,7 @@ def _load_recent_daily_rows(code: str, symbol: str) -> list[dict]:
                 text(
                     f"""
                     SELECT {", ".join(selected_columns)}
-                    FROM stock_daily_kline
+                    FROM {table_name}
                     WHERE symbol IN (:code, :symbol)
                     ORDER BY trade_date DESC
                     LIMIT 30
@@ -728,9 +790,6 @@ def _load_recent_daily_rows(code: str, symbol: str) -> list[dict]:
 
 def _get_table_columns(db, table_name: str) -> set[str]:
     try:
-        dialect_name = db.bind.dialect.name if db.bind is not None else ""
-        if dialect_name == "sqlite":
-            return {row[1] for row in db.execute(text(f"PRAGMA table_info({table_name})")).fetchall()}
         rows = db.execute(
             text(
                 """

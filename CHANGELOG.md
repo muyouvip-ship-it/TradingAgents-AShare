@@ -22,7 +22,6 @@ All notable changes to this project will be documented in this file.
 - **日志体系**：uvicorn 日志配置文件统一时间戳格式。
 - **Docker 优化**：CMD 使用 tradingagents-api 入口点；git tag 注入 VERSION build-arg。
 - **登录页**：12-Agent → 15-Agent，补齐宏观分析、主力资金、博弈裁判。
-- **SQLite WAL 模式**：启用 WAL 支持并发读写。
 
 ### Fixed
 - 修复 mini_racer/V8 多线程 crash：启动时预加载交易日历，后续请求全走缓存。

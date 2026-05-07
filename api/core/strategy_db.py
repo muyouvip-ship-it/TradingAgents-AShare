@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -14,22 +13,30 @@ load_project_env()
 
 _database_url = os.getenv("STRATEGY_DATABASE_URL") or os.getenv("DATABASE_URL")
 if not _database_url:
-    if "pytest" in sys.modules:
-        strategy_db_path = os.getenv("STRATEGY_DB_PATH", "data/strategy_management.db")
-        _database_url = f"sqlite:///{strategy_db_path}"
-    else:
-        _database_url = "postgresql://localhost/trading_agents"
+    raise RuntimeError("DATABASE_URL or STRATEGY_DATABASE_URL is required. PostgreSQL is the only supported database.")
+if not (_database_url.startswith("postgresql://") or _database_url.startswith("postgresql+") or _database_url.startswith("postgres://")):
+    raise RuntimeError("Strategy database URL must point to PostgreSQL.")
 
-_is_sqlite = _database_url.startswith("sqlite")
 strategy_engine = create_engine(
     _database_url,
     echo=False,
-    connect_args={"check_same_thread": False} if _is_sqlite else {},
 )
 StrategySessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=strategy_engine)
+_strategy_schema_ready = False
+
+
+def ensure_strategy_schema_ready() -> None:
+    global _strategy_schema_ready
+    if _strategy_schema_ready:
+        return
+    from api.models.strategy_models import Base
+
+    Base.metadata.create_all(strategy_engine)
+    _strategy_schema_ready = True
 
 
 def get_strategy_db() -> Iterator[Session]:
+    ensure_strategy_schema_ready()
     db = StrategySessionLocal()
     try:
         yield db
@@ -39,6 +46,7 @@ def get_strategy_db() -> Iterator[Session]:
 
 @contextmanager
 def get_strategy_db_ctx() -> Iterator[Session]:
+    ensure_strategy_schema_ready()
     db = StrategySessionLocal()
     try:
         yield db
