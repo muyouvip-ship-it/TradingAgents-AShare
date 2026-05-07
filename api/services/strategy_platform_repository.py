@@ -220,6 +220,24 @@ def get_platform_backtest_run(db: Session, run_id: str) -> dict[str, Any] | None
     return _backtest_to_payload(row)
 
 
+def list_platform_backtest_runs(
+    db: Session,
+    *,
+    strategy_id: str | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    query = db.query(BacktestJobDB)
+    if strategy_id:
+        query = query.filter(BacktestJobDB.strategy_id == strategy_id)
+    rows = (
+        query
+        .order_by(BacktestJobDB.created_at.desc(), BacktestJobDB.completed_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [_backtest_to_payload(row) for row in rows if _is_platform_backtest(row)]
+
+
 def get_latest_completed_platform_backtest(db: Session, strategy_id: str) -> dict[str, Any] | None:
     rows = (
         db.query(BacktestJobDB)

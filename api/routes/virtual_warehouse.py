@@ -38,10 +38,33 @@ class QmtBulkSellRequest(BaseModel):
 @router.get("/qmt/overview")
 def get_qmt_virtual_warehouse(
     account_key: str | None = Query(default=None),
+    preferred_role: str | None = Query(default=None),
+    prefer_cache: bool = Query(default=False),
     current_user=Depends(require_api_user),
     db: Session = Depends(get_db),
 ):
-    return qmt_virtual_account_service.get_qmt_virtual_account_overview(db, current_user.id, account_key=account_key)
+    return qmt_virtual_account_service.get_qmt_virtual_account_overview(
+        db,
+        current_user.id,
+        account_key=account_key,
+        preferred_role=preferred_role,
+        prefer_cache=prefer_cache,
+    )
+
+
+@router.post("/qmt/refresh")
+def trigger_qmt_virtual_warehouse_refresh(
+    account_key: str | None = Query(default=None),
+    preferred_role: str | None = Query(default=None),
+    current_user=Depends(require_api_user),
+    db: Session = Depends(get_db),
+):
+    return qmt_virtual_account_service.trigger_qmt_background_refresh(
+        db,
+        current_user.id,
+        account_key=account_key,
+        preferred_role=preferred_role,
+    )
 
 
 @router.get("/qmt/orders")

@@ -3,22 +3,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pandas as pd
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from api.core.strategy_db import get_strategy_db_ctx, strategy_engine
+from api.core.strategy_db import get_strategy_db_ctx
 from api.database import get_db_ctx
 from api.models.strategy_models import (
-    Base,
     RealtimeApprovalDB,
     RealtimeEventDB,
     RealtimeMonitorDB,
+)
+from api.services.data_source_governance import (
+    build_realtime_monitor_governance,
+    build_realtime_positions_governance,
 )
 from api.services.qmt_market_data_service import fetch_intraday_bars
 from api.services import qmt_virtual_account_service, watchlist_service
@@ -26,6 +30,7 @@ from api.services.minute_data_service import evaluate_first_day_band_signals, ev
 from api.services.qmt_realtime_minute_capture_service import capture_today_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
 from api.services.strategy_platform_repository import get_platform_strategy
+from tradingagents.dataflows.trade_calendar import is_cn_trading_day
 
 
 logger = logging.getLogger(__name__)
@@ -35,10 +40,53 @@ REALTIME_LOG_PATH = PROJECT_ROOT / "realtime_monitor.runtime.log"
 _WORKER_TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 5
+_EVENT_SUBSCRIBERS: dict[tuple[str, str], list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]]] = {}
+_EVENT_SUBSCRIBERS_LOCK = threading.Lock()
+
+
+def subscribe_event_queue(user_id: str, monitor_id: str) -> asyncio.Queue[dict[str, Any]]:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
+    key = (str(user_id), str(monitor_id))
+    with _EVENT_SUBSCRIBERS_LOCK:
+        _EVENT_SUBSCRIBERS.setdefault(key, []).append((loop, queue))
+    return queue
+
+
+def unsubscribe_event_queue(user_id: str, monitor_id: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+    key = (str(user_id), str(monitor_id))
+    with _EVENT_SUBSCRIBERS_LOCK:
+        subscribers = [
+            item for item in _EVENT_SUBSCRIBERS.get(key, [])
+            if item[1] is not queue
+        ]
+        if subscribers:
+            _EVENT_SUBSCRIBERS[key] = subscribers
+        else:
+            _EVENT_SUBSCRIBERS.pop(key, None)
+
+
+def _publish_event_to_subscribers(event: RealtimeEventDB) -> None:
+    payload = event.to_dict()
+    key = (str(event.user_id), str(event.monitor_id))
+    with _EVENT_SUBSCRIBERS_LOCK:
+        subscribers = list(_EVENT_SUBSCRIBERS.get(key, []))
+    for loop, queue in subscribers:
+        if loop.is_closed():
+            continue
+        loop.call_soon_threadsafe(_queue_event_drop_oldest, queue, payload)
+
+
+def _queue_event_drop_oldest(queue: asyncio.Queue[dict[str, Any]], payload: dict[str, Any]) -> None:
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    queue.put_nowait(payload)
 
 
 def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    Base.metadata.create_all(strategy_engine)
     strategy = _require_strategy(strategy_db, str(payload.get("strategy_id") or ""))
     compiled = _compile_strategy_payload(strategy)
     if compiled.status != "passed":
@@ -90,7 +138,6 @@ def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload
 
 
 def list_monitors(db: Session, user_id: str) -> list[dict[str, Any]]:
-    Base.metadata.create_all(strategy_engine)
     rows = (
         db.query(RealtimeMonitorDB)
         .filter(RealtimeMonitorDB.user_id == user_id)
@@ -222,38 +269,59 @@ def run_monitor_once(strategy_db: Session, main_db: Session, user_id: str, monit
     }
 
 
-def list_events(db: Session, user_id: str, monitor_id: str, *, limit: int = 200, after_id: str | None = None) -> list[dict[str, Any]]:
+def list_events(
+    db: Session,
+    user_id: str,
+    monitor_id: str,
+    *,
+    limit: int = 200,
+    after_id: str | None = None,
+    since_started: bool = False,
+) -> list[dict[str, Any]]:
     _require_monitor(db, user_id, monitor_id)
-    max_limit = max(min(limit, 1000), 1)
+    max_limit = max(min(limit, 50000), 1)
     query = db.query(RealtimeEventDB).filter(
         RealtimeEventDB.monitor_id == monitor_id,
         RealtimeEventDB.user_id == user_id,
     )
+    runtime_start_at = _latest_runtime_start_at(db, user_id, monitor_id) if since_started else None
+    if runtime_start_at is not None:
+        query = query.filter(RealtimeEventDB.created_at >= runtime_start_at)
     if after_id:
-        cursor = db.query(RealtimeEventDB).filter(RealtimeEventDB.id == after_id).first()
+        cursor = db.query(RealtimeEventDB).filter(
+            RealtimeEventDB.id == after_id,
+            RealtimeEventDB.monitor_id == monitor_id,
+            RealtimeEventDB.user_id == user_id,
+        ).first()
         if cursor and cursor.created_at:
-            # Use >= and trim in Python so we don't drop sibling events created in the same
-            # timestamp bucket as the cursor event.
             rows = (
-                query.filter(RealtimeEventDB.created_at >= cursor.created_at)
-                .order_by(RealtimeEventDB.created_at.asc())
+                query.filter(
+                    or_(
+                        RealtimeEventDB.created_at > cursor.created_at,
+                        and_(RealtimeEventDB.created_at == cursor.created_at, RealtimeEventDB.id > cursor.id),
+                    )
+                )
+                .order_by(RealtimeEventDB.created_at.asc(), RealtimeEventDB.id.asc())
+                .limit(max_limit)
                 .all()
             )
-            cursor_seen = False
-            fresh_rows: list[RealtimeEventDB] = []
-            for row in rows:
-                if not cursor_seen:
-                    if row.id == after_id:
-                        cursor_seen = True
-                    continue
-                fresh_rows.append(row)
-                if len(fresh_rows) >= max_limit:
-                    break
-            if not cursor_seen:
-                fresh_rows = [row for row in rows if row.created_at > cursor.created_at][:max_limit]
-            return [row.to_dict() for row in fresh_rows]
-    rows = query.order_by(RealtimeEventDB.created_at.desc()).limit(max_limit).all()
+            return [row.to_dict() for row in rows]
+    rows = query.order_by(RealtimeEventDB.created_at.desc(), RealtimeEventDB.id.desc()).limit(max_limit).all()
     return [row.to_dict() for row in reversed(rows)]
+
+
+def _latest_runtime_start_at(db: Session, user_id: str, monitor_id: str) -> datetime | None:
+    row = (
+        db.query(RealtimeEventDB)
+        .filter(
+            RealtimeEventDB.monitor_id == monitor_id,
+            RealtimeEventDB.user_id == user_id,
+            RealtimeEventDB.event_type.in_(["monitor_started", "monitor_resumed"]),
+        )
+        .order_by(RealtimeEventDB.created_at.desc())
+        .first()
+    )
+    return row.created_at if row and row.created_at else None
 
 
 def list_orders(db: Session, user_id: str, monitor_id: str) -> list[dict[str, Any]]:
@@ -302,15 +370,19 @@ def list_trades(db: Session, user_id: str, monitor_id: str) -> list[dict[str, An
 
 def get_positions(db: Session, main_db: Session, user_id: str, monitor_id: str) -> dict[str, Any]:
     monitor = _require_monitor(db, user_id, monitor_id)
-    overview = qmt_virtual_account_service.get_qmt_virtual_account_overview(main_db, user_id, account_key=monitor.account_key)
-    return {
+    overview = _get_realtime_qmt_overview(main_db, user_id, monitor.account_key)
+    payload = {
         "monitor_id": monitor.id,
         "account_key": monitor.account_key,
         "positions": overview.get("positions") or [],
         "account": overview.get("account"),
         "connection": overview.get("connection"),
         "fetched_at": overview.get("fetched_at"),
+        "data_source": overview.get("data_source"),
+        "is_stale": bool(overview.get("is_stale", False)),
     }
+    payload["data_governance"] = build_realtime_positions_governance(payload)
+    return payload
 
 
 def list_approvals(db: Session, user_id: str, status: str | None = None) -> list[dict[str, Any]]:
@@ -396,7 +468,6 @@ async def _worker_loop() -> None:
 
 
 def _scan_and_run_once() -> None:
-    Base.metadata.create_all(strategy_engine)
     with get_strategy_db_ctx() as db:
         rows = db.query(RealtimeMonitorDB).filter(RealtimeMonitorDB.status == "running").all()
         due_ids = [row.id for row in rows if _monitor_due(row)]
@@ -429,12 +500,35 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
             _fuse_monitor(strategy_db, monitor, "策略 DSL 编译失败")
             return
 
-        pool = dict(monitor.monitor_pool_json or {})
-        symbols = _resolve_monitor_symbols(main_db, monitor.user_id, monitor.account_key, strategy, pool)
-        pool["resolved_symbols"] = symbols
-        monitor.monitor_pool_json = pool
         monitor.last_heartbeat_at = now
         monitor.updated_at = now
+        if not _is_monitor_trading_window(now) and not bool((monitor.config_json or {}).get("allow_outside_session")):
+            _append_event(
+                strategy_db,
+                monitor,
+                "cycle_skipped",
+                payload={
+                    "cycle_id": cycle_id,
+                    "reason": "outside_trading_session",
+                    "trigger_source": trigger_source,
+                    "session": "09:30-11:30,13:00-15:00",
+                },
+                correlation_id=cycle_id,
+            )
+            _update_state_stats(monitor, latest_cycle=cycle_id)
+            strategy_db.add(monitor)
+            strategy_db.commit()
+            return
+
+        overview = _get_realtime_qmt_overview(main_db, monitor.user_id, monitor.account_key)
+        if not _is_realtime_qmt_overview_live(overview):
+            _fuse_monitor(strategy_db, monitor, _realtime_qmt_overview_error(overview))
+            return
+
+        pool = dict(monitor.monitor_pool_json or {})
+        symbols = _resolve_monitor_symbols(main_db, monitor.user_id, monitor.account_key, strategy, pool, overview=overview)
+        pool["resolved_symbols"] = symbols
+        monitor.monitor_pool_json = pool
         _append_event(
             strategy_db,
             monitor,
@@ -453,17 +547,28 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
             strategy_db.add(monitor)
             strategy_db.commit()
             return
-
-        overview = qmt_virtual_account_service.get_qmt_virtual_account_overview(main_db, monitor.user_id, account_key=monitor.account_key)
         _refresh_execution_state(strategy_db, main_db, monitor, overview, correlation_id=cycle_id)
-        quotes = qmt_virtual_account_service._fetch_live_quotes(symbols)
+        quotes = qmt_virtual_account_service._fetch_live_quotes(
+            symbols,
+            account_key=monitor.account_key,
+            timeout_seconds=2.5,
+            db=main_db,
+            user_id=monitor.user_id,
+        )
         if not quotes:
             _fuse_monitor(strategy_db, monitor, "QMT/实时行情不可用，已立即熔断")
             return
         quote_sample = {symbol: quotes.get(symbol) for symbol in symbols[:10]}
         _append_event(strategy_db, monitor, "market_snapshot", payload={"cycle_id": cycle_id, "quotes": quote_sample}, correlation_id=cycle_id)
 
-        minute_capture = capture_today_minute_bars(account_key=monitor.account_key, symbols=symbols, trade_date=now.date().isoformat())
+        local_now = now.astimezone().replace(tzinfo=None)
+        minute_capture = capture_today_minute_bars(
+            account_key=monitor.account_key,
+            symbols=symbols,
+            trade_date=local_now.date().isoformat(),
+            db=main_db,
+            user_id=monitor.user_id,
+        )
         _append_event(
             strategy_db,
             monitor,
@@ -478,18 +583,39 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                 "captured_symbols": minute_capture.get("captured_symbols") or [],
                 "missing_symbols": minute_capture.get("missing_symbols") or [],
                 "symbol_rows": minute_capture.get("symbol_rows") or {},
+                "symbol_latest_trade_times": minute_capture.get("symbol_latest_trade_times") or {},
                 "symbol_errors": minute_capture.get("symbol_errors") or {},
                 "partial": bool(minute_capture.get("partial")),
             },
             correlation_id=cycle_id,
         )
 
-        minute_features = _build_minute_features(monitor, symbols)
+        minute_features = _build_minute_features(
+            monitor,
+            symbols,
+            minute_capture=minute_capture,
+            current_time=local_now,
+            main_db=main_db,
+            user_id=monitor.user_id,
+        )
         _append_event(
             strategy_db,
             monitor,
             "minute_features",
-            payload={"cycle_id": cycle_id, "source": minute_features.get("source"), "timeframe": minute_features.get("timeframe"), "items": minute_features.get("items", [])[:20]},
+            payload={
+                "cycle_id": cycle_id,
+                "source": minute_features.get("source"),
+                "timeframe": minute_features.get("timeframe"),
+                "items": minute_features.get("items", [])[:20],
+                "qmt_required": bool(minute_features.get("qmt_required")),
+                "missing_symbols": minute_features.get("missing_symbols") or [],
+                "stale_symbols": minute_features.get("stale_symbols") or [],
+                "incomplete_symbols": minute_features.get("incomplete_symbols") or [],
+                "capture_missing_symbols": minute_features.get("capture_missing_symbols") or [],
+                "capture_stale_symbols": minute_features.get("capture_stale_symbols") or [],
+                "capture_latest_trade_times": minute_features.get("capture_latest_trade_times") or {},
+                "latest_closed_bar_end": minute_features.get("latest_closed_bar_end"),
+            },
             correlation_id=cycle_id,
         )
 
@@ -519,6 +645,27 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
             intent = _build_order_intent(monitor, overview, signal)
             risk = _risk_check(strategy_db, monitor, intent, signal)
             if not risk["passed"]:
+                if _should_block_unsellable_signal(monitor, intent, signal, risk):
+                    _append_event(
+                        strategy_db,
+                        monitor,
+                        "signal_blocked",
+                        symbol=signal["symbol"],
+                        signal_payload=signal,
+                        risk_payload={
+                            **risk,
+                            "reason": "available_position_below_lot_size",
+                        },
+                        order_payload=intent,
+                        payload={
+                            "message": "卖出信号命中，但当前可卖仓位不足一手，已跳过下单",
+                            "available_position": intent.get("available_position"),
+                            "current_position": intent.get("current_position"),
+                            "lot_size": _monitor_lot_size(monitor),
+                        },
+                        correlation_id=cycle_id,
+                    )
+                    continue
                 _append_event(
                     strategy_db,
                     monitor,
@@ -586,7 +733,42 @@ def _compile_strategy_payload(strategy: dict[str, Any]):
     return compile_strategy_dsl(dsl)
 
 
-def _resolve_monitor_symbols(main_db: Session, user_id: str, account_key: str, strategy: dict[str, Any], pool: dict[str, Any]) -> list[str]:
+def _get_realtime_qmt_overview(main_db: Session, user_id: str, account_key: str) -> dict[str, Any]:
+    return qmt_virtual_account_service.get_qmt_virtual_account_overview(
+        main_db,
+        user_id,
+        account_key=account_key,
+        allow_cache_fallback=False,
+    )
+
+
+def _is_realtime_qmt_overview_live(overview: dict[str, Any]) -> bool:
+    connection = overview.get("connection") if isinstance(overview.get("connection"), dict) else {}
+    return (
+        str(overview.get("data_source") or "").strip().lower() == "live"
+        and bool(connection.get("connected")) is True
+        and bool(overview.get("is_stale", False)) is False
+    )
+
+
+def _realtime_qmt_overview_error(overview: dict[str, Any]) -> str:
+    connection = overview.get("connection") if isinstance(overview.get("connection"), dict) else {}
+    message = str(connection.get("message") or overview.get("message") or "").strip()
+    if message:
+        return f"QMT 账户实时快照不可用，实时监控禁止使用缓存：{message}"
+    source = str(overview.get("data_source") or "unknown")
+    return f"QMT 账户实时快照不可用，实时监控禁止使用缓存（source={source}）"
+
+
+def _resolve_monitor_symbols(
+    main_db: Session,
+    user_id: str,
+    account_key: str,
+    strategy: dict[str, Any],
+    pool: dict[str, Any],
+    *,
+    overview: dict[str, Any] | None = None,
+) -> list[str]:
     mode = str(pool.get("mode") or "strategy_positions_watchlist").strip().lower()
     symbols: set[str] = set()
     if mode not in {"qmt_positions_only", "positions_only"}:
@@ -602,11 +784,14 @@ def _resolve_monitor_symbols(main_db: Session, user_id: str, account_key: str, s
                 if normalized:
                     symbols.add(normalized)
     try:
-        overview = qmt_virtual_account_service.get_qmt_virtual_account_overview(main_db, user_id, account_key=account_key)
-        for position in overview.get("positions") or []:
-            normalized = _normalize_symbol(position.get("symbol"))
-            if normalized:
-                symbols.add(normalized)
+        active_overview = overview or _get_realtime_qmt_overview(main_db, user_id, account_key)
+        if _is_realtime_qmt_overview_live(active_overview):
+            for position in active_overview.get("positions") or []:
+                normalized = _normalize_symbol(position.get("symbol"))
+                if normalized:
+                    symbols.add(normalized)
+        else:
+            logger.warning("[realtime-monitor] skip qmt positions because strict live overview is unavailable: %s", _realtime_qmt_overview_error(active_overview))
     except Exception as exc:
         logger.warning("[realtime-monitor] resolve qmt positions failed: %s", exc)
     if mode not in {"qmt_positions_only", "positions_only", "manual_only"}:
@@ -620,28 +805,301 @@ def _resolve_monitor_symbols(main_db: Session, user_id: str, account_key: str, s
     return sorted(symbols)
 
 
-def _build_minute_features(monitor: RealtimeMonitorDB, symbols: list[str]) -> dict[str, Any]:
-    trade_date = datetime.now().date().isoformat()
+def _build_minute_features(
+    monitor: RealtimeMonitorDB,
+    symbols: list[str],
+    *,
+    minute_capture: dict[str, Any] | None = None,
+    current_time: datetime | None = None,
+    main_db: Session | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    raw_now = current_time or datetime.now().astimezone()
+    now_local = raw_now.astimezone().replace(tzinfo=None) if raw_now.tzinfo else raw_now.replace(tzinfo=None)
+    trade_date = now_local.date().isoformat()
     config = dict(monitor.config_json or {})
     signal_mode = str(config.get("signal_mode") or "intraday_confirmation").strip().lower()
     timeframe = str(config.get("signal_timeframe") or "30m").strip().lower() or "30m"
+    all_symbols = sorted({_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)})
+    qmt_symbols, capture_missing_symbols, capture_stale_symbols, capture_latest_trade_times = _qmt_fresh_captured_symbols(
+        all_symbols,
+        minute_capture,
+        trade_date=trade_date,
+        timeframe=timeframe,
+        current_time=now_local,
+    )
+    signal_symbols = sorted(qmt_symbols)
+    if minute_capture is not None and not signal_symbols:
+        latest_closed_bar_end = _latest_closed_bar_end(now_local, timeframe)
+        return {
+            "timeframe": timeframe,
+            "source": str(minute_capture.get("source") or "qmt_intraday"),
+            "items": [],
+            "missing_symbols": all_symbols,
+            "stale_symbols": capture_stale_symbols,
+            "incomplete_symbols": [],
+            "capture_missing_symbols": capture_missing_symbols or all_symbols,
+            "capture_stale_symbols": capture_stale_symbols,
+            "capture_latest_trade_times": capture_latest_trade_times,
+            "latest_closed_bar_end": latest_closed_bar_end.isoformat(),
+            "qmt_required": True,
+            "signal_mode": signal_mode,
+            "error": "本轮 QMT 未返回足够新的分钟线，已跳过信号计算",
+        }
     try:
         if signal_mode == "first_day_band":
-            result = evaluate_first_day_band_signals(symbols=symbols, trade_date=trade_date, timeframe=timeframe)
-            if not _minute_result_covers_trade_date(result.items, trade_date):
+            result = evaluate_first_day_band_signals(symbols=signal_symbols, trade_date=trade_date, timeframe=timeframe)
+            items, missing_symbols, stale_symbols, incomplete_symbols = _fresh_minute_items_for_trade_date(
+                result.items,
+                required_symbols=signal_symbols,
+                trade_date=trade_date,
+                timeframe=timeframe,
+                current_time=now_local,
+                require_latest_bar=True,
+            )
+            if missing_symbols:
                 supplemented = _supplement_first_day_band_result(
                     account_key=monitor.account_key,
-                    symbols=symbols,
+                    symbols=missing_symbols,
                     trade_date=trade_date,
                     timeframe=timeframe,
+                    force_refresh=True,
+                    db=main_db,
+                    user_id=user_id or getattr(monitor, "user_id", None),
                 )
                 if supplemented is not None:
-                    result = supplemented
-        else:
-            result = evaluate_intraday_confirmation(symbols=symbols, trade_date=trade_date, timeframe=timeframe)
-        return {"timeframe": result.timeframe, "source": result.source, "items": result.items, "missing_symbols": result.missing_symbols}
+                    supplement_items, supplement_missing, supplement_stale, supplement_incomplete = _fresh_minute_items_for_trade_date(
+                        supplemented.items,
+                        required_symbols=missing_symbols,
+                        trade_date=trade_date,
+                        timeframe=timeframe,
+                        current_time=now_local,
+                        require_latest_bar=True,
+                    )
+                    by_symbol = {str(item.get("symbol")): item for item in items}
+                    by_symbol.update({str(item.get("symbol")): item for item in supplement_items})
+                    items = list(by_symbol.values())
+                    missing_symbols = sorted(set(supplement_missing) | (set(missing_symbols) - set(by_symbol)))
+                    stale_symbols = sorted((set(stale_symbols) | set(supplement_stale)) - set(by_symbol))
+                    incomplete_symbols = sorted((set(incomplete_symbols) | set(supplement_incomplete)) - set(by_symbol))
+                    source = f"{result.source}+{supplemented.source}"
+                else:
+                    source = result.source
+            else:
+                source = result.source
+            seen = {str(item.get("symbol")) for item in items if item.get("symbol")}
+            latest_closed_bar_end = _latest_closed_bar_end(now_local, timeframe)
+            return {
+                "timeframe": result.timeframe,
+                "source": _realtime_minute_source(source, minute_capture),
+                "items": items,
+                "missing_symbols": sorted(set(all_symbols) - seen),
+                "stale_symbols": sorted(set(stale_symbols) | set(capture_stale_symbols)),
+                "incomplete_symbols": incomplete_symbols,
+                "capture_missing_symbols": capture_missing_symbols,
+                "capture_stale_symbols": capture_stale_symbols,
+                "capture_latest_trade_times": capture_latest_trade_times,
+                "latest_closed_bar_end": latest_closed_bar_end.isoformat(),
+                "qmt_required": True,
+                "signal_mode": signal_mode,
+            }
+        result = evaluate_intraday_confirmation(
+            symbols=signal_symbols,
+            trade_date=trade_date,
+            timeframe=timeframe,
+            allow_cache=False,
+            allow_synthetic=False,
+        )
+        items, missing_symbols, stale_symbols, incomplete_symbols = _fresh_minute_items_for_trade_date(
+            result.items,
+            required_symbols=signal_symbols,
+            trade_date=trade_date,
+            timeframe=timeframe,
+            current_time=now_local,
+            require_latest_bar=True,
+        )
+        seen = {str(item.get("symbol")) for item in items if item.get("symbol")}
+        latest_closed_bar_end = _latest_closed_bar_end(now_local, timeframe)
+        return {
+            "timeframe": result.timeframe,
+            "source": _realtime_minute_source(result.source, minute_capture),
+            "items": items,
+            "missing_symbols": sorted(set(all_symbols) - seen),
+            "stale_symbols": sorted(set(stale_symbols) | set(capture_stale_symbols)),
+            "incomplete_symbols": incomplete_symbols,
+            "capture_missing_symbols": capture_missing_symbols,
+            "capture_stale_symbols": capture_stale_symbols,
+            "capture_latest_trade_times": capture_latest_trade_times,
+            "latest_closed_bar_end": latest_closed_bar_end.isoformat(),
+            "qmt_required": True,
+            "signal_mode": signal_mode,
+        }
     except Exception as exc:
-        return {"timeframe": timeframe, "source": "unavailable", "items": [], "missing_symbols": symbols, "error": str(exc), "signal_mode": signal_mode}
+        return {
+            "timeframe": timeframe,
+            "source": "unavailable",
+            "items": [],
+            "missing_symbols": all_symbols,
+            "stale_symbols": [],
+            "incomplete_symbols": [],
+            "capture_missing_symbols": capture_missing_symbols,
+            "capture_stale_symbols": capture_stale_symbols,
+            "capture_latest_trade_times": capture_latest_trade_times,
+            "latest_closed_bar_end": _latest_closed_bar_end(now_local, timeframe).isoformat(),
+            "error": str(exc),
+            "signal_mode": signal_mode,
+            "qmt_required": True,
+        }
+
+
+def _qmt_captured_symbols(
+    symbols: list[str],
+    minute_capture: dict[str, Any] | None,
+    *,
+    trade_date: str,
+) -> tuple[set[str], list[str]]:
+    normalized = {_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)}
+    if minute_capture is None:
+        return set(normalized), []
+    captured_trade_date = str(minute_capture.get("trade_date") or "").strip()
+    if captured_trade_date and captured_trade_date != trade_date:
+        return set(), sorted(normalized)
+    symbol_rows = minute_capture.get("symbol_rows") if isinstance(minute_capture.get("symbol_rows"), dict) else {}
+    captured_raw = minute_capture.get("captured_symbols") if isinstance(minute_capture.get("captured_symbols"), list) else []
+    missing_raw = minute_capture.get("missing_symbols") if isinstance(minute_capture.get("missing_symbols"), list) else []
+    captured = {_normalize_symbol(symbol) for symbol in captured_raw if _normalize_symbol(symbol)}
+    if not captured and symbol_rows:
+        captured = {
+            _normalize_symbol(symbol)
+            for symbol, rows in symbol_rows.items()
+            if _normalize_symbol(symbol) and int(rows or 0) > 0
+        }
+    if not captured and not symbol_rows and not missing_raw and bool(minute_capture.get("success")) and int(minute_capture.get("rows") or 0) > 0:
+        captured = set(normalized)
+    captured = {symbol for symbol in captured if symbol in normalized}
+    missing = {
+        _normalize_symbol(symbol)
+        for symbol in missing_raw
+        if _normalize_symbol(symbol) in normalized
+    }
+    missing |= normalized - captured
+    return captured, sorted(missing)
+
+
+def _qmt_fresh_captured_symbols(
+    symbols: list[str],
+    minute_capture: dict[str, Any] | None,
+    *,
+    trade_date: str,
+    timeframe: str,
+    current_time: datetime,
+) -> tuple[set[str], list[str], list[str], dict[str, str]]:
+    captured, missing = _qmt_captured_symbols(symbols, minute_capture, trade_date=trade_date)
+    if minute_capture is None or not captured:
+        return captured, missing, [], {}
+
+    latest_closed_bar_end = _latest_closed_bar_end(current_time, timeframe)
+    latest_raw = minute_capture.get("symbol_latest_trade_times")
+    latest_by_symbol = latest_raw if isinstance(latest_raw, dict) else {}
+    fresh: set[str] = set()
+    stale: set[str] = set()
+    latest_trade_times: dict[str, str] = {}
+    for symbol in captured:
+        latest_text = str(latest_by_symbol.get(symbol) or "").strip()
+        if latest_text:
+            latest_trade_times[symbol] = latest_text
+        latest_dt = _parse_local_datetime(latest_text)
+        if latest_dt is None or latest_dt.date().isoformat() != trade_date:
+            stale.add(symbol)
+            continue
+        if latest_dt < latest_closed_bar_end:
+            stale.add(symbol)
+            continue
+        fresh.add(symbol)
+    missing_symbols = sorted(set(missing) | (captured - fresh))
+    return fresh, missing_symbols, sorted(stale), latest_trade_times
+
+
+def _realtime_minute_source(source: str, minute_capture: dict[str, Any] | None) -> str:
+    source_text = str(source or "empty")
+    if minute_capture is None:
+        return source_text
+    capture_source = str((minute_capture or {}).get("source") or "qmt_intraday").strip()
+    if not capture_source or capture_source in source_text:
+        return source_text
+    return f"{capture_source}+{source_text}"
+
+
+def _fresh_minute_items_for_trade_date(
+    items: list[dict[str, Any]],
+    *,
+    required_symbols: list[str],
+    trade_date: str,
+    timeframe: str,
+    current_time: datetime | None = None,
+    require_latest_bar: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    required = {_normalize_symbol(symbol) for symbol in required_symbols if _normalize_symbol(symbol)}
+    latest_closed_bar_end = _latest_closed_bar_end(current_time or datetime.now(), timeframe)
+    fresh_items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    stale_symbols: set[str] = set()
+    incomplete_symbols: set[str] = set()
+    for raw_item in items or []:
+        if not isinstance(raw_item, dict):
+            continue
+        symbol = _normalize_symbol(raw_item.get("symbol"))
+        if not symbol or symbol not in required:
+            continue
+        bar_end = str(raw_item.get("bar_end") or "")
+        if bar_end[:10] != trade_date:
+            stale_symbols.add(symbol)
+            continue
+        bar_end_dt = _parse_local_datetime(bar_end)
+        if bar_end_dt is None:
+            stale_symbols.add(symbol)
+            continue
+        if bar_end_dt > latest_closed_bar_end:
+            incomplete_symbols.add(symbol)
+            continue
+        if require_latest_bar and bar_end_dt < latest_closed_bar_end:
+            stale_symbols.add(symbol)
+            continue
+        item = dict(raw_item)
+        item["symbol"] = symbol
+        fresh_items.append(item)
+        seen.add(symbol)
+    missing_symbols = sorted(required - seen)
+    return fresh_items, missing_symbols, sorted(stale_symbols - seen), sorted(incomplete_symbols - seen)
+
+
+def _latest_closed_bar_end(current_time: datetime, timeframe: str) -> datetime:
+    current = current_time.replace(tzinfo=None)
+    rule = _timeframe_to_pandas_rule(timeframe)
+    return pd.Timestamp(current).floor(rule).to_pydatetime()
+
+
+def _timeframe_to_pandas_rule(timeframe: str) -> str:
+    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min"}
+    return mapping.get(str(timeframe or "").strip().lower(), "30min")
+
+
+def _parse_local_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d%H%M%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _minute_result_covers_trade_date(items: list[dict[str, Any]], trade_date: str) -> bool:
@@ -658,6 +1116,9 @@ def _supplement_first_day_band_result(
     symbols: list[str],
     trade_date: str,
     timeframe: str,
+    force_refresh: bool = False,
+    db: Session | None = None,
+    user_id: str | None = None,
 ):
     live_records: list[dict[str, Any]] = []
     for symbol in symbols:
@@ -667,7 +1128,11 @@ def _supplement_first_day_band_result(
             period="1m",
             include_latest_quote=False,
             account_key=account_key,
+            db=db,
+            user_id=user_id,
             persist=True,
+            force_refresh=force_refresh,
+            allow_cache=not force_refresh,
         )
         items = payload.get("items") or []
         if isinstance(items, list):
@@ -696,7 +1161,6 @@ def _generate_signals(
     config = monitor.config_json or {}
     signal_mode = str(config.get("signal_mode") or "intraday_confirmation").strip().lower()
     signal_timeframe = str(config.get("signal_timeframe") or minute_features.get("timeframe") or "30m").strip().lower()
-    max_signals = int(config.get("max_signals_per_cycle") or 3)
     positions = {item.get("symbol"): item for item in (overview.get("positions") or []) if item.get("symbol")}
     signals: list[dict[str, Any]] = []
     risk = dict(monitor.risk_config_json or {})
@@ -719,8 +1183,6 @@ def _generate_signals(
             )
     if signal_mode == "first_day_band":
         for item in minute_features.get("items") or []:
-            if len(signals) >= max_signals:
-                break
             symbol = item.get("symbol")
             action = str(item.get("signal") or "hold").lower()
             if not symbol or action not in {"buy", "sell"}:
@@ -729,7 +1191,7 @@ def _generate_signals(
             price = _to_float(quote.get("price"), item.get("close"), quote.get("close"))
             if not price:
                 continue
-            if action == "buy" and symbol not in positions:
+            if action == "buy":
                 signals.append(
                     {
                         "symbol": symbol,
@@ -742,7 +1204,7 @@ def _generate_signals(
                         "timeframe": signal_timeframe,
                     }
                 )
-            if action == "sell" and symbol in positions:
+            if action == "sell":
                 signals.append(
                     {
                         "symbol": symbol,
@@ -762,10 +1224,6 @@ def _generate_signals(
             if item.get("confirmed") is True
         }
         for symbol in confirmed_symbols:
-            if len(signals) >= max_signals:
-                break
-            if symbol in positions:
-                continue
             quote = quotes.get(symbol) or {}
             price = _to_float(quote.get("price"), quote.get("close"))
             if not price:
@@ -781,7 +1239,7 @@ def _generate_signals(
                     "source": "dsl_realtime_ir",
                 }
             )
-    return signals[:max_signals]
+    return signals
 
 
 def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
@@ -790,11 +1248,13 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
     side = signal["side"]
     symbol = signal["symbol"]
     price = float(signal.get("price") or 0)
-    lot_size = int((monitor.config_json or {}).get("lot_size") or 100)
+    lot_size = _monitor_lot_size(monitor)
     reentry_anchor_quantity = None
+    position = positions.get(symbol) or {}
+    available_position = float(position.get("available_position") or 0.0)
+    current_position = float(position.get("current_position") or 0.0)
     if side == "sell":
-        available = float((positions.get(symbol) or {}).get("available_position") or 0.0)
-        quantity = int(available // lot_size) * lot_size
+        quantity = int(available_position // lot_size) * lot_size
     else:
         total_asset = float(account.get("total_asset") or account.get("available_cash") or 0.0)
         available_cash = float(account.get("available_cash") or account.get("cash") or total_asset)
@@ -822,6 +1282,8 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
         "strategy_name": f"RealtimeMonitor-{monitor.id[:8]}",
         "order_remark": signal.get("reason") or "realtime_monitor",
         "target_position_pct": signal.get("target_position_pct"),
+        "available_position": round(available_position, 2),
+        "current_position": round(current_position, 2),
     }
     if reentry_anchor_quantity is not None:
         intent["reentry_anchor_quantity"] = reentry_anchor_quantity
@@ -833,15 +1295,10 @@ def _risk_check(db: Session, monitor: RealtimeMonitorDB, intent: dict[str, Any],
         return {"passed": False, "reason": "live_readonly_not_whitelisted"}
     if monitor.status == "fused":
         return {"passed": False, "reason": "monitor_fused"}
-    if not _is_trading_session(_now_dt()) and not bool((monitor.config_json or {}).get("allow_outside_session")):
+    if not _is_monitor_trading_window(_now_dt()) and not bool((monitor.config_json or {}).get("allow_outside_session")):
         return {"passed": False, "reason": "outside_continuous_auction_session"}
-    if int(intent.get("quantity") or 0) < int((monitor.config_json or {}).get("lot_size") or 100):
+    if int(intent.get("quantity") or 0) < _monitor_lot_size(monitor):
         return {"passed": False, "reason": "quantity_below_lot_size"}
-    if _already_ordered_today(db, monitor, intent):
-        return {"passed": False, "reason": "duplicate_order_today"}
-    max_daily_orders = int((monitor.risk_config_json or {}).get("max_daily_orders") or 20)
-    if _today_order_count(db, monitor) >= max_daily_orders:
-        return {"passed": False, "reason": "max_daily_orders_reached"}
     return {"passed": True, "reason": "passed", "signal_source": signal.get("source")}
 
 
@@ -909,6 +1366,7 @@ def _execute_order_intent(db: Session, main_db: Session, monitor: RealtimeMonito
             price_type=str(intent.get("price_type") or "opponent"),
             strategy_name=str(intent.get("strategy_name") or "RealtimeMonitor"),
             order_remark=str(intent.get("order_remark") or reason),
+            overview_allow_cache_fallback=False,
         )
         return _normalize_broker_result(result)
     except Exception as exc:
@@ -963,6 +1421,7 @@ def _append_event(
     )
     db.add(event)
     db.flush()
+    _publish_event_to_subscribers(event)
     _runtime_log(
         f"event={event_type} monitor={monitor.id} account={monitor.account_key} strategy={monitor.strategy_id} symbol={symbol or '-'}"
     )
@@ -1489,6 +1948,7 @@ def _monitor_payload(monitor: RealtimeMonitorDB) -> dict[str, Any]:
         "reason": monitor.fused_reason,
         "last_heartbeat_at": payload.get("last_heartbeat_at"),
     }
+    payload["data_governance"] = build_realtime_monitor_governance(payload)
     return payload
 
 
@@ -1692,9 +2152,21 @@ def _account_role(account_key: str) -> str:
     return "paper" if "paper" in account_key else "live" if "live" in account_key else "paper"
 
 
+def _is_trading_day(value: datetime) -> bool:
+    local_date = value.astimezone().date()
+    try:
+        return is_cn_trading_day(local_date.isoformat())
+    except Exception:
+        return local_date.weekday() < 5
+
+
 def _is_trading_session(value: datetime) -> bool:
     local = value.astimezone().time()
     return dtime(9, 30) <= local <= dtime(11, 30) or dtime(13, 0) <= local <= dtime(15, 0)
+
+
+def _is_monitor_trading_window(value: datetime) -> bool:
+    return _is_trading_day(value) and _is_trading_session(value)
 
 
 def _already_ordered_today(db: Session, monitor: RealtimeMonitorDB, intent: dict[str, Any]) -> bool:
@@ -1737,6 +2209,24 @@ def _update_state_stats(monitor: RealtimeMonitorDB, *, latest_cycle: str) -> Non
     state["latest_cycle"] = latest_cycle
     state["last_updated_at"] = _now_dt().isoformat()
     monitor.state_json = state
+
+
+def _monitor_lot_size(monitor: RealtimeMonitorDB) -> int:
+    return max(int((monitor.config_json or {}).get("lot_size") or 100), 1)
+
+
+def _should_block_unsellable_signal(
+    monitor: RealtimeMonitorDB,
+    intent: dict[str, Any],
+    signal: dict[str, Any],
+    risk: dict[str, Any],
+) -> bool:
+    return (
+        str(signal.get("side") or "").lower() == "sell"
+        and str(risk.get("reason") or "") == "quantity_below_lot_size"
+        and int(intent.get("quantity") or 0) < _monitor_lot_size(monitor)
+        and float(intent.get("available_position") or 0.0) < _monitor_lot_size(monitor)
+    )
 
 
 def _runtime_log(message: str, *, level: str = "INFO") -> None:

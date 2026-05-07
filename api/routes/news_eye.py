@@ -7,14 +7,16 @@ from sqlalchemy.orm import Session
 
 from api.database import get_db
 from api.deps import require_api_user
+from api.schemas.news_eye import NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse
 from api.services import news_eye_service
 
 router = APIRouter(prefix="/v1/news-eye", tags=["News Eye"])
 
 
-@router.get("/items")
+@router.get("/items", response_model=NewsEyeListResponse)
 def list_news_items(
     limit: int = Query(120, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=5000),
     source: str | None = Query(None),
     sentiment: str | None = Query(None),
     symbol: str | None = Query(None),
@@ -26,6 +28,7 @@ def list_news_items(
     return news_eye_service.list_news_items(
         db,
         limit=limit,
+        offset=offset,
         source=source,
         sentiment=sentiment,
         symbol=symbol,
@@ -45,4 +48,17 @@ def refresh_news_items(
         limit=limit,
         symbols=symbols,
         trigger="manual",
+    )
+
+
+@router.post("/analyze", response_model=NewsEyeAnalyzeResponse)
+def analyze_news_item(
+    payload: NewsEyeAnalyzeRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_api_user),
+) -> dict[str, Any]:
+    return news_eye_service.analyze_news_item(
+        db,
+        user_id=current_user.id,
+        payload=payload.model_dump(),
     )

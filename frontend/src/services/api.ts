@@ -1,11 +1,46 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeListResponse, NewsEyeRefreshResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
+
+type ApiRequestOptions = RequestInit & {
+    timeoutMs?: number
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 15000
+const DAILY_REVIEW_GENERATE_TIMEOUT_MS = 180000
+
+function isLoopbackHostname(hostname: string): boolean {
+    const normalized = hostname.trim().toLowerCase()
+    return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '0.0.0.0' || normalized === '::1'
+}
+
+function isLoopbackLikeUrl(value: string): boolean {
+    try {
+        const parsed = new URL(value)
+        return isLoopbackHostname(parsed.hostname)
+    } catch {
+        return false
+    }
+}
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
-    if (envUrl) return envUrl.replace(/\/$/, '')
     if (typeof window !== 'undefined' && window.location?.origin) {
-        return window.location.origin.replace(/\/$/, '')
+        const origin = window.location.origin.replace(/\/$/, '')
+        const originIsLoopback = isLoopbackLikeUrl(origin)
+        const remotePage = !isLoopbackLikeUrl(origin)
+        if (envUrl) {
+            const normalizedEnvUrl = envUrl.replace(/\/$/, '')
+            // In local development, prefer the current Vite origin so `/v1` requests
+            // go through the configured dev proxy instead of bypassing it.
+            if (originIsLoopback && isLoopbackLikeUrl(normalizedEnvUrl)) {
+                return origin
+            }
+            if (!(remotePage && isLoopbackLikeUrl(normalizedEnvUrl))) {
+                return normalizedEnvUrl
+            }
+        }
+        return origin
     }
+    if (envUrl) return envUrl.replace(/\/$/, '')
     return 'http://localhost:8500'
 }
 
@@ -19,18 +54,42 @@ function getAuthToken(): string | null {
 }
 
 class ApiService {
-    public async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+    public async request<T>(endpoint: string, options?: ApiRequestOptions): Promise<T> {
         const url = `${getBaseUrl()}${endpoint}`
         const token = getAuthToken()
-        const response = await fetch(url, {
-            ...options,
-            credentials: 'include',  // 包含cookie用于session认证
-            headers: {
-                'Content-Type': 'application/json',
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
-                ...options?.headers,
-            },
-        })
+        let response: Response
+        const {
+            timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+            signal,
+            headers,
+            ...fetchOptions
+        } = options || {}
+        const controller = signal ? null : new AbortController()
+        const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null
+        try {
+            response = await fetch(url, {
+                ...fetchOptions,
+                signal: signal || controller?.signal,
+                credentials: 'include',  // 包含cookie用于session认证
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                    ...headers,
+                },
+            })
+        } catch (error) {
+            if (error instanceof Error && error.name === 'AbortError') {
+                const seconds = Math.round(timeoutMs / 1000)
+                const message = controller
+                    ? `请求超时：接口超过 ${seconds} 秒未返回，请稍后查看生成结果或重试`
+                    : '请求已取消'
+                throw new Error(`${message}。当前接口地址：${url}`)
+            }
+            const message = error instanceof Error ? error.message : '未知网络错误'
+            throw new Error(`网络连接失败：${message}。当前接口地址：${url}`)
+        } finally {
+            if (timeoutId) window.clearTimeout(timeoutId)
+        }
 
         if (!response.ok) {
             const contentType = response.headers.get('content-type') || ''
@@ -107,6 +166,7 @@ class ApiService {
 
     async getNewsEyeItems(params?: {
         limit?: number
+        offset?: number
         source?: string
         sentiment?: string
         symbol?: string
@@ -114,6 +174,7 @@ class ApiService {
     }): Promise<NewsEyeListResponse> {
         const query = new URLSearchParams()
         if (params?.limit) query.append('limit', String(params.limit))
+        if (typeof params?.offset === 'number') query.append('offset', String(params.offset))
         if (params?.source) query.append('source', params.source)
         if (params?.sentiment) query.append('sentiment', params.sentiment)
         if (params?.symbol) query.append('symbol', params.symbol)
@@ -125,6 +186,13 @@ class ApiService {
     async refreshNewsEye(limit = 80): Promise<NewsEyeRefreshResponse> {
         return this.request<NewsEyeRefreshResponse>(`/v1/news-eye/refresh?limit=${limit}`, {
             method: 'POST',
+        })
+    }
+
+    async analyzeNewsEye(payload: NewsEyeAnalyzeRequest): Promise<NewsEyeAnalyzeResponse> {
+        return this.request<NewsEyeAnalyzeResponse>('/v1/news-eye/analyze', {
+            method: 'POST',
+            body: JSON.stringify(payload),
         })
     }
 
@@ -227,10 +295,20 @@ class ApiService {
     async getPortfolioOverview(): Promise<PortfolioOverviewResponse> {
         return this.request<PortfolioOverviewResponse>('/v1/portfolio/overview')
     }
-    async getQmtVirtualWarehouseOverview(accountKey?: string): Promise<VirtualWarehouseOverviewResponse> {
+    async getQmtVirtualWarehouseOverview(accountKey?: string, preferredRole?: 'paper' | 'live', preferCache = false): Promise<VirtualWarehouseOverviewResponse> {
         const params = new URLSearchParams()
         if (accountKey) params.set('account_key', accountKey)
+        if (preferredRole) params.set('preferred_role', preferredRole)
+        if (preferCache) params.set('prefer_cache', 'true')
         return this.request<VirtualWarehouseOverviewResponse>(`/v1/virtual-warehouse/qmt/overview${params.toString() ? `?${params}` : ''}`)
+    }
+    async triggerQmtVirtualWarehouseRefresh(accountKey?: string, preferredRole?: 'paper' | 'live'): Promise<QmtBackgroundRefreshResponse> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        if (preferredRole) params.set('preferred_role', preferredRole)
+        return this.request<QmtBackgroundRefreshResponse>(`/v1/virtual-warehouse/qmt/refresh${params.toString() ? `?${params}` : ''}`, {
+            method: 'POST',
+        })
     }
     async syncQmtVirtualWarehouse(accountKey?: string): Promise<{ message: string; source: string; summary: Record<string, unknown>; overview: VirtualWarehouseOverviewResponse }> {
         const params = new URLSearchParams()
@@ -678,16 +756,18 @@ class ApiService {
         })
     }
 
-    async getRealtimeMonitorEvents(monitorId: string, params?: { limit?: number; after_id?: string }): Promise<{ items: RealtimeEvent[] }> {
+    async getRealtimeMonitorEvents(monitorId: string, params?: { limit?: number; after_id?: string; since_started?: boolean }): Promise<{ items: RealtimeEvent[] }> {
         const query = new URLSearchParams()
         if (params?.limit) query.set('limit', String(params.limit))
         if (params?.after_id) query.set('after_id', params.after_id)
+        if (params?.since_started !== undefined) query.set('since_started', String(params.since_started))
         return this.request<{ items: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/events${query.toString() ? `?${query}` : ''}`)
     }
 
-    async streamRealtimeMonitor(monitorId: string, params?: { initial_limit?: number; signal?: AbortSignal }): Promise<Response> {
+    async streamRealtimeMonitor(monitorId: string, params?: { initial_limit?: number; initial_since_started?: boolean; signal?: AbortSignal }): Promise<Response> {
         const query = new URLSearchParams()
         if (params?.initial_limit !== undefined) query.set('initial_limit', String(params.initial_limit))
+        if (params?.initial_since_started !== undefined) query.set('initial_since_started', String(params.initial_since_started))
         const token = getAuthToken()
         const response = await fetch(`${getBaseUrl()}/v1/realtime/monitors/${monitorId}/stream${query.toString() ? `?${query}` : ''}`, {
             method: 'GET',
@@ -750,6 +830,13 @@ class ApiService {
         })
     }
 
+    async listStrategyPlatformBacktests(params?: { strategy_id?: string; limit?: number }): Promise<{ items: BacktestRun[] }> {
+        const query = new URLSearchParams()
+        if (params?.strategy_id) query.set('strategy_id', params.strategy_id)
+        if (params?.limit) query.set('limit', String(params.limit))
+        return this.request<{ items: BacktestRun[] }>(`/v1/backtests${query.toString() ? `?${query.toString()}` : ''}`)
+    }
+
     async getStrategyPlatformBacktest(runId: string): Promise<BacktestRun> {
         return this.request<BacktestRun>(`/v1/backtests/${runId}`)
     }
@@ -798,8 +885,16 @@ class ApiService {
         return this.request<{ items: BacktestEquityPoint[] }>(`/v1/backtests/${runId}/equity`)
     }
 
-    async getStrategyPlatformBacktestWatchlists(runId: string): Promise<{ items: BacktestWatchlistItem[] }> {
-        return this.request<{ items: BacktestWatchlistItem[] }>(`/v1/backtests/${runId}/watchlists`)
+    async getStrategyPlatformBacktestWatchlists(
+        runId: string,
+        options: { skip?: number; limit?: number; sort_by?: string; sort_order?: 'asc' | 'desc' } = {},
+    ): Promise<{ items: BacktestWatchlistItem[], total?: number }> {
+        const params = new URLSearchParams()
+        params.set('skip', String(options.skip ?? 0))
+        params.set('limit', String(options.limit ?? 1000))
+        if (options.sort_by) params.set('sort_by', options.sort_by)
+        if (options.sort_order) params.set('sort_order', options.sort_order)
+        return this.request<{ items: BacktestWatchlistItem[], total?: number }>(`/v1/backtests/${runId}/watchlists?${params.toString()}`)
     }
 
     async getStrategyPlatformBacktestMinuteConfirmations(runId: string): Promise<{ items: BacktestMinuteConfirmationItem[] }> {
@@ -864,6 +959,34 @@ class ApiService {
         return this.request<WecomWarmupResponse>('/v1/config/wecom/warmup', {
             method: 'POST',
             body: JSON.stringify(request),
+        })
+    }
+
+    async getDailyReview(tradeDate?: string): Promise<DailyReview | null> {
+        const suffix = tradeDate ? `?trade_date=${encodeURIComponent(tradeDate)}` : ''
+        return this.request<DailyReview | null>(`/v1/daily-reviews${suffix}`)
+    }
+
+    async getDailyReviewHistory(limit = 60): Promise<{ items: DailyReviewHistoryItem[] }> {
+        return this.request<{ items: DailyReviewHistoryItem[] }>(`/v1/daily-reviews/history?limit=${limit}`)
+    }
+
+    async generateDailyReview(payload?: { trade_date?: string; push_after_generate?: boolean }): Promise<DailyReview> {
+        return this.request<DailyReview>('/v1/daily-reviews/generate', {
+            method: 'POST',
+            body: JSON.stringify(payload || {}),
+            timeoutMs: DAILY_REVIEW_GENERATE_TIMEOUT_MS,
+        })
+    }
+
+    async getDailyReviewConfig(): Promise<DailyReviewConfig> {
+        return this.request<DailyReviewConfig>('/v1/daily-reviews/config')
+    }
+
+    async updateDailyReviewConfig(payload: Partial<DailyReviewConfig>): Promise<DailyReviewConfig> {
+        return this.request<DailyReviewConfig>('/v1/daily-reviews/config', {
+            method: 'PATCH',
+            body: JSON.stringify(payload),
         })
     }
 
@@ -940,6 +1063,10 @@ class ApiService {
 
     async markFeedbackRead(id: string): Promise<void> {
         return this.request<void>(`/v1/feedbacks/${id}/read`, { method: 'POST' })
+    }
+
+    async getSystemDataSources(): Promise<SystemDataSourceRegistryResponse> {
+        return this.request<SystemDataSourceRegistryResponse>('/v1/system/data-sources')
     }
 }
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
+import os
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,17 +15,21 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.core.strategy_db import StrategySessionLocal, get_strategy_db, strategy_engine
+from api.core.strategy_db import StrategySessionLocal, get_strategy_db
 from api.core.runtime_config import build_runtime_config
 from api.database import UserDB, get_db
 from api.deps import optional_web_user
-from api.models.strategy_models import Base, PaperAccountDB, PaperOrderDB, TradeRecordDB
+from api.models.strategy_models import PaperAccountDB, PaperOrderDB, TradeRecordDB
 from api.services.factor_registry import get_factor_registry_item, list_factor_registry
+from api.services.data_source_governance import build_backtest_governance
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
+from api.services.market_data_pipeline_service import preferred_daily_kline_table, preferred_minute_kline_table
 from api.services.strategy_dsl_schema import StrategyDslSchema
 from api.services.strategy_platform_engine import (
     build_evolution_candidates,
+    enrich_watchlist_sector_metadata,
     read_artifact_items,
+    read_artifact_page,
     run_strategy_backtest,
 )
 from api.services.strategy_platform_repository import (
@@ -34,6 +40,7 @@ from api.services.strategy_platform_repository import (
     get_platform_evolution_experiment,
     get_platform_strategy,
     get_platform_strategy_versions,
+    list_platform_backtest_runs,
     list_platform_evolution_candidates,
     list_platform_strategies,
     save_platform_backtest_run,
@@ -310,9 +317,14 @@ class BacktestRun(BaseModel):
     result: dict[str, Any] | None = None
     artifact_root: str | None = None
     error_message: str | None = None
+    data_governance: dict[str, Any] | None = None
     created_at: str
     started_at: str | None = None
     completed_at: str | None = None
+
+
+class BacktestRunListResponse(BaseModel):
+    items: list[BacktestRun]
 
 
 class BacktestCompareRequest(BaseModel):
@@ -329,6 +341,14 @@ class PaperAccountCreateRequest(BaseModel):
     id: str | None = None
     name: str | None = None
     initial_capital: float = Field(default=1_000_000, ge=0)
+
+
+def _with_backtest_governance(run: BacktestRun) -> BacktestRun:
+    return run.model_copy(update={"data_governance": build_backtest_governance(run.model_dump())})
+
+
+def _backtest_run_from_payload(payload: Mapping[str, Any]) -> BacktestRun:
+    return _with_backtest_governance(BacktestRun(**payload))
 
 
 class EvolutionCandidate(BaseModel):
@@ -765,6 +785,11 @@ _MINUTE_CONFIRMATIONS: dict[str, list[dict[str, Any]]] = {}
 _BACKTEST_STATUS_EVENTS: dict[str, list[dict[str, Any]]] = {}
 _EXPERIMENTS: dict[str, EvolutionExperiment] = {}
 _BACKTEST_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_BACKTEST_ARTIFACT_MEMORY_LIMIT = int(os.getenv("BACKTEST_ARTIFACT_MEMORY_LIMIT", "5000"))
+
+
+def _should_execute_backtest_inline() -> bool:
+    return "pytest" in sys.modules or os.getenv("TA_BACKTEST_INLINE") == "1"
 
 
 def _sse_pack(event: str, data: dict[str, Any]) -> str:
@@ -976,6 +1001,57 @@ def _detail_response(
         "sort_by": sort_by,
         "sort_order": sort_order,
     }
+
+
+def _artifact_detail_response(
+    run_id: str,
+    name: str,
+    cache: dict[str, list[dict[str, Any]]],
+    *,
+    skip: int,
+    limit: int,
+    sort_by: str | None,
+    sort_order: Literal["asc", "desc"],
+    enrich_watchlist: bool = False,
+) -> dict[str, Any]:
+    cached_items = cache.get(run_id)
+    if cached_items is not None:
+        return _detail_response(
+            enrich_watchlist_sector_metadata(cached_items) if enrich_watchlist else cached_items,
+            skip=skip,
+            limit=limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+
+    paged = read_artifact_page(
+        run_id,
+        name,
+        skip=skip,
+        limit=limit,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    if paged is not None:
+        if enrich_watchlist:
+            paged["items"] = enrich_watchlist_sector_metadata(paged.get("items") or [])
+        return paged
+
+    items = read_artifact_items(run_id, name)
+    if enrich_watchlist:
+        items = enrich_watchlist_sector_metadata(items)
+    return _detail_response(
+        items,
+        skip=skip,
+        limit=limit,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+
+def _watchlist_items_for_response(run_id: str) -> list[dict[str, Any]]:
+    items = _WATCHLISTS.get(run_id) or read_artifact_items(run_id, "watchlists")
+    return enrich_watchlist_sector_metadata(items)
 
 
 def _sort_value(item: Mapping[str, Any], key: str) -> tuple[int, Any]:
@@ -1350,7 +1426,6 @@ def _strategy_definition_from_payload(payload: dict[str, Any]) -> StrategyDefini
 
 
 def _ensure_seed_strategies(db: Session) -> None:
-    Base.metadata.create_all(strategy_engine)
     existing = list_platform_strategies(db)
     existing_names = {item.get("name") for item in existing}
     legacy_name = "首日波段金叉选股策略"
@@ -1382,7 +1457,6 @@ async def list_strategy_platform_factors(
     search: str | None = Query(None),
     db: Session = Depends(get_strategy_db),
 ):
-    Base.metadata.create_all(strategy_engine)
     items = [FactorRegistryItem(**payload) for payload in list_factor_registry(db, active_only=active_only)]
     if category:
         items = [item for item in items if item.category == category]
@@ -1399,7 +1473,6 @@ async def list_strategy_platform_factors(
 
 @router.get("/v1/factors/{factor_name}", response_model=FactorRegistryItem)
 async def get_strategy_platform_factor(factor_name: str, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     payload = get_factor_registry_item(db, factor_name)
     if payload is None:
         raise HTTPException(status_code=404, detail="Factor not found")
@@ -1449,12 +1522,12 @@ async def create_llm_strategy_draft(
             )
         ],
         data_dependencies=[
-            "stock_daily_kline.close",
-            "stock_daily_kline.volume",
-            "stock_daily_kline.float_market_cap",
-            "stock_daily_kline.net_profit_ttm",
+            f"{preferred_daily_kline_table()}.close",
+            f"{preferred_daily_kline_table()}.volume",
+            f"{preferred_daily_kline_table()}.float_market_cap",
+            f"{preferred_daily_kline_table()}.net_profit_ttm",
             "concept_membership",
-            "minute_kline.30m",
+            f"{preferred_minute_kline_table()}.30m",
         ],
         risk_notes=[
             "分钟线只按 Watchlist 懒加载，避免全市场分钟数据 OOM。",
@@ -1981,14 +2054,21 @@ def _build_backtest_request_config(request: BacktestCreateRequest, frequency: st
 
 
 def _store_backtest_artifacts(run_id: str, engine_result: Any) -> None:
-    _EQUITY[run_id] = engine_result.equity
-    _TRADES[run_id] = engine_result.trades
-    _SNAPSHOTS[run_id] = engine_result.snapshots
-    _SIGNALS[run_id] = engine_result.signals
-    _POSITIONS[run_id] = engine_result.positions
-    _ORDERS[run_id] = engine_result.orders
-    _WATCHLISTS[run_id] = engine_result.watchlists
-    _MINUTE_CONFIRMATIONS[run_id] = engine_result.minute_confirmations
+    _cache_backtest_artifact(_EQUITY, run_id, engine_result.equity)
+    _cache_backtest_artifact(_TRADES, run_id, engine_result.trades)
+    _cache_backtest_artifact(_SNAPSHOTS, run_id, engine_result.snapshots)
+    _cache_backtest_artifact(_SIGNALS, run_id, engine_result.signals)
+    _cache_backtest_artifact(_POSITIONS, run_id, engine_result.positions)
+    _cache_backtest_artifact(_ORDERS, run_id, engine_result.orders)
+    _cache_backtest_artifact(_WATCHLISTS, run_id, engine_result.watchlists)
+    _cache_backtest_artifact(_MINUTE_CONFIRMATIONS, run_id, engine_result.minute_confirmations)
+
+
+def _cache_backtest_artifact(cache: dict[str, list[dict[str, Any]]], run_id: str, items: list[dict[str, Any]]) -> None:
+    if _BACKTEST_ARTIFACT_MEMORY_LIMIT > 0 and len(items) <= _BACKTEST_ARTIFACT_MEMORY_LIMIT:
+        cache[run_id] = items
+    else:
+        cache.pop(run_id, None)
 
 
 def _execute_strategy_platform_backtest(
@@ -2103,13 +2183,43 @@ async def create_strategy_platform_backtest(
         message="回测任务已创建，正在进入后台执行队列",
         stage="queued",
     )
+    if _should_execute_backtest_inline():
+        _execute_strategy_platform_backtest(
+            run_id,
+            {**request.model_dump(), "frequency": effective_frequency},
+            strategy_model.model_dump(),
+        )
+        latest_run = _BACKTESTS.get(run_id)
+        if latest_run is not None:
+            return _with_backtest_governance(latest_run)
+        payload = get_platform_backtest_run(db, run_id)
+        if payload is not None:
+            return _backtest_run_from_payload(payload)
+        return _with_backtest_governance(run)
     background_tasks.add_task(
         _execute_strategy_platform_backtest,
         run_id,
         {**request.model_dump(), "frequency": effective_frequency},
         strategy_model.model_dump(),
     )
-    return run
+    return _with_backtest_governance(run)
+
+
+@router.get("/v1/backtests", response_model=BacktestRunListResponse)
+async def list_strategy_platform_backtests(
+    strategy_id: str | None = Query(None),
+    limit: int = Query(8, ge=1, le=50),
+    db: Session = Depends(get_strategy_db),
+):
+    items = [
+        _backtest_run_from_payload(payload)
+        for payload in list_platform_backtest_runs(
+            db,
+            strategy_id=strategy_id,
+            limit=limit,
+        )
+    ]
+    return BacktestRunListResponse(items=items)
 
 
 @router.get("/v1/backtests/{run_id}", response_model=BacktestRun)
@@ -2118,9 +2228,9 @@ async def get_strategy_platform_backtest(run_id: str, db: Session = Depends(get_
     if run is None:
         payload = get_platform_backtest_run(db, run_id)
         if payload is not None:
-            return BacktestRun(**payload)
+            return _backtest_run_from_payload(payload)
         raise HTTPException(status_code=404, detail="Backtest not found")
-    return run
+    return _with_backtest_governance(run)
 
 
 @router.get("/v1/backtests/{run_id}/stream")
@@ -2130,7 +2240,7 @@ async def stream_strategy_platform_backtest(run_id: str, db: Session = Depends(g
         payload = get_platform_backtest_run(db, run_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="Backtest not found")
-        run = BacktestRun(**payload)
+        run = _backtest_run_from_payload(payload)
         _BACKTESTS[run_id] = run
 
     async def event_generator():
@@ -2194,7 +2304,7 @@ async def cancel_strategy_platform_backtest(run_id: str, db: Session = Depends(g
         run = BacktestRun(**payload)
 
     if run.status in {"completed", "failed", "cancelled"}:
-        return run
+        return _with_backtest_governance(run)
 
     run.status = "cancelled"
     run.progress = 1.0
@@ -2209,7 +2319,7 @@ async def cancel_strategy_platform_backtest(run_id: str, db: Session = Depends(g
         stage="cancelled",
         completed_at=run.completed_at,
     )
-    return run
+    return _with_backtest_governance(run)
 
 
 @router.post("/v1/backtests/compare")
@@ -2331,8 +2441,10 @@ async def get_strategy_platform_backtest_equity(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _EQUITY.get(run_id) or read_artifact_items(run_id, "equity"),
+    return _artifact_detail_response(
+        run_id,
+        "equity",
+        _EQUITY,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2350,8 +2462,10 @@ async def get_strategy_platform_backtest_trades(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _TRADES.get(run_id) or read_artifact_items(run_id, "trades"),
+    return _artifact_detail_response(
+        run_id,
+        "trades",
+        _TRADES,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2369,8 +2483,10 @@ async def get_strategy_platform_backtest_trade_snapshots(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _SNAPSHOTS.get(run_id) or read_artifact_items(run_id, "trade_snapshots"),
+    return _artifact_detail_response(
+        run_id,
+        "trade_snapshots",
+        _SNAPSHOTS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2388,8 +2504,10 @@ async def get_strategy_platform_backtest_signals(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _SIGNALS.get(run_id) or read_artifact_items(run_id, "signals"),
+    return _artifact_detail_response(
+        run_id,
+        "signals",
+        _SIGNALS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2407,8 +2525,10 @@ async def get_strategy_platform_backtest_positions(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _POSITIONS.get(run_id) or read_artifact_items(run_id, "positions"),
+    return _artifact_detail_response(
+        run_id,
+        "positions",
+        _POSITIONS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2426,8 +2546,10 @@ async def get_strategy_platform_backtest_orders(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _ORDERS.get(run_id) or read_artifact_items(run_id, "orders"),
+    return _artifact_detail_response(
+        run_id,
+        "orders",
+        _ORDERS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2445,12 +2567,15 @@ async def get_strategy_platform_backtest_watchlists(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _WATCHLISTS.get(run_id) or read_artifact_items(run_id, "watchlists"),
+    return _artifact_detail_response(
+        run_id,
+        "watchlists",
+        _WATCHLISTS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
         sort_order=sort_order,
+        enrich_watchlist=True,
     )
 
 
@@ -2464,8 +2589,10 @@ async def get_strategy_platform_backtest_minute_confirmations(
     db: Session = Depends(get_strategy_db),
 ):
     _ensure_backtest_exists(db, run_id)
-    return _detail_response(
-        _MINUTE_CONFIRMATIONS.get(run_id) or read_artifact_items(run_id, "minute_confirmations"),
+    return _artifact_detail_response(
+        run_id,
+        "minute_confirmations",
+        _MINUTE_CONFIRMATIONS,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
@@ -2479,9 +2606,9 @@ def _latest_completed_backtest_for_strategy(db: Session, strategy_id: str) -> Ba
         if run.strategy_id == strategy_id and run.status == "completed"
     ]
     if cached_runs:
-        return max(cached_runs, key=lambda run: run.completed_at or run.created_at)
+        return _with_backtest_governance(max(cached_runs, key=lambda run: run.completed_at or run.created_at))
     payload = get_latest_completed_platform_backtest(db, strategy_id)
-    return BacktestRun(**payload) if payload is not None else None
+    return _backtest_run_from_payload(payload) if payload is not None else None
 
 
 def _apply_dsl_patch(dsl: StrategyDsl, patch: dict[str, Any]) -> StrategyDsl:
@@ -2519,7 +2646,6 @@ def _set_nested_value(payload: dict[str, Any], parts: list[str], value: Any) -> 
 
 @router.post("/v1/evolution/experiments", response_model=EvolutionExperiment)
 async def create_evolution_experiment(request: EvolutionCreateRequest, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     if get_platform_strategy(db, request.strategy_id) is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
     experiment_id = uuid4().hex
@@ -2571,7 +2697,6 @@ async def get_evolution_experiment(experiment_id: str, db: Session = Depends(get
     experiment = _EXPERIMENTS.get(experiment_id)
     if experiment:
         return experiment
-    Base.metadata.create_all(strategy_engine)
     payload = get_platform_evolution_experiment(db, experiment_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="Evolution experiment not found")
@@ -2585,7 +2710,6 @@ async def get_evolution_candidates(experiment_id: str, db: Session = Depends(get
     experiment = _EXPERIMENTS.get(experiment_id)
     if experiment:
         return {"candidates": experiment.candidates}
-    Base.metadata.create_all(strategy_engine)
     payload = list_platform_evolution_candidates(db, experiment_id)
     if not payload:
         experiment_payload = get_platform_evolution_experiment(db, experiment_id)
@@ -2597,7 +2721,6 @@ async def get_evolution_candidates(experiment_id: str, db: Session = Depends(get
 
 @router.post("/v1/evolution/candidates/{candidate_id}/accept", response_model=StrategyDefinition)
 async def accept_evolution_candidate(candidate_id: str, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     candidate_payload = get_platform_evolution_candidate(db, candidate_id)
     if candidate_payload is None:
         for experiment in _EXPERIMENTS.values():
@@ -2673,7 +2796,6 @@ async def accept_evolution_candidate(candidate_id: str, db: Session = Depends(ge
 
 @router.post("/v1/paper/accounts")
 async def create_paper_account(request: PaperAccountCreateRequest, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     account_id = request.id or uuid4().hex
     existing = db.query(PaperAccountDB).filter(PaperAccountDB.id == account_id).first()
     if existing is not None:
@@ -2695,7 +2817,6 @@ async def create_paper_account(request: PaperAccountCreateRequest, db: Session =
 
 @router.get("/v1/paper/accounts")
 async def list_paper_accounts(db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     rows = db.query(PaperAccountDB).order_by(PaperAccountDB.updated_at.desc()).all()
     return {"items": [row.to_dict() for row in rows]}
 
@@ -2704,7 +2825,6 @@ async def list_paper_accounts(db: Session = Depends(get_strategy_db)):
 async def run_paper_strategy(account_id: str, strategy_id: str = Query(...), db: Session = Depends(get_strategy_db)):
     if get_platform_strategy(db, strategy_id) is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    Base.metadata.create_all(strategy_engine)
     account = _get_or_create_paper_account(db, account_id)
     signal = _resolve_paper_order_signal(db, strategy_id)
     quantity = _paper_order_quantity(account, signal["price"], signal["side"])
@@ -2760,7 +2880,6 @@ async def run_paper_strategy(account_id: str, strategy_id: str = Query(...), db:
 
 @router.get("/v1/paper/accounts/{account_id}/orders")
 async def get_paper_orders(account_id: str, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     rows = (
         db.query(PaperOrderDB)
         .filter(PaperOrderDB.account_id == account_id)
@@ -2772,7 +2891,6 @@ async def get_paper_orders(account_id: str, db: Session = Depends(get_strategy_d
 
 @router.get("/v1/paper/accounts/{account_id}/positions")
 async def get_paper_positions(account_id: str, db: Session = Depends(get_strategy_db)):
-    Base.metadata.create_all(strategy_engine)
     rows = db.query(PaperOrderDB).filter(PaperOrderDB.account_id == account_id).all()
     positions: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -2942,13 +3060,6 @@ def _run_validation_backtest(
     )
     save_platform_backtest_run(db, payload.model_dump())
     _BACKTESTS[validation_run_id] = payload
-    _EQUITY[validation_run_id] = engine_result.equity
-    _TRADES[validation_run_id] = engine_result.trades
-    _SNAPSHOTS[validation_run_id] = engine_result.snapshots
-    _SIGNALS[validation_run_id] = engine_result.signals
-    _POSITIONS[validation_run_id] = engine_result.positions
-    _ORDERS[validation_run_id] = engine_result.orders
-    _WATCHLISTS[validation_run_id] = engine_result.watchlists
-    _MINUTE_CONFIRMATIONS[validation_run_id] = engine_result.minute_confirmations
+    _store_backtest_artifacts(validation_run_id, engine_result)
     update_platform_strategy_metrics(db, strategy.id, metrics.model_dump())
     return payload

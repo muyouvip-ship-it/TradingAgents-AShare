@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import math
 import os
@@ -12,6 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.engine import Engine
 
 from api.core.env import load_project_env
 from api.services.a_share_market_rules import get_a_share_market_rule, round_to_tick
@@ -23,6 +25,7 @@ from api.services.daily_kline_parquet_store import (
 )
 from api.services.strategy_compute_backend import compute_daily_features
 from api.services.minute_data_service import evaluate_intraday_confirmation
+from api.services.market_data_pipeline_service import preferred_daily_kline_table
 from api.services.strategy_dsl_compiler import CompiledStrategy, compile_strategy_dsl
 
 
@@ -35,6 +38,79 @@ SECTOR_MEMBERSHIP_JSON_PATH = UNIVERSE_METADATA_ROOT / "sector_memberships.json"
 
 _symbol_metadata_cache_df: pd.DataFrame | None = None
 _sector_membership_cache_df: pd.DataFrame | None = None
+_market_data_engine: Engine | None = None
+_market_data_engine_url: str | None = None
+DAILY_KLINE_COMPUTE_COLUMNS = {
+    "symbol",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "pre_close",
+    "net_profit_ttm",
+    "turnover_rate",
+}
+DAILY_KLINE_RAW_COLUMN_ORDER = [
+    "symbol",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "turnover_rate",
+    "pre_close",
+    "float_market_cap",
+    "total_market_cap",
+    "net_profit_ttm",
+    "sw_industry_l1",
+    "sw_industry_l2",
+    "sw_industry_l3",
+]
+DAILY_KLINE_RAW_COLUMNS = {
+    *DAILY_KLINE_RAW_COLUMN_ORDER,
+}
+DAILY_METADATA_COLUMNS = {
+    "listing_date",
+    "listing_days",
+    "listed_days",
+    "days_since_listing",
+    "concept",
+    "concepts",
+    "sector",
+    "industry",
+    "sw_industry_l1",
+    "sw_industry_l2",
+    "sw_industry_l3",
+}
+BACKTEST_FEATURE_COLUMNS = {
+    "symbol",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "pre_close",
+    "ma5",
+    "ma20",
+    "momentum_20d",
+    "momentum_60d",
+    "volatility_20d",
+    "rsi_14",
+    "atr_14",
+    "money_flow_strength_20d",
+    "momentum_rank_pct",
+    "money_flow_rank_pct",
+    "profit_growth_rank_pct",
+    "factor_score",
+    "weekly_trend_pass",
+}
 
 
 @dataclass
@@ -75,7 +151,10 @@ def run_strategy_backtest(
     selection_only_mode = strategy_type == "selection"
     symbols = _normalize_symbols(symbols)
     warmup_start_date = _resolve_feature_warmup_start(start_date, compiled)
-    raw_data, data_source = _load_daily_kline(symbols, warmup_start_date, end_date)
+    raw_data, data_source = _load_daily_kline(symbols, warmup_start_date, end_date, compiled=compiled)
+    raw_prefilter = {"enabled": False, "reason": "explicit_symbol_universe"} if symbols else {"enabled": False}
+    if not symbols:
+        raw_data, raw_prefilter = _prefilter_raw_daily_universe(raw_data, compiled)
     feature_frame, compute_backend = compute_daily_features(raw_data, compiled)
     feature_frame = _trim_feature_frame_to_backtest_window(feature_frame, start_date, end_date)
     _raise_if_backtest_window_has_no_market_data(
@@ -85,6 +164,9 @@ def run_strategy_backtest(
         end_date=end_date,
         strategy_name=strategy_name,
     )
+    del raw_data
+    feature_frame = _prune_feature_frame_for_backtest(feature_frame, compiled)
+    gc.collect()
     walk_forward = walk_forward or {}
     walk_forward_enabled = bool(walk_forward.get("enabled"))
     walk_forward_report: dict[str, Any] | None = None
@@ -149,6 +231,7 @@ def run_strategy_backtest(
         ) if portfolio["minute_symbol_days"] else 0.0,
         "minute_data_missing": portfolio["minute_data_missing"],
         "universe_filter": portfolio["universe_filter"],
+        "raw_universe_prefilter": raw_prefilter,
         "order_count": len(portfolio["orders"]),
         "risk_event_count": len(portfolio["risk_events"]),
         "risk_events": portfolio["risk_events"][:50],
@@ -298,6 +381,154 @@ def read_artifact_items(run_id: str, name: str) -> list[dict[str, Any]]:
     return []
 
 
+def read_artifact_page(
+    run_id: str,
+    name: str,
+    *,
+    skip: int,
+    limit: int,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
+) -> dict[str, Any] | None:
+    parquet_path = ARTIFACT_ROOT / run_id / f"{name}.parquet"
+    if parquet_path.exists() and _has_module("duckdb"):
+        page = _read_artifact_page_with_duckdb(
+            parquet_path,
+            skip=skip,
+            limit=limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+        if page is not None:
+            return page
+    json_items = read_artifact_items(run_id, name)
+    if not json_items:
+        return None
+    if sort_by:
+        json_items = sorted(
+            json_items,
+            key=lambda item: _artifact_sort_value(item, sort_by),
+            reverse=sort_order == "desc",
+        )
+    total = len(json_items)
+    return {
+        "items": json_items[skip: skip + limit],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+    }
+
+
+def _read_artifact_page_with_duckdb(
+    path: Path,
+    *,
+    skip: int,
+    limit: int,
+    sort_by: str | None,
+    sort_order: str,
+) -> dict[str, Any] | None:
+    try:
+        import duckdb
+
+        columns = list(duckdb.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(path)]).fetchdf().columns)
+        if not columns:
+            return None
+        total = int(duckdb.execute("SELECT COUNT(*) FROM read_parquet(?)", [str(path)]).fetchone()[0] or 0)
+        order_clause = ""
+        if sort_by and sort_by in columns:
+            direction = "DESC" if sort_order == "desc" else "ASC"
+            order_clause = f" ORDER BY {_quote_duckdb_identifier(sort_by)} {direction}"
+        elif sort_by:
+            sort_by = None
+        frame = duckdb.execute(
+            f"SELECT * FROM read_parquet(?){order_clause} LIMIT ? OFFSET ?",
+            [str(path), limit, skip],
+        ).fetchdf()
+        items = [_artifact_json_safe(row) for row in frame.to_dict("records")]
+        return {
+            "items": items,
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        }
+    except Exception:
+        return None
+
+
+def _quote_duckdb_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _artifact_sort_value(item: dict[str, Any], key: str) -> tuple[int, Any]:
+    value = item.get(key)
+    if value is None:
+        return (1, "")
+    if isinstance(value, (int, float, str, bool)):
+        return (0, value)
+    return (0, str(value))
+
+
+def _artifact_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _artifact_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_artifact_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_artifact_json_safe(item) for item in value]
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    return value
+
+
+def enrich_watchlist_sector_metadata(
+    items: list[dict[str, Any]],
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    enriched = [dict(item) for item in items]
+    symbols = [
+        _safe_text(item.get("symbol"))
+        for item in enriched
+        if _safe_text(item.get("symbol"))
+    ]
+    if not symbols:
+        return enriched
+    metadata_date = end_date or _latest_item_date(enriched)
+    metadata = _load_symbol_metadata(symbols, metadata_date)
+    metadata_by_symbol: dict[str, dict[str, Any]] = {}
+    if metadata is not None and not metadata.empty:
+        for _, row in metadata.iterrows():
+            symbol = _safe_text(row.get("symbol"))
+            if symbol:
+                metadata_by_symbol[symbol] = row.to_dict()
+    for item in enriched:
+        symbol = _normalize_symbol(_safe_text(item.get("symbol")))
+        metadata_row = metadata_by_symbol.get(symbol, {})
+        for field in ("sw_industry_l1", "sw_industry_l2", "sw_industry_l3", "sector", "industry", "concepts"):
+            if _safe_text(item.get(field)):
+                continue
+            value = _safe_text(metadata_row.get(field))
+            if value:
+                item[field] = value
+        item.update(_watchlist_sector_payload(item))
+    return enriched
+
+
 def _resolve_feature_warmup_start(start_date: str, compiled: CompiledStrategy) -> str:
     max_window = 0
     for factor in compiled.factor_definitions:
@@ -321,12 +552,57 @@ def _trim_feature_frame_to_backtest_window(frame: pd.DataFrame, start_date: str,
     return trimmed.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
-def _load_daily_kline(symbols: list[str], start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
+def _prune_feature_frame_for_backtest(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    keep_columns = set(BACKTEST_FEATURE_COLUMNS)
+    for factor in compiled.factor_definitions:
+        source_column = str(factor.get("source_column") or factor.get("name") or "")
+        if source_column:
+            keep_columns.add(source_column)
+    for rule in [*compiled.entry_rules, *compiled.exit_rules]:
+        params = rule.get("params") or {}
+        keep_columns.update(str(params.get(key) or "") for key in ("left", "right", "field", "indicator"))
+        keep_columns.update(str(item) for item in rule.get("data_requirements") or [])
+    for item in (compiled.selection_plan or {}).get("filters") or []:
+        field = str(item.get("field") or "")
+        if field:
+            keep_columns.add(field)
+    if _compiled_uses_daily_field(compiled, "first_day_band") or _compiled_uses_daily_field(compiled, "first_day_band_b1"):
+        keep_columns.update({"first_day_band", "first_day_band_b1", "first_day_band_cross", "first_day_band_dead_cross"})
+    existing = [column for column in frame.columns if column in keep_columns]
+    return frame.loc[:, existing].copy()
+
+
+def _compiled_uses_daily_field(compiled: CompiledStrategy, field: str) -> bool:
+    for factor in compiled.factor_definitions:
+        if str(factor.get("source_column") or factor.get("name") or "") == field:
+            return True
+        if field in {str(item) for item in factor.get("required_fields") or []}:
+            return True
+    for rule in [*compiled.entry_rules, *compiled.exit_rules]:
+        params = rule.get("params") or {}
+        if any(str(params.get(key) or "") == field for key in ("left", "right", "field", "indicator")):
+            return True
+        if field in {str(item) for item in rule.get("data_requirements") or []}:
+            return True
+    return False
+
+
+def _load_daily_kline(
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    *,
+    compiled: CompiledStrategy | None = None,
+) -> tuple[pd.DataFrame, str]:
     variants = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+    parquet_columns = _daily_kline_columns_for_strategy(compiled, end_date) if compiled is not None else None
     parquet_frame = load_daily_kline_slice_from_parquet(
         symbols=variants,
         start_date=start_date,
         end_date=end_date,
+        columns=parquet_columns,
     )
     if parquet_frame is not None and not parquet_frame.empty:
         normalized = _normalize_daily_frame(parquet_frame)
@@ -339,30 +615,100 @@ def _load_daily_kline(symbols: list[str], start_date: str, end_date: str) -> tup
                 merged = pd.concat([normalized, db_tail], ignore_index=True)
                 merged = _normalize_daily_frame(merged)
                 write_daily_kline_parquet_cache(db_tail)
-                return _enrich_daily_kline_metadata(merged, end_date), "duckdb:parquet+postgresql_tail:stock_daily_kline"
-        return _enrich_daily_kline_metadata(normalized, end_date), "duckdb:parquet:stock_daily_kline"
+                return _maybe_enrich_daily_kline_metadata(merged, end_date, compiled), f"duckdb:parquet+postgresql_tail:{preferred_daily_kline_table()}"
+        return _maybe_enrich_daily_kline_metadata(normalized, end_date, compiled), f"duckdb:parquet:{preferred_daily_kline_table()}"
     db_frame = _try_load_daily_kline_from_db(symbols, start_date, end_date)
     if db_frame is not None and not db_frame.empty:
         write_daily_kline_parquet_cache(db_frame)
-        return _enrich_daily_kline_metadata(db_frame, end_date), "postgresql:stock_daily_kline:parquet_cache_updated"
+        return _maybe_enrich_daily_kline_metadata(db_frame, end_date, compiled), f"postgresql:{preferred_daily_kline_table()}:parquet_cache_updated"
     return _generate_synthetic_daily_kline(symbols, start_date, end_date), "synthetic:fallback"
 
 
+def _daily_kline_columns_for_strategy(compiled: CompiledStrategy | None, end_date: str) -> list[str] | None:
+    if compiled is None:
+        return None
+    columns = set(DAILY_KLINE_COMPUTE_COLUMNS)
+    for field in compiled.required_fields:
+        field_name = str(field)
+        if field_name in DAILY_KLINE_RAW_COLUMNS:
+            columns.add(field_name)
+    for factor in compiled.factor_definitions:
+        for field in factor.get("required_fields") or []:
+            field_name = str(field)
+            if field_name in DAILY_KLINE_RAW_COLUMNS:
+                columns.add(field_name)
+    selection_plan = compiled.selection_plan or {}
+    for item in selection_plan.get("filters") or []:
+        field_name = str(item.get("field") or "")
+        if field_name in DAILY_KLINE_RAW_COLUMNS:
+            columns.add(field_name)
+    if selection_plan.get("include_concepts") and _get_or_build_sector_memberships(end_date) is None:
+        columns.update({"sw_industry_l1", "sw_industry_l2", "sw_industry_l3"})
+    return [column for column in DAILY_KLINE_RAW_COLUMN_ORDER if column in columns]
+
+
+def _maybe_enrich_daily_kline_metadata(
+    frame: pd.DataFrame,
+    end_date: str,
+    compiled: CompiledStrategy | None,
+) -> pd.DataFrame:
+    if compiled is None:
+        return _enrich_daily_kline_metadata(frame, end_date)
+    return frame
+
+
+def _prefilter_raw_daily_universe(frame: pd.DataFrame, compiled: CompiledStrategy) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if frame.empty:
+        return frame, {"enabled": False, "input_rows": 0, "output_rows": 0}
+    selection_plan = compiled.selection_plan or {}
+    input_rows = int(len(frame))
+    filtered = frame
+    steps: list[dict[str, Any]] = []
+    if selection_plan.get("include_concepts"):
+        concept_filter = _apply_concept_filter(filtered, selection_plan.get("include_concepts") or [])
+        concept_frame = concept_filter.get("frame")
+        if isinstance(concept_frame, pd.DataFrame) and not concept_frame.empty:
+            steps.append(
+                {
+                    "type": "concepts",
+                    "before": int(len(filtered)),
+                    "after": int(len(concept_frame)),
+                    "status": concept_filter.get("status"),
+                    "source": concept_filter.get("source"),
+                }
+            )
+            filtered = concept_frame
+    for item in selection_plan.get("filters") or []:
+        field = str(item.get("field") or "")
+        if field != "symbol" or field not in filtered.columns:
+            continue
+        next_frame = _apply_universe_filter(filtered, item)
+        if not next_frame.empty:
+            steps.append({"type": "symbol_filter", "field": field, "before": int(len(filtered)), "after": int(len(next_frame))})
+            filtered = next_frame
+    output = filtered.reset_index(drop=True)
+    return output, {
+        "enabled": bool(steps),
+        "input_rows": input_rows,
+        "output_rows": int(len(output)),
+        "steps": steps,
+    }
+
+
 def _try_load_daily_kline_from_db(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame | None:
-    load_project_env()
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
+    engine = _get_market_data_engine()
+    if engine is None:
         return None
     try:
-        engine = create_engine(database_url)
+        table_name = preferred_daily_kline_table()
         variants = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
         if variants:
             statement = text(
-                """
+                f"""
                 SELECT symbol, trade_date AS date, open, high, low, close, volume, amount,
                        turnover_rate, pre_close, float_market_cap, total_market_cap,
                        net_profit_ttm, sw_industry_l1, sw_industry_l2, sw_industry_l3
-                FROM stock_daily_kline
+                FROM {table_name}
                 WHERE trade_date >= :start_date
                   AND trade_date <= :end_date
                   AND symbol IN :symbols
@@ -376,11 +722,11 @@ def _try_load_daily_kline_from_db(symbols: list[str], start_date: str, end_date:
             )
         else:
             statement = text(
-                """
+                f"""
                 SELECT symbol, trade_date AS date, open, high, low, close, volume, amount,
                        turnover_rate, pre_close, float_market_cap, total_market_cap,
                        net_profit_ttm, sw_industry_l1, sw_industry_l2, sw_industry_l3
-                FROM stock_daily_kline
+                FROM {table_name}
                 WHERE trade_date >= :start_date
                   AND trade_date <= :end_date
                 ORDER BY trade_date, symbol
@@ -398,6 +744,20 @@ def _try_load_daily_kline_from_db(symbols: list[str], start_date: str, end_date:
         return None
 
 
+def _get_market_data_engine() -> Engine | None:
+    global _market_data_engine, _market_data_engine_url
+    load_project_env()
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return None
+    if _market_data_engine is None or _market_data_engine_url != database_url:
+        if _market_data_engine is not None:
+            _market_data_engine.dispose()
+        _market_data_engine = create_engine(database_url)
+        _market_data_engine_url = database_url
+    return _market_data_engine
+
+
 def _generate_synthetic_daily_kline(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
     if not symbols:
         symbols = ["300750.SZ", "300520.SZ", "601136.SH"]
@@ -405,9 +765,17 @@ def _generate_synthetic_daily_kline(symbols: list[str], start_date: str, end_dat
     if len(dates) < 80:
         dates = pd.bdate_range(end=end_date, periods=100)
     rows: list[dict[str, Any]] = []
+    synthetic_industries = [
+        ("电力设备", "电池", "锂电池"),
+        ("电子", "半导体", "集成电路"),
+        ("非银金融", "证券", "证券经纪"),
+        ("计算机", "软件开发", "行业应用软件"),
+        ("机械设备", "自动化设备", "机器人"),
+    ]
     for symbol_index, symbol in enumerate(symbols):
         seed = sum(ord(ch) for ch in symbol)
         base = 18 + (seed % 90)
+        industry_l1, industry_l2, industry_l3 = synthetic_industries[symbol_index % len(synthetic_industries)]
         for idx, date_value in enumerate(dates):
             trend = 1 + idx * (0.0018 + symbol_index * 0.0002)
             cycle = 1 + math.sin(idx / 7 + symbol_index) * 0.025
@@ -431,6 +799,9 @@ def _generate_synthetic_daily_kline(symbols: list[str], start_date: str, end_dat
                     "float_market_cap": float(10_000_000_000 + symbol_index * 2_500_000_000 + (idx % 8) * 200_000_000),
                     "total_market_cap": float(18_000_000_000 + symbol_index * 3_000_000_000),
                     "net_profit_ttm": float(900_000_000 + idx * 8_000_000 + symbol_index * 50_000_000),
+                    "sw_industry_l1": industry_l1,
+                    "sw_industry_l2": industry_l2,
+                    "sw_industry_l3": industry_l3,
                 }
             )
     return _normalize_daily_frame(pd.DataFrame(rows))
@@ -495,8 +866,9 @@ def _load_symbol_metadata_from_db(symbols: list[str], end_date: str) -> pd.DataF
         return None
     try:
         engine = create_engine(database_url)
+        table_name = preferred_daily_kline_table()
         statement = text(
-            """
+            f"""
             WITH ranked AS (
                 SELECT
                     symbol,
@@ -509,7 +881,7 @@ def _load_symbol_metadata_from_db(symbols: list[str], end_date: str) -> pd.DataF
                             CASE WHEN sw_industry_l1 IS NOT NULL OR sw_industry_l2 IS NOT NULL OR sw_industry_l3 IS NOT NULL THEN 0 ELSE 1 END,
                             trade_date DESC
                     ) AS row_num
-                FROM stock_daily_kline
+                FROM {table_name}
                 WHERE trade_date <= :end_date
                   AND symbol IN :symbols
             )
@@ -541,14 +913,16 @@ def _attach_concept_aliases(frame: pd.DataFrame) -> pd.DataFrame:
         enriched["sector"] = enriched.get("sw_industry_l1")
     if "industry" not in enriched.columns:
         enriched["industry"] = enriched.get("sw_industry_l2")
+    if "concepts" in enriched.columns:
+        return enriched
 
     def build_tags(row: pd.Series) -> str | None:
         texts = [
-            str(row.get("sw_industry_l1") or "").strip(),
-            str(row.get("sw_industry_l2") or "").strip(),
-            str(row.get("sw_industry_l3") or "").strip(),
-            str(row.get("sector") or "").strip(),
-            str(row.get("industry") or "").strip(),
+            _safe_text(row.get("sw_industry_l1")),
+            _safe_text(row.get("sw_industry_l2")),
+            _safe_text(row.get("sw_industry_l3")),
+            _safe_text(row.get("sector")),
+            _safe_text(row.get("industry")),
         ]
         tags: list[str] = []
         for text in texts:
@@ -600,7 +974,7 @@ def _get_or_build_sector_memberships(end_date: str) -> pd.DataFrame | None:
         return None
     records: list[dict[str, Any]] = []
     for _, row in metadata.iterrows():
-        symbol = str(row.get("symbol") or "").strip()
+        symbol = _safe_text(row.get("symbol"))
         if not symbol:
             continue
         for field, sector_type in (
@@ -610,10 +984,10 @@ def _get_or_build_sector_memberships(end_date: str) -> pd.DataFrame | None:
             ("sector", "sector"),
             ("industry", "industry"),
         ):
-            value = str(row.get(field) or "").strip()
+            value = _safe_text(row.get(field))
             if value:
                 records.append({"symbol": symbol, "sector_name": value, "sector_type": sector_type, "source": "daily_kline_metadata"})
-        for tag in [item.strip() for item in str(row.get("concepts") or "").split(",") if item.strip()]:
+        for tag in [item.strip() for item in _safe_text(row.get("concepts")).split(",") if item.strip()]:
             records.append({"symbol": symbol, "sector_name": tag, "sector_type": "concept_alias", "source": "alias_membership"})
     if not records:
         return None
@@ -687,14 +1061,15 @@ def _load_symbol_listing_dates_from_db(end_date: str) -> pd.DataFrame | None:
         return None
     try:
         engine = create_engine(database_url)
+        table_name = preferred_daily_kline_table()
         frame = pd.read_sql_query(
             text(
-                """
+                f"""
                 SELECT
                     symbol,
                     split_part(symbol, '.', 1) AS symbol_code,
                     MIN(trade_date) AS listing_date
-                FROM stock_daily_kline
+                FROM {table_name}
                 WHERE trade_date <= :end_date
                 GROUP BY 1, 2
                 """
@@ -717,9 +1092,10 @@ def _load_symbol_industry_metadata(end_date: str) -> pd.DataFrame | None:
         return None
     try:
         engine = create_engine(database_url)
+        table_name = preferred_daily_kline_table()
         frame = pd.read_sql_query(
             text(
-                """
+                f"""
                 WITH ranked AS (
                     SELECT
                         symbol,
@@ -733,7 +1109,7 @@ def _load_symbol_industry_metadata(end_date: str) -> pd.DataFrame | None:
                                 CASE WHEN sw_industry_l1 IS NOT NULL OR sw_industry_l2 IS NOT NULL OR sw_industry_l3 IS NOT NULL THEN 0 ELSE 1 END,
                                 trade_date DESC
                         ) AS row_num
-                    FROM stock_daily_kline
+                    FROM {table_name}
                     WHERE trade_date <= :end_date
                 )
                 SELECT symbol, symbol_code, sw_industry_l1, sw_industry_l2, sw_industry_l3
@@ -920,6 +1296,7 @@ def _simulate_portfolio(
     data, universe_filter = _apply_universe_constraints(data, compiled)
     universe_symbol_count = int(data["symbol"].nunique()) if not data.empty and "symbol" in data.columns else 0
     universe_row_count = int(len(data))
+    metadata_payload_by_symbol = _watchlist_metadata_payload_by_symbol(data)
     if data.empty:
         return {
             "equity": [{"date": pd.Timestamp.utcnow().date().isoformat(), "equity": round(initial_capital, 2), "cash": round(initial_capital, 2), "positions_value": 0.0, "drawdown": 0.0}],
@@ -946,6 +1323,7 @@ def _simulate_portfolio(
     close_lookup = data.set_index(["symbol", "date"])["close"].to_dict() if not data.empty else {}
     minute_timeframes = compiled.minute_requirements.get("timeframes") or []
     minute_timeframe = minute_timeframes[-1] if minute_timeframes else "30m"
+    running_peak_equity = float(initial_capital)
 
     for date_index, date_value in enumerate(dates):
         daily = by_date[date_value]
@@ -1038,7 +1416,7 @@ def _simulate_portfolio(
                         },
                     )
                     trades.append(trade)
-                    snapshots.append(_snapshot_record(trade, row, close_lookup))
+                    snapshots.append(_snapshot_record(trade, row, close_lookup, metadata_payload_by_symbol))
                     _mark_order(
                         orders,
                         order_index,
@@ -1080,7 +1458,7 @@ def _simulate_portfolio(
                         pnl=pnl,
                     )
                     trades.append(trade)
-                    snapshots.append(_snapshot_record(trade, row, close_lookup))
+                    snapshots.append(_snapshot_record(trade, row, close_lookup, metadata_payload_by_symbol))
                     if order["reason"] == "stop_loss" and cooldown_days_after_stop > 0:
                         cooldown_until_index[row["symbol"]] = date_index + cooldown_days_after_stop
                     _mark_order(
@@ -1141,12 +1519,17 @@ def _simulate_portfolio(
                 (daily["factor_score"] >= min_score)
                 & _entry_mask(daily, compiled, include_minute_rules=False)
             ].sort_values("factor_score", ascending=False)
-        raw_candidates = base_candidates.head(max_positions).copy()
-        confirmed_candidates = raw_candidates
+        raw_candidates = base_candidates.copy()
+        # Watchlists are reporting output and should keep the full candidate pool.
+        # Trading/minute confirmation still uses the bounded execution slice below.
+        execution_candidates = raw_candidates if selection_only else raw_candidates.head(max_positions).copy()
+        confirmed_candidates = execution_candidates
         confirmed_symbols: set[str] | None = None
+        daily_minute_confirmation_by_symbol: dict[str, dict[str, Any]] = {}
 
         if not raw_candidates.empty:
-            for rank, (_, row) in enumerate(raw_candidates.iterrows(), start=1):
+            for rank, row in enumerate(raw_candidates.to_dict("records"), start=1):
+                metadata_payload = metadata_payload_by_symbol.get(str(row["symbol"]), _watchlist_sector_payload(row))
                 watchlists.append(
                     {
                         "date": date_value.isoformat(),
@@ -1155,6 +1538,7 @@ def _simulate_portfolio(
                         "rank": rank,
                         "stage": "daily_watchlist",
                         "weekly_trend_pass": bool(row.get("weekly_trend_pass", True)),
+                        **metadata_payload,
                     }
                 )
 
@@ -1162,13 +1546,13 @@ def _simulate_portfolio(
             frequency == "daily_minute"
             and use_minute_confirm
             and bool(compiled.minute_requirements.get("enabled"))
-            and not raw_candidates.empty
+            and not execution_candidates.empty
         )
         if should_use_minute:
             minute_load_count += 1
-            minute_symbol_days += len(raw_candidates)
+            minute_symbol_days += len(execution_candidates)
             minute_result = evaluate_intraday_confirmation(
-                symbols=raw_candidates["symbol"].tolist(),
+                symbols=execution_candidates["symbol"].tolist(),
                 trade_date=date_value.date().isoformat(),
                 timeframe=minute_timeframe,
             )
@@ -1185,27 +1569,27 @@ def _simulate_portfolio(
                     if bool(row.get("confirmed"))
                 }
                 confirm_hit_count += len(confirmed_symbols)
-                confirmed_candidates = raw_candidates[raw_candidates["symbol"].isin(confirmed_symbols)]
-                for rank, (_, row) in enumerate(raw_candidates.iterrows(), start=1):
+                confirmed_candidates = execution_candidates[execution_candidates["symbol"].isin(confirmed_symbols)]
+                for rank, (_, row) in enumerate(execution_candidates.iterrows(), start=1):
                     minute_row = confirmation_map.get(row["symbol"])
-                    minute_confirmations.append(
-                        {
-                            "date": date_value.isoformat(),
-                            "symbol": row["symbol"],
-                            "rank": rank,
-                            "timeframe": minute_timeframe,
-                            "confirmed": bool(minute_row.get("confirmed")) if minute_row is not None else False,
-                            "source": minute_result.source,
-                            "close": round(float(minute_row.get("close", 0.0)), 4) if minute_row is not None else None,
-                            "vwap": round(float(minute_row.get("vwap", 0.0)), 4) if minute_row is not None else None,
-                            "bar_end": str(minute_row.get("bar_end")) if minute_row is not None else None,
-                            "factor_score": round(float(row["factor_score"]), 6),
-                        }
-                    )
+                    confirmation_payload = {
+                        "date": date_value.isoformat(),
+                        "symbol": row["symbol"],
+                        "rank": rank,
+                        "timeframe": minute_timeframe,
+                        "confirmed": bool(minute_row.get("confirmed")) if minute_row is not None else False,
+                        "source": minute_result.source,
+                        "close": round(float(minute_row.get("close", 0.0)), 4) if minute_row is not None else None,
+                        "vwap": round(float(minute_row.get("vwap", 0.0)), 4) if minute_row is not None else None,
+                        "bar_end": str(minute_row.get("bar_end")) if minute_row is not None else None,
+                        "factor_score": round(float(row["factor_score"]), 6),
+                    }
+                    minute_confirmations.append(confirmation_payload)
+                    daily_minute_confirmation_by_symbol[str(row["symbol"])] = confirmation_payload
             else:
-                confirmed_candidates = raw_candidates.iloc[0:0]
+                confirmed_candidates = execution_candidates.iloc[0:0]
                 confirmed_symbols = set()
-        candidates = confirmed_candidates if should_use_minute else raw_candidates
+        candidates = confirmed_candidates if should_use_minute else execution_candidates
         if selection_only:
             equity_curve.append(
                 {
@@ -1255,7 +1639,7 @@ def _simulate_portfolio(
             minute_confirm = None
             if should_use_minute:
                 reason += " + lazy_minute_confirm"
-                minute_confirm = next((item for item in minute_confirmations if item["date"] == date_value.isoformat() and item["symbol"] == symbol), None)
+                minute_confirm = daily_minute_confirmation_by_symbol.get(symbol)
             order_id = _append_order(
                 orders,
                 order_index,
@@ -1338,7 +1722,8 @@ def _simulate_portfolio(
                 "positions_value": round(positions_value, 2),
             }
         )
-        drawdown = equity / max([float(item["equity"]) for item in equity_curve] or [equity]) - 1 if equity_curve else 0.0
+        running_peak_equity = max(running_peak_equity, equity)
+        drawdown = equity / running_peak_equity - 1 if running_peak_equity else 0.0
         if not risk_halted and max_drawdown_pct < 1.0 and drawdown <= -abs(max_drawdown_pct):
             risk_halted = True
             risk_events.append({"date": date_value.isoformat(), "type": "max_drawdown_halt", "value": round(drawdown, 6), "threshold": -abs(max_drawdown_pct)})
@@ -1553,9 +1938,9 @@ def _apply_universe_constraints(data: pd.DataFrame, compiled: CompiledStrategy) 
     input_rows = int(len(filtered))
     selection_plan = compiled.selection_plan or {}
     if selection_plan.get("exclude_suspended", True):
-        filtered = filtered[~filtered.apply(_is_suspended, axis=1)]
+        filtered = filtered[_tradable_row_mask(filtered)]
     if selection_plan.get("exclude_st", True):
-        filtered = filtered[~filtered.apply(_is_st, axis=1)]
+        filtered = filtered[~_st_row_mask(filtered)]
     concept_filter = _apply_concept_filter(filtered, selection_plan.get("include_concepts") or [])
     filtered = concept_filter.pop("frame")
     min_listing_days = ((compiled.normalized_dsl.get("universe") or {}).get("min_listing_days") or 0) if isinstance(compiled.normalized_dsl, dict) else 0
@@ -1567,6 +1952,12 @@ def _apply_universe_constraints(data: pd.DataFrame, compiled: CompiledStrategy) 
     for item in selection_plan.get("filters") or []:
         field = str(item.get("field") or "")
         if field not in filtered.columns:
+            metadata_filtered = _apply_metadata_universe_filter(filtered, item)
+            if metadata_filtered is None:
+                continue
+            before_count = int(len(filtered))
+            filtered = metadata_filtered
+            applied_filters.append({"field": field, "op": item.get("op"), "before": before_count, "after": int(len(filtered)), "source": "symbol_metadata"})
             continue
         before_count = int(len(filtered))
         filtered = _apply_universe_filter(filtered, item)
@@ -1584,6 +1975,38 @@ def _apply_universe_constraints(data: pd.DataFrame, compiled: CompiledStrategy) 
         "listing_days_filter": listing_days_filter,
         "fallback_to_unfiltered": fallback_to_unfiltered,
     }
+
+
+def _tradable_row_mask(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(False, index=frame.index)
+    open_price = _numeric_frame_column(frame, "open")
+    close_price = _numeric_frame_column(frame, "close")
+    volume = _numeric_frame_column(frame, "volume").fillna(0.0)
+    return open_price.notna() & close_price.notna() & (volume > 0)
+
+
+def _numeric_frame_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index)
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def _st_row_mask(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(False, index=frame.index)
+    mask = pd.Series(False, index=frame.index)
+    if "is_st" in frame.columns:
+        raw = frame["is_st"]
+        if raw.dtype == bool:
+            mask = mask | raw.fillna(False)
+        else:
+            mask = mask | raw.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y", "st"})
+    name_columns = [column for column in ("name", "stock_name") if column in frame.columns]
+    for column in name_columns:
+        text = frame[column].astype(str).str.upper()
+        mask = mask | text.str.contains("ST", na=False) | text.str.contains("退", na=False)
+    return mask
 
 
 def _apply_min_listing_days_filter(frame: pd.DataFrame, min_listing_days: int) -> dict[str, Any]:
@@ -1616,6 +2039,20 @@ def _apply_min_listing_days_filter(frame: pd.DataFrame, min_listing_days: int) -
                 "before": before,
                 "after": int(len(filtered)),
             }
+    metadata_listing_date = _metadata_series_for_frame(frame, "listing_date")
+    if metadata_listing_date is not None:
+        before = int(len(frame))
+        listing_date = pd.to_datetime(metadata_listing_date, errors="coerce")
+        trade_date = pd.to_datetime(frame["date"], errors="coerce")
+        filtered = frame[(trade_date - listing_date).dt.days >= min_listing_days]
+        return {
+            "frame": filtered,
+            "requested": min_listing_days,
+            "status": "applied_from_symbol_metadata",
+            "field": "listing_date",
+            "before": before,
+            "after": int(len(filtered)),
+        }
     return {
         "frame": frame,
         "requested": min_listing_days,
@@ -1657,6 +2094,9 @@ def _apply_concept_filter(frame: pd.DataFrame, concepts: list[str]) -> dict[str,
         if column in frame.columns
     ]
     if not concept_columns:
+        metadata_filter = _apply_concept_filter_from_symbol_metadata(frame, concepts)
+        if metadata_filter is not None:
+            return metadata_filter
         return {"frame": frame, "requested": concepts, "status": "metadata_missing", "matched_rows": None}
     mask = pd.Series(False, index=frame.index)
     for column in concept_columns:
@@ -1667,6 +2107,90 @@ def _apply_concept_filter(frame: pd.DataFrame, concepts: list[str]) -> dict[str,
     if filtered.empty:
         return {"frame": frame, "requested": concepts, "status": "no_match_fallback", "matched_rows": 0, "columns": concept_columns}
     return {"frame": filtered, "requested": concepts, "status": "applied", "matched_rows": int(len(filtered)), "columns": concept_columns}
+
+
+def _apply_concept_filter_from_symbol_metadata(frame: pd.DataFrame, concepts: list[str]) -> dict[str, Any] | None:
+    if frame.empty:
+        return None
+    metadata = _symbol_metadata_for_frame(frame)
+    if metadata is None or metadata.empty:
+        return None
+    concept_columns = [
+        column for column in [
+            "concept",
+            "concepts",
+            "sector",
+            "industry",
+            "sw_industry_l1",
+            "sw_industry_l2",
+            "sw_industry_l3",
+        ]
+        if column in metadata.columns
+    ]
+    if not concept_columns:
+        return None
+    mask = pd.Series(False, index=metadata.index)
+    for column in concept_columns:
+        text = metadata[column].astype(str)
+        for concept in concepts:
+            mask = mask | text.str.contains(str(concept), case=False, na=False)
+    matched_symbols = set(metadata.loc[mask, "symbol"].astype(str))
+    if not matched_symbols:
+        return {
+            "frame": frame,
+            "requested": concepts,
+            "status": "no_match_fallback",
+            "matched_rows": 0,
+            "columns": concept_columns,
+            "source": "symbol_metadata",
+        }
+    filtered = frame[frame["symbol"].astype(str).isin(matched_symbols)]
+    if filtered.empty:
+        return {
+            "frame": frame,
+            "requested": concepts,
+            "status": "no_match_fallback",
+            "matched_rows": 0,
+            "columns": concept_columns,
+            "source": "symbol_metadata",
+        }
+    return {
+        "frame": filtered,
+        "requested": concepts,
+        "status": "applied",
+        "matched_rows": int(len(filtered)),
+        "matched_symbols": int(filtered["symbol"].nunique()),
+        "columns": concept_columns,
+        "source": "symbol_metadata",
+    }
+
+
+def _apply_metadata_universe_filter(frame: pd.DataFrame, item: dict[str, Any]) -> pd.DataFrame | None:
+    field = str(item.get("field") or "")
+    if field not in DAILY_METADATA_COLUMNS:
+        return None
+    series = _metadata_series_for_frame(frame, field)
+    if series is None:
+        return None
+    filter_frame = frame.copy()
+    filter_frame[field] = series.to_numpy()
+    return _apply_universe_filter(filter_frame, item).drop(columns=[field], errors="ignore")
+
+
+def _metadata_series_for_frame(frame: pd.DataFrame, field: str) -> pd.Series | None:
+    metadata = _symbol_metadata_for_frame(frame)
+    if metadata is None or metadata.empty or field not in metadata.columns:
+        return None
+    values = metadata.drop_duplicates(["symbol"], keep="first").set_index("symbol")[field]
+    return frame["symbol"].astype(str).map(values)
+
+
+def _symbol_metadata_for_frame(frame: pd.DataFrame) -> pd.DataFrame | None:
+    if frame.empty or "symbol" not in frame.columns or "date" not in frame.columns:
+        return None
+    end_date = pd.to_datetime(frame["date"]).max().date().isoformat()
+    symbols = frame["symbol"].dropna().astype(str).unique().tolist()
+    return _load_symbol_metadata(symbols, end_date)
 
 
 def _apply_universe_filter(frame: pd.DataFrame, item: dict[str, Any]) -> pd.DataFrame:
@@ -2196,7 +2720,12 @@ def _trade_record(
     return payload
 
 
-def _snapshot_record(trade: dict[str, Any], row: pd.Series, close_lookup: dict[tuple[str, Any], float]) -> dict[str, Any]:
+def _snapshot_record(
+    trade: dict[str, Any],
+    row: pd.Series,
+    close_lookup: dict[tuple[str, Any], float],
+    metadata_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     date_value = pd.Timestamp(row["date"])
     symbol = str(row["symbol"])
     labels = {}
@@ -2208,6 +2737,9 @@ def _snapshot_record(trade: dict[str, Any], row: pd.Series, close_lookup: dict[t
             target_index = min(index + days, len(dates) - 1)
             if target_index > index and current_close:
                 labels[f"ret_{days}d"] = round(float(close_lookup[(symbol, dates[target_index])] / current_close - 1), 6)
+    industry_state = _industry_state(row)
+    if industry_state == "industry_metadata_missing" and metadata_by_symbol:
+        industry_state = _industry_state(metadata_by_symbol.get(symbol, {}))
     return {
         "trade_id": trade["trade_id"],
         "symbol": symbol,
@@ -2222,7 +2754,7 @@ def _snapshot_record(trade: dict[str, Any], row: pd.Series, close_lookup: dict[t
             "watchlist_rank": int(trade.get("watchlist_rank") or 0),
         },
         "market_state": "trend_up" if float(row.get("close", 0)) >= float(row.get("ma20", 0)) else "trend_down",
-        "industry_state": _industry_state(row),
+        "industry_state": industry_state,
         "minute_confirm_result": trade.get("minute_confirm"),
         "entry_reason": trade["reason"] if trade["direction"] == "buy" else None,
         "exit_reason": trade["reason"] if trade["direction"] == "sell" else None,
@@ -2352,7 +2884,7 @@ def _normalize_symbols(symbols: list[str]) -> list[str]:
 
 
 def _normalize_symbol(raw: Any) -> str:
-    value = str(raw or "").strip().upper()
+    value = _safe_text(raw).upper()
     if not value:
         return ""
     code = value.split(".")[0]
@@ -2361,6 +2893,59 @@ def _normalize_symbol(raw: Any) -> str:
     if code.startswith(("6", "9")):
         return f"{code}.SH"
     return f"{code}.SZ"
+
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _watchlist_sector_payload(row: Any) -> dict[str, str | None]:
+    sw_l1 = _safe_text(row.get("sw_industry_l1"))
+    sw_l2 = _safe_text(row.get("sw_industry_l2"))
+    sw_l3 = _safe_text(row.get("sw_industry_l3"))
+    sector = _safe_text(row.get("sector")) or sw_l1
+    industry = _safe_text(row.get("industry")) or sw_l2
+    concepts = _safe_text(row.get("concepts"))
+    return {
+        "sw_industry_l1": sw_l1 or None,
+        "sw_industry_l2": sw_l2 or None,
+        "sw_industry_l3": sw_l3 or None,
+        "sector": sector or None,
+        "industry": industry or None,
+        "concepts": concepts or None,
+    }
+
+
+def _watchlist_metadata_payload_by_symbol(frame: pd.DataFrame) -> dict[str, dict[str, str | None]]:
+    if frame.empty or "symbol" not in frame.columns or "date" not in frame.columns:
+        return {}
+    metadata = _symbol_metadata_for_frame(frame)
+    if metadata is None or metadata.empty:
+        return {}
+    payloads: dict[str, dict[str, str | None]] = {}
+    for _, row in metadata.iterrows():
+        symbol = _safe_text(row.get("symbol"))
+        if symbol:
+            payloads[symbol] = _watchlist_sector_payload(row)
+    return payloads
+
+
+def _latest_item_date(items: list[dict[str, Any]]) -> str:
+    dates = [
+        _safe_text(item.get("date"))[:10]
+        for item in items
+        if _safe_text(item.get("date"))
+    ]
+    if dates:
+        return sorted(dates)[-1]
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _symbol_variants(symbol: str) -> set[str]:

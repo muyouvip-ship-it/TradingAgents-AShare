@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import { Loader2, RefreshCw, Search, TrendingDown, TrendingUp } from 'lucide-react'
 
-import KlinePanel from '@/components/KlinePanel'
+import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
+import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type { MarketOverviewResponse, MarketSectorItem, MarketTickerItem, StockSearchResult } from '@/types'
+
+const KlinePanel = lazy(() => import('@/components/KlinePanel'))
 
 function isFiniteNumberValue(value: unknown): value is number {
   if (value === null || value === undefined || value === '') return false
@@ -148,11 +151,10 @@ export default function StockMarket() {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selectedSymbol, setSelectedSymbol] = useState('000001.SH')
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchInput, setSearchInput] = useState('')
   const [searchResults, setSearchResults] = useState<StockSearchResult[]>([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [showDropdown, setShowDropdown] = useState(false)
-  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const loadOverview = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -174,40 +176,30 @@ export default function StockMarket() {
     setRefreshing(false)
   }, [loadOverview])
 
+  const runSearch = useCallback(async (query?: string) => {
+    const q = (query ?? searchInput).trim()
+    if (!q) {
+      setSearchResults([])
+      setShowDropdown(false)
+      return
+    }
+    try {
+      setSearchLoading(true)
+      const response = await api.searchStocks(q)
+      setSearchResults(response.results || [])
+      setShowDropdown(true)
+    } catch {
+      setSearchResults([])
+    } finally {
+      setSearchLoading(false)
+    }
+  }, [searchInput])
+
   useEffect(() => {
     void loadOverview()
   }, [loadOverview])
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void refreshOverview()
-    }, 20000)
-    return () => window.clearInterval(timer)
-  }, [refreshOverview])
-
-  useEffect(() => {
-    if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
-    const q = searchQuery.trim()
-    if (!q) {
-      setSearchResults([])
-      return
-    }
-    searchTimerRef.current = setTimeout(async () => {
-      try {
-        setSearchLoading(true)
-        const response = await api.searchStocks(q)
-        setSearchResults(response.results || [])
-        setShowDropdown(true)
-      } catch {
-        setSearchResults([])
-      } finally {
-        setSearchLoading(false)
-      }
-    }, 250)
-    return () => {
-      if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
-    }
-  }, [searchQuery])
+  usePolling(refreshOverview, { intervalMs: 20000, runImmediately: false })
 
   const selectedName = useMemo(() => {
     const indices = overview?.indices || []
@@ -221,6 +213,74 @@ export default function StockMarket() {
     return inSearch || selectedSymbol
   }, [overview?.indices, overview?.top_gainers, overview?.top_losers, searchResults, selectedSymbol])
 
+  const selectedSearchResult = useMemo(
+    () => searchResults.find(item => item.symbol === selectedSymbol) || null,
+    [searchResults, selectedSymbol],
+  )
+  const selectedMarketItem = useMemo(
+    () => [...(overview?.top_gainers || []), ...(overview?.top_losers || [])].find(item => item.symbol === selectedSymbol) || null,
+    [overview?.top_gainers, overview?.top_losers, selectedSymbol],
+  )
+  const backendGovernance = overview?.data_governance || null
+  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
+    if (backendGovernance?.items?.length) return backendGovernance.items
+    const indexSources = Array.from(new Set((overview?.indices || []).map(item => item.source).filter(Boolean)))
+    const rankingSources = Array.from(
+      new Set([...(overview?.top_gainers || []), ...(overview?.top_losers || [])].map(item => item.source).filter(Boolean)),
+    )
+    const sectorSources = Array.from(
+      new Set([
+        ...(overview?.sector_gainers || []),
+        ...(overview?.sector_losers || []),
+        ...(overview?.sector_fund_inflows || []),
+        ...(overview?.sector_fund_outflows || []),
+      ].map(item => item.source).filter(Boolean)),
+    )
+    return [
+      {
+        label: '页面主数据源',
+        value: overview?.source || '--',
+        detail: overview?.fallback ? '当前页面已经退回前端或后端回退链路' : '当前使用市场总览接口返回结果',
+        tone: overview?.fallback ? 'warn' : 'good',
+      },
+      {
+        label: '指数行情',
+        value: indexSources.join(' / ') || '--',
+        detail: '三大指数与主要宽基指数的实时或近实时来源',
+        tone: indexSources.some(item => String(item).includes('qmt')) ? 'good' : 'neutral',
+      },
+      {
+        label: '个股与榜单',
+        value: rankingSources.join(' / ') || '--',
+        detail: '涨跌榜、搜索结果与个股卡片使用的来源集合',
+        tone: rankingSources.some(item => String(item).includes('qmt')) ? 'good' : 'neutral',
+      },
+      {
+        label: '板块与资金流',
+        value: sectorSources.join(' / ') || '--',
+        detail: '板块热度与资金流一般是独立来源，不等同于实时逐笔行情',
+        tone: sectorSources.some(item => String(item).includes('akshare')) ? 'info' : 'neutral',
+      },
+      {
+        label: '页面更新时间',
+        value: formatDateTime(overview?.updated_at),
+        detail: '这是市场总览接口给出的最近更新时间，不代表每个子模块完全同频',
+        tone: 'info',
+      },
+    ]
+  }, [backendGovernance?.items, overview])
+  const governanceWarnings = useMemo(() => {
+    if (backendGovernance?.warnings?.length) {
+      const merged = [...backendGovernance.warnings]
+      if (error && !merged.includes(error)) merged.push(error)
+      return merged
+    }
+    const warnings: string[] = []
+    if (overview?.fallback) warnings.push('当前市场页已进入 fallback 链路，指数、榜单和板块数据可能来自不同回退源。')
+    if (error) warnings.push(error)
+    return warnings
+  }, [backendGovernance?.warnings, error, overview?.fallback])
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
@@ -230,17 +290,32 @@ export default function StockMarket() {
             查看三大指数、涨跌榜、板块热度和股票搜索，默认每 20 秒自动刷新。
           </p>
         </div>
-        <div className="flex flex-col gap-3 md:flex-row md:items-center">
-          <div className="relative min-w-[300px]">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center">
+          <div className="relative min-w-[320px]">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <input
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               onFocus={() => setShowDropdown(true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void runSearch()
+                }
+              }}
               placeholder="搜索股票代码或名称"
-              className="input w-full pl-10 pr-10"
+              className="input w-full pl-10 pr-28"
             />
-            {searchLoading && <Loader2 className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-slate-400" />}
+            <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-2">
+              {searchLoading && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
+              <button
+                type="button"
+                onClick={() => void runSearch()}
+                className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+              >
+                搜索
+              </button>
+            </div>
             {showDropdown && searchResults.length > 0 && (
               <div className="absolute z-20 mt-2 w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-lg dark:border-slate-700 dark:bg-slate-900">
                 {searchResults.map(result => (
@@ -249,7 +324,7 @@ export default function StockMarket() {
                     type="button"
                     onClick={() => {
                       setSelectedSymbol(result.symbol)
-                      setSearchQuery(`${result.name} ${result.symbol}`)
+                      setSearchInput(result.symbol)
                       setShowDropdown(false)
                     }}
                     className="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-slate-50 dark:hover:bg-slate-800"
@@ -284,6 +359,13 @@ export default function StockMarket() {
         </div>
       )}
 
+      <DataSourceGovernanceCard
+        title="数据源治理"
+        description={backendGovernance?.description || '股票市场页同时混合指数行情、个股榜单、板块热度和资金流来源，必须明确区分。'}
+        items={governanceItems}
+        warnings={governanceWarnings}
+      />
+
       {loading || !overview ? (
         <div className="card flex min-h-[320px] items-center justify-center text-slate-500 dark:text-slate-400">
           <Loader2 className="mr-2 h-5 w-5 animate-spin" />
@@ -291,6 +373,56 @@ export default function StockMarket() {
         </div>
       ) : (
         <>
+          <div className="grid gap-4 lg:grid-cols-[1.25fr_0.75fr]">
+            <div className="card">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-slate-500 dark:text-slate-400">当前选中股票</div>
+                  <div className="mt-2 text-2xl font-bold text-slate-900 dark:text-slate-100">{selectedName}</div>
+                  <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{selectedSymbol}</div>
+                </div>
+                <div className={`rounded-full px-3 py-1 text-sm font-semibold ${
+                  (selectedSearchResult?.change_pct ?? selectedMarketItem?.change_pct ?? 0) >= 0
+                    ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                    : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+                }`}>
+                  {formatPercent(selectedSearchResult?.change_pct ?? selectedMarketItem?.change_pct)}
+                </div>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <div className="rounded-2xl bg-slate-50 p-3 dark:bg-slate-900/40">
+                  <div className="text-xs text-slate-400">最新价</div>
+                  <div className="mt-1 text-lg font-semibold text-slate-900 dark:text-slate-100">
+                    {formatNumber(selectedSearchResult?.current_price ?? selectedMarketItem?.price)}
+                  </div>
+                </div>
+                <div className="rounded-2xl bg-slate-50 p-3 dark:bg-slate-900/40">
+                  <div className="text-xs text-slate-400">数据来源</div>
+                  <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                    {selectedSearchResult?.source || selectedMarketItem?.source || 'market'}
+                  </div>
+                </div>
+                <div className="rounded-2xl bg-slate-50 p-3 dark:bg-slate-900/40">
+                  <div className="text-xs text-slate-400">行情时间</div>
+                  <div className="mt-1 text-sm font-medium text-slate-900 dark:text-slate-100">
+                    {selectedMarketItem?.trade_time || overview.updated_at}
+                  </div>
+                </div>
+              </div>
+              <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+                搜索请点击“搜索”按钮或按回车，选中后会直接刷新下方 K 线，不会在输入过程中自动搜索。
+              </p>
+            </div>
+            <div className="card">
+              <div className="text-sm font-medium text-slate-500 dark:text-slate-400">查看方式</div>
+              <div className="mt-3 space-y-2 text-sm text-slate-600 dark:text-slate-300">
+                <div>1. 输入股票代码或名称，点击搜索</div>
+                <div>2. 在结果里点一下目标股票</div>
+                <div>3. 下方 K 线会切到该股票</div>
+              </div>
+            </div>
+          </div>
+
           <div className="grid gap-4 xl:grid-cols-3">
             {(overview.indices || []).map((item) => {
               const hasChange = isFiniteNumberValue(item.change_pct)
@@ -338,27 +470,37 @@ export default function StockMarket() {
             })}
           </div>
 
-          <div className="grid gap-4 2xl:grid-cols-[1.3fr,1fr]">
-            <div className="space-y-4">
-              <div className="card">
-                <div className="mb-3 flex items-center justify-between">
-                  <div>
-                    <div className="text-base font-semibold text-slate-900 dark:text-slate-100">K 线详情</div>
-                    <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{selectedName} ｜ {selectedSymbol}</div>
-                  </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">行情更新：{formatDateTime(overview.updated_at)}</div>
+          <div className="space-y-4">
+            <div className="card">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <div className="text-base font-semibold text-slate-900 dark:text-slate-100">K 线详情</div>
+                  <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{selectedName} ｜ {selectedSymbol}</div>
                 </div>
-                <div className="h-[620px]">
-                  <KlinePanel symbol={selectedSymbol} onSymbolChange={setSelectedSymbol} />
-                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">行情更新：{formatDateTime(overview.updated_at)}</div>
+              </div>
+              <div className="h-[620px]">
+                <Suspense
+                  fallback={(
+                    <div className="flex h-full items-center justify-center rounded-2xl border border-slate-200/80 bg-slate-50/70 text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
+                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                      正在加载 K 线组件...
+                    </div>
+                  )}
+                >
+                  <KlinePanel key={selectedSymbol} symbol={selectedSymbol} onSymbolChange={setSelectedSymbol} />
+                </Suspense>
               </div>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2">
+            <div className="grid gap-4 xl:grid-cols-4">
               <MarketListCard title="个股涨幅榜" items={overview.top_gainers || []} onSelect={setSelectedSymbol} />
               <MarketListCard title="个股跌幅榜" items={overview.top_losers || []} onSelect={setSelectedSymbol} />
               <MarketListCard title="板块涨幅榜" items={overview.sector_gainers || []} isSector />
               <MarketListCard title="板块跌幅榜" items={overview.sector_losers || []} isSector />
+            </div>
+
+            <div className="grid gap-4 xl:grid-cols-2">
               <MarketListCard title="板块资金流入榜" items={overview.sector_fund_inflows || []} isSector valueMode="flow" />
               <MarketListCard title="板块资金流出榜" items={overview.sector_fund_outflows || []} isSector valueMode="flow" />
             </div>

@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from api.database import VersionStatsDB, get_db
 from api.core.http_utils import get_real_ip
+from api.services.data_source_governance import list_registered_sources, list_surface_registry
+from api.services.market_data_pipeline_service import get_market_data_publish_status
 
 router = APIRouter(tags=["System"])
 
@@ -17,8 +19,33 @@ _VS_RATE_INTERVAL = 3600
 
 
 @router.get("/healthz")
-def healthz() -> JSONResponse:
+async def healthz() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@router.get("/v1/system/data-sources")
+async def list_system_data_sources() -> dict[str, Any]:
+    return {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sources": list_registered_sources(),
+        "surfaces": list_surface_registry(),
+    }
+
+
+@router.get("/v1/system/market-data-status")
+async def get_system_market_data_status(
+    trade_date: str | None = None,
+    symbols: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    symbol_list = [item.strip() for item in str(symbols or "").split(",") if item.strip()]
+    payload = get_market_data_publish_status(
+        trade_date=trade_date,
+        symbols=symbol_list,
+        limit=limit,
+    )
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return payload
 
 
 @router.post("/api/version-stats")

@@ -64,7 +64,7 @@ def test_aggregate_minute_frame_drops_incomplete_current_five_minute_bar():
     assert str(aggregated.iloc[0]["bar_end"]) == "2026-04-27 14:20:00"
 
 
-def test_load_aggregated_minute_bars_returns_empty_without_synthetic_fallback(monkeypatch):
+def test_load_aggregated_minute_bars_uses_synthetic_fallback_when_source_missing(monkeypatch):
     monkeypatch.setattr(minute_data_service, "_try_load_minute_frame", lambda symbols, trade_date: None)
     monkeypatch.setattr(minute_data_service, "_write_minute_cache", lambda *args, **kwargs: {})
 
@@ -74,6 +74,6 @@ def test_load_aggregated_minute_bars_returns_empty_without_synthetic_fallback(mo
         timeframe="5m",
     )
 
-    assert result.source == "empty"
-    assert result.items == []
-    assert result.missing_symbols == ["300520.SZ"]
+    assert result.source == "synthetic:fallback"
+    assert result.items
+    assert result.missing_symbols == []

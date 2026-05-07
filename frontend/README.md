@@ -1,6 +1,6 @@
-# TradingAgents Dashboard
+# 量化之神前端
 
-专业的金融交易分析界面，基于 React + TypeScript + Tailwind CSS 构建。
+量化之神的交易研究前端，基于 React + TypeScript + Tailwind CSS 构建。
 
 ## 特性
 
@@ -110,7 +110,7 @@ frontend/
 
 ## 后端集成
 
-本前端设计用于配合 TradingAgents FastAPI 后端使用：
+本前端设计用于配合量化之神 FastAPI 后端使用：
 
 ```python
 # 后端运行

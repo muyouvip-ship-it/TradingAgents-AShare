@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 
 from api.core.strategy_db import StrategySessionLocal, get_strategy_db
+from api.services.market_data_pipeline_service import preferred_daily_kline_table
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +109,21 @@ def _load_kline_data(start_date: datetime, end_date: datetime, symbols: List[str
 
     database_url = os.getenv("DATABASE_URL", "postgresql://localhost/trading_agents")
     pg_engine = create_engine(database_url)
+    table_name = preferred_daily_kline_table()
 
     if symbols:
-        query = """
+        query = f"""
         SELECT symbol, trade_date as date, open, high, low, close, volume
-        FROM stock_daily_kline
+        FROM {table_name}
         WHERE trade_date >= %(start_date)s AND trade_date <= %(end_date)s
           AND symbol = ANY(%(symbols)s)
         ORDER BY trade_date, symbol
         """
         params = {"start_date": start_date, "end_date": end_date, "symbols": symbols}
     else:
-        query = """
+        query = f"""
         SELECT symbol, trade_date as date, open, high, low, close, volume
-        FROM stock_daily_kline
+        FROM {table_name}
         WHERE trade_date >= %(start_date)s AND trade_date <= %(end_date)s
         ORDER BY trade_date, symbol
         LIMIT 50000

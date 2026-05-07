@@ -33,7 +33,7 @@ def print_section(title):
     print("=" * 70)
 
 
-def test_health():
+def health_check():
     """测试健康检查"""
     print_section("1. 测试健康检查")
     
@@ -338,7 +338,7 @@ def main():
     print("  7. 清理数据")
     
     # 1. 健康检查
-    if not test_health():
+    if not health_check():
         return
     
     # 2. 创建策略

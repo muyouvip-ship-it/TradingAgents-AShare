@@ -1,4 +1,6 @@
-# TradingAgents-AShare
+# 量化之神
+
+面向 A 股研究、回测与策略执行的一体化多智能体量化平台。
 
 ## Quick Start
 

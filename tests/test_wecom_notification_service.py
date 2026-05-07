@@ -34,13 +34,13 @@ class TestBuildReportMessage:
 
         message = build_report_message(_make_report())
 
-        assert "TradingAgents 定时分析完成" in message
+        assert "量化之神定时分析完成" in message
         assert "标的：600519.SH" in message
         assert "交易日：2025-06-01" in message
         assert "决策：BUY" in message
         assert "方向：看多" in message
         assert "置信度：85%" in message
-        assert "摘要：" in message
+        assert "核心理由：" in message
 
     def test_falls_back_to_investment_plan_summary(self):
         from api.services.wecom_notification_service import build_report_message
@@ -60,7 +60,7 @@ class TestBuildReportMessage:
 
         message = build_test_message()
 
-        assert "TradingAgents Webhook Warmup" in message
+        assert "量化之神 Webhook 预热" in message
         assert "测试消息" in message
 
 

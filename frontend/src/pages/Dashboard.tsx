@@ -64,7 +64,7 @@ export default function Dashboard() {
                 <div>
                     <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">控制台</h1>
                     <p className="mt-1 text-slate-500 dark:text-slate-400">
-                        {user?.email ? `当前账户：${user.email}` : '欢迎使用 TradingAgents 智能分析系统'}
+                        {user?.email ? `当前账户：${user.email}` : '欢迎使用量化之神研究系统'}
                     </p>
                 </div>
             </div>

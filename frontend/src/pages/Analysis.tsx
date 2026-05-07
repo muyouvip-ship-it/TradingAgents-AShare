@@ -1,14 +1,15 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import AgentCollaboration from '@/components/AgentCollaboration'
 import DebateDrawer from '@/components/DebateDrawer'
 import ReportViewer from '@/components/ReportViewer'
 import ChatCopilotPanel from '@/components/ChatCopilotPanel'
-import KlinePanel from '@/components/KlinePanel'
 import DecisionCard from '@/components/DecisionCard'
 import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAnalysisStore } from '@/stores/analysisStore'
+
+const KlinePanel = lazy(() => import('@/components/KlinePanel'))
 
 function mapDecision(decision?: string): 'buy' | 'sell' | 'hold' | 'add' | 'reduce' | 'watch' | undefined {
     if (!decision) return undefined
@@ -102,12 +103,24 @@ export default function Analysis() {
 
                 <div className="min-w-0 space-y-4">
                     <div className="h-[360px]">
-                        <KlinePanel
-                            symbol={activeSymbol}
-                            onSymbolChange={(symbol) => {
-                                setActiveSymbol(symbol)
-                            }}
-                        />
+                        <Suspense
+                            fallback={(
+                                <div className="card flex h-full items-center justify-center text-slate-500 dark:text-slate-400">
+                                    <svg className="mr-2 h-5 w-5 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none">
+                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeOpacity="0.2" strokeWidth="4" />
+                                        <path d="M22 12A10 10 0 0 0 12 2" stroke="currentColor" strokeWidth="4" strokeLinecap="round" />
+                                    </svg>
+                                    正在加载 K 线组件...
+                                </div>
+                            )}
+                        >
+                            <KlinePanel
+                                symbol={activeSymbol}
+                                onSymbolChange={(symbol) => {
+                                    setActiveSymbol(symbol)
+                                }}
+                            />
+                        </Suspense>
                     </div>
 
                     <AgentCollaboration onSelectSection={handleShowReport} onOpenDebate={setDebateDrawer} selectedSection={activeSection} />

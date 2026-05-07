@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import { TrendingUp } from 'lucide-react'
+import { Crown } from 'lucide-react'
 
 import { navItems } from '@/components/sidebarNav'
 
@@ -21,12 +21,12 @@ export default function Sidebar() {
             {/* Logo */}
             <div className="h-16 flex items-center justify-center border-b border-slate-700 px-2">
                 <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 via-purple-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/30 flex-shrink-0">
-                        <TrendingUp className="w-5 h-5 text-white" />
+                    <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 via-orange-500 to-red-500 flex items-center justify-center shadow-lg shadow-orange-500/30 flex-shrink-0">
+                        <Crown className="w-5 h-5 text-white" />
                     </div>
                     {isExpanded && (
-                        <span className="font-bold text-base bg-gradient-to-r from-blue-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent whitespace-nowrap">
-                            TradingAgents
+                        <span className="font-bold text-base bg-gradient-to-r from-amber-300 via-orange-300 to-red-300 bg-clip-text text-transparent whitespace-nowrap">
+                            量化之神
                         </span>
                     )}
                 </div>
@@ -57,8 +57,8 @@ export default function Sidebar() {
             <div className="p-3 border-t border-slate-700">
                 {isExpanded ? (
                     <div className="text-xs text-slate-500 text-center">
-                        <p className="text-slate-400 text-sm font-medium">TradingAgents</p>
-                        <p className="mt-0.5">多智能体投研系统</p>
+                        <p className="text-slate-300 text-sm font-medium">量化之神</p>
+                        <p className="mt-0.5">多智能体量化研究台</p>
                         <p className="mt-1 font-mono text-[11px] text-slate-400">{buildVersion}</p>
                         <p className="mt-0.5 text-[10px] text-slate-500">{buildDate} · {buildCommit}</p>
                     </div>

@@ -162,9 +162,6 @@ _AGENT_SECTIONS = [
 ]
 
 
-_GITHUB_URL = "https://github.com/KylinMountain/TradingAgents-AShare"
-
-
 def render_report_html(report: "ReportDB", frontend_url: str = "", stock_name: str = "") -> str:
     """Render a *ReportDB* instance as an HTML email string with inline CSS."""
 
@@ -198,7 +195,7 @@ def render_report_html(report: "ReportDB", frontend_url: str = "", stock_name: s
     parts.append(
         '<tr><td style="background:#0f172a;padding:28px 32px;">'
         f'<table width="100%" cellpadding="0" cellspacing="0"><tr>'
-        f'<td><p style="margin:0;font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.3px;">TradingAgents 投研报告</p>'
+        f'<td><p style="margin:0;font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.3px;">量化之神研究报告</p>'
         f'<p style="margin:6px 0 0;font-size:14px;color:#94a3b8;">{name + " " if name else ""}{symbol} &middot; {trade_date}</p></td>'
         f'<td align="right" valign="top">'
         f'<span style="display:inline-block;background:{direction_bg};color:{direction_color};font-size:15px;font-weight:700;padding:6px 16px;border-radius:20px;">{_escape(direction) or "-"}</span>'
@@ -383,16 +380,8 @@ def render_report_html(report: "ReportDB", frontend_url: str = "", stock_name: s
     # --- footer ---
     parts.append(
         '<tr><td style="padding:28px 32px;border-top:1px solid #e2e8f0;margin-top:24px;text-align:center;">'
-        '<p style="margin:0;font-size:12px;color:#94a3b8;line-height:1.6;">本报告由 TradingAgents 多智能体系统自动生成，仅供参考，不构成投资建议。</p>'
-        f'<p style="margin:10px 0 0;font-size:12px;color:#94a3b8;">'
-        f'<a href="{_GITHUB_URL}" style="color:#3b82f6;text-decoration:none;font-weight:600;">TradingAgents-AShare</a>'
-        f' &mdash; 14 名 AI Agent 协作分析的 A 股智能投研系统</p>'
-        f'<p style="margin:8px 0 0;font-size:12px;color:#94a3b8;">'
-        f'觉得有帮助？给项目点个 '
-        f'<a href="{_GITHUB_URL}" style="color:#3b82f6;text-decoration:none;">&#11088; Star</a>'
-        f' 或 '
-        f'<a href="https://app.510168.xyz/sponsor" style="color:#3b82f6;text-decoration:none;">&#10084;&#65039; 赞助支持</a>'
-        f'</p>'
+        '<p style="margin:0;font-size:12px;color:#94a3b8;line-height:1.6;">本报告由量化之神多智能体研究引擎自动生成，仅供研究参考，不构成投资建议。</p>'
+        '<p style="margin:10px 0 0;font-size:12px;color:#94a3b8;">量化之神 &mdash; 面向 A 股研究与策略决策的智能工作台</p>'
         f'<p style="margin:12px 0 0;font-size:11px;color:#cbd5e1;">不想收到此邮件？请登录后在「设置」页面关闭「邮件报告推送」即可取消订阅。</p>'
         '</td></tr>'
     )
@@ -437,12 +426,12 @@ def send_report_email(user: "UserDB", report: "ReportDB", stock_name: str = "") 
         report_link = f"\n\n查看完整报告: {frontend_url.rstrip('/')}/reports?report={report.id}"
 
     msg = EmailMessage()
-    msg["Subject"] = f"TradingAgents 投研报告 - {display_name} ({trade_date})"
+    msg["Subject"] = f"量化之神研究报告 - {display_name} ({trade_date})"
     msg["From"] = smtp_from
     msg["To"] = user.email
 
     # text/plain fallback
-    plain = f"TradingAgents 投研报告\n{display_name} {trade_date}\n决策: {report.decision or '-'}\n方向: {report.direction or '-'}\n置信度: {report.confidence or '-'}%{report_link}\n\n请使用支持 HTML 的邮件客户端查看完整报告。"
+    plain = f"量化之神研究报告\n{display_name} {trade_date}\n决策: {report.decision or '-'}\n方向: {report.direction or '-'}\n置信度: {report.confidence or '-'}%{report_link}\n\n请使用支持 HTML 的邮件客户端查看完整报告。"
     msg.set_content(plain)
     msg.add_alternative(html_body, subtype="html")
 

@@ -18,6 +18,15 @@ def compute_daily_features(frame: pd.DataFrame, compiled: CompiledStrategy) -> t
 
 
 def _compute_with_pandas(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.DataFrame:
+    needs_first_day_band = _compiled_uses_any(
+        compiled,
+        {
+            "first_day_band",
+            "first_day_band_b1",
+            "first_day_band_cross",
+            "first_day_band_dead_cross",
+        },
+    )
     data = frame.copy()
     data["date"] = pd.to_datetime(data["date"])
     for column in ["open", "high", "low", "close", "volume", "amount"]:
@@ -42,23 +51,24 @@ def _compute_with_pandas(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
     data["turnover_rate"] = pd.to_numeric(data.get("turnover_rate"), errors="coerce").fillna(0.0)
     data["profit_growth_proxy"] = grouped["net_profit_ttm"].transform(lambda series: series.pct_change(60).fillna(0.0))
     data["ma_gap_5_20"] = ((data["ma5"] / data["ma20"].replace(0, np.nan)) - 1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    var8a = (2 * data["close"] + data["high"] + data["low"]) / 4
-    var9a = grouped["low"].transform(lambda series: series.rolling(9, min_periods=1).min())
-    var10a = grouped["high"].transform(lambda series: series.rolling(9, min_periods=1).max())
-    band_raw = ((var8a - var9a) / (var10a - var9a).replace(0, np.nan) * 100).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    data["first_day_band"] = grouped.apply(lambda group: band_raw.loc[group.index].ewm(span=8, adjust=False).mean()).reset_index(level=0, drop=True)
-    b1_source = grouped["first_day_band"].shift(1) * 0.667 + data["first_day_band"] * 0.333
-    data["first_day_band_b1"] = grouped.apply(lambda group: b1_source.loc[group.index].ewm(span=2, adjust=False).mean()).reset_index(level=0, drop=True)
-    previous_band = grouped["first_day_band"].shift(1)
-    previous_b1 = grouped["first_day_band_b1"].shift(1)
-    data["first_day_band_cross"] = (
-        (data["first_day_band"] > data["first_day_band_b1"])
-        & (previous_band <= previous_b1)
-    ).fillna(False).astype(float)
-    data["first_day_band_dead_cross"] = (
-        (data["first_day_band"] < data["first_day_band_b1"])
-        & (previous_band >= previous_b1)
-    ).fillna(False).astype(float)
+    if needs_first_day_band:
+        var8a = (2 * data["close"] + data["high"] + data["low"]) / 4
+        var9a = grouped["low"].transform(lambda series: series.rolling(9, min_periods=1).min())
+        var10a = grouped["high"].transform(lambda series: series.rolling(9, min_periods=1).max())
+        band_raw = ((var8a - var9a) / (var10a - var9a).replace(0, np.nan) * 100).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        data["first_day_band"] = grouped.apply(lambda group: band_raw.loc[group.index].ewm(span=8, adjust=False).mean()).reset_index(level=0, drop=True)
+        b1_source = grouped["first_day_band"].shift(1) * 0.667 + data["first_day_band"] * 0.333
+        data["first_day_band_b1"] = grouped.apply(lambda group: b1_source.loc[group.index].ewm(span=2, adjust=False).mean()).reset_index(level=0, drop=True)
+        previous_band = grouped["first_day_band"].shift(1)
+        previous_b1 = grouped["first_day_band_b1"].shift(1)
+        data["first_day_band_cross"] = (
+            (data["first_day_band"] > data["first_day_band_b1"])
+            & (previous_band <= previous_b1)
+        ).fillna(False).astype(float)
+        data["first_day_band_dead_cross"] = (
+            (data["first_day_band"] < data["first_day_band_b1"])
+            & (previous_band >= previous_b1)
+        ).fillna(False).astype(float)
     data["momentum_rank_pct"] = data.groupby("date")["momentum_60d"].rank(pct=True).fillna(0.5)
     data["money_flow_rank_pct"] = data.groupby("date")["money_flow_strength_20d"].rank(pct=True).fillna(0.5)
     data["profit_growth_rank_pct"] = data.groupby("date")["profit_growth_proxy"].rank(pct=True).fillna(0.5)
@@ -72,6 +82,15 @@ def _compute_with_pandas(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
 def _compute_with_polars(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.DataFrame:
     import polars as pl
 
+    needs_first_day_band = _compiled_uses_any(
+        compiled,
+        {
+            "first_day_band",
+            "first_day_band_b1",
+            "first_day_band_cross",
+            "first_day_band_dead_cross",
+        },
+    )
     data = frame.copy()
     data["date"] = pd.to_datetime(data["date"])
     pl_df = pl.from_pandas(data).sort(["symbol", "date"])
@@ -99,45 +118,50 @@ def _compute_with_polars(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
             net_profit_growth.alias("profit_growth_proxy"),
         ]
     )
-    band_seed = (
-        ((((pl.col("close") * 2) + pl.col("high") + pl.col("low")) / 4) - pl.col("low").rolling_min(window_size=9, min_samples=1).over("symbol"))
-        / (
-            pl.col("high").rolling_max(window_size=9, min_samples=1).over("symbol")
-            - pl.col("low").rolling_min(window_size=9, min_samples=1).over("symbol")
-        ).replace(0, None)
-        * 100
-    ).fill_nan(0.0).fill_null(0.0)
-    first_day_band = band_seed.ewm_mean(span=8, adjust=False).over("symbol").fill_null(0.0)
-    first_day_band_b1_seed = (first_day_band.shift(1).over("symbol") * 0.667 + first_day_band * 0.333).fill_null(first_day_band)
-    pl_df = pl_df.with_columns(
-        [
-            ((pl.col("ma5") / pl.col("ma20")) - 1).fill_nan(0.0).fill_null(0.0).alias("ma_gap_5_20"),
-            first_day_band.alias("first_day_band"),
-            first_day_band_b1_seed.ewm_mean(span=2, adjust=False).over("symbol").fill_null(0.0).alias("first_day_band_b1"),
-            pl.col("momentum_60d").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("momentum_rank_pct"),
-            pl.col("money_flow_strength_20d").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("money_flow_rank_pct"),
-            pl.col("profit_growth_proxy").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("profit_growth_rank_pct"),
-            (1 - pl.col("volatility_20d").rank("average").over("date").truediv(pl.len().over("date"))).fill_null(0.5).alias("volatility_rank_inverse"),
-        ]
-    )
-    pl_df = pl_df.with_columns(
-        [
-            (
-                (pl.col("first_day_band") > pl.col("first_day_band_b1"))
-                & (
-                    pl.col("first_day_band").shift(1).over("symbol")
-                    <= pl.col("first_day_band_b1").shift(1).over("symbol")
-                )
-            ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_cross"),
-            (
-                (pl.col("first_day_band") < pl.col("first_day_band_b1"))
-                & (
-                    pl.col("first_day_band").shift(1).over("symbol")
-                    >= pl.col("first_day_band_b1").shift(1).over("symbol")
-                )
-            ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_dead_cross"),
-        ]
-    )
+    derived_columns = [
+        ((pl.col("ma5") / pl.col("ma20")) - 1).fill_nan(0.0).fill_null(0.0).alias("ma_gap_5_20"),
+        pl.col("momentum_60d").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("momentum_rank_pct"),
+        pl.col("money_flow_strength_20d").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("money_flow_rank_pct"),
+        pl.col("profit_growth_proxy").rank("average").over("date").truediv(pl.len().over("date")).fill_null(0.5).alias("profit_growth_rank_pct"),
+        (1 - pl.col("volatility_20d").rank("average").over("date").truediv(pl.len().over("date"))).fill_null(0.5).alias("volatility_rank_inverse"),
+    ]
+    if needs_first_day_band:
+        band_seed = (
+            ((((pl.col("close") * 2) + pl.col("high") + pl.col("low")) / 4) - pl.col("low").rolling_min(window_size=9, min_samples=1).over("symbol"))
+            / (
+                pl.col("high").rolling_max(window_size=9, min_samples=1).over("symbol")
+                - pl.col("low").rolling_min(window_size=9, min_samples=1).over("symbol")
+            ).replace(0, None)
+            * 100
+        ).fill_nan(0.0).fill_null(0.0)
+        first_day_band = band_seed.ewm_mean(span=8, adjust=False).over("symbol").fill_null(0.0)
+        first_day_band_b1_seed = (first_day_band.shift(1).over("symbol") * 0.667 + first_day_band * 0.333).fill_null(first_day_band)
+        derived_columns.extend(
+            [
+                first_day_band.alias("first_day_band"),
+                first_day_band_b1_seed.ewm_mean(span=2, adjust=False).over("symbol").fill_null(0.0).alias("first_day_band_b1"),
+            ]
+        )
+    pl_df = pl_df.with_columns(derived_columns)
+    if needs_first_day_band:
+        pl_df = pl_df.with_columns(
+            [
+                (
+                    (pl.col("first_day_band") > pl.col("first_day_band_b1"))
+                    & (
+                        pl.col("first_day_band").shift(1).over("symbol")
+                        <= pl.col("first_day_band_b1").shift(1).over("symbol")
+                    )
+                ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_cross"),
+                (
+                    (pl.col("first_day_band") < pl.col("first_day_band_b1"))
+                    & (
+                        pl.col("first_day_band").shift(1).over("symbol")
+                        >= pl.col("first_day_band_b1").shift(1).over("symbol")
+                    )
+                ).cast(pl.Float64).fill_null(0.0).alias("first_day_band_dead_cross"),
+            ]
+        )
     data = pl_df.to_pandas()
     data = _attach_weekly_features(data)
     data = _apply_compiled_factor_scores(data, compiled)
@@ -147,6 +171,7 @@ def _compute_with_polars(frame: pd.DataFrame, compiled: CompiledStrategy) -> pd.
 def _apply_compiled_factor_scores(data: pd.DataFrame, compiled: CompiledStrategy) -> pd.DataFrame:
     score_components: list[pd.Series] = []
     total_weight = 0.0
+    date_group_keys = data["date"]
     for factor in compiled.factor_definitions:
         source_column = str(factor.get("source_column") or factor.get("name") or "")
         if source_column not in data.columns:
@@ -155,11 +180,12 @@ def _apply_compiled_factor_scores(data: pd.DataFrame, compiled: CompiledStrategy
         transform = str(factor.get("transform") or "rank_pct")
         direction = str(factor.get("direction") or "higher_better")
         if transform == "rank_pct":
-            ranked = data.assign(_value=raw).groupby("date")["_value"].rank(pct=True).fillna(0.5)
+            ranked = raw.groupby(date_group_keys).rank(pct=True).fillna(0.5)
             signal = 1 - ranked if direction == "lower_better" else ranked
         elif transform == "zscore":
-            mean = data.assign(_value=raw).groupby("date")["_value"].transform("mean")
-            std = data.assign(_value=raw).groupby("date")["_value"].transform("std").replace(0, np.nan)
+            grouped = raw.groupby(date_group_keys)
+            mean = grouped.transform("mean")
+            std = grouped.transform("std").replace(0, np.nan)
             signal = ((raw - mean) / std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
             if direction == "lower_better":
                 signal = -signal
@@ -181,30 +207,37 @@ def _apply_compiled_factor_scores(data: pd.DataFrame, compiled: CompiledStrategy
 
 
 def _attach_weekly_features(data: pd.DataFrame) -> pd.DataFrame:
-    weekly_frames: list[pd.DataFrame] = []
-    for symbol, group in data.groupby("symbol"):
-        weekly = group.set_index("date").resample("W-FRI").agg(
+    if data.empty:
+        data["weekly_close"] = data["close"]
+        data["weekly_ma20"] = data["ma20"]
+        data["weekly_trend_pass"] = data["close"] > data["ma20"]
+        return data
+    merged = data.copy()
+    trade_dates = pd.to_datetime(merged["date"])
+    merged["week_end"] = trade_dates.dt.to_period("W-FRI").dt.end_time.dt.normalize()
+    weekly_frame = (
+        merged.groupby(["symbol", "week_end"], sort=True)
+        .agg(
             weekly_open=("open", "first"),
             weekly_high=("high", "max"),
             weekly_low=("low", "min"),
             weekly_close=("close", "last"),
             weekly_volume=("volume", "sum"),
-        ).dropna(subset=["weekly_close"], how="any")
-        if weekly.empty:
-            continue
-        weekly["weekly_ma20"] = weekly["weekly_close"].rolling(20, min_periods=1).mean()
-        weekly["week_end"] = weekly.index
-        weekly["symbol"] = symbol
-        weekly_frames.append(weekly.reset_index(drop=True))
-    if not weekly_frames:
-        data["weekly_close"] = data["close"]
-        data["weekly_ma20"] = data["ma20"]
-        data["weekly_trend_pass"] = data["close"] > data["ma20"]
-        return data
-    weekly_frame = pd.concat(weekly_frames, ignore_index=True)
-    weekly_frame["week_end"] = pd.to_datetime(weekly_frame["week_end"])
-    merged = data.copy()
-    merged["week_end"] = merged["date"] + pd.offsets.Week(weekday=4)
+        )
+        .dropna(subset=["weekly_close"], how="any")
+        .reset_index()
+    )
+    if weekly_frame.empty:
+        merged["weekly_close"] = merged["close"]
+        merged["weekly_ma20"] = merged["ma20"]
+        merged["weekly_trend_pass"] = merged["close"] > merged["ma20"]
+        return merged.drop(columns=["week_end"])
+    weekly_frame["weekly_ma20"] = (
+        weekly_frame.groupby("symbol", sort=False)["weekly_close"]
+        .rolling(20, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
     merged = merged.merge(
         weekly_frame[["symbol", "week_end", "weekly_close", "weekly_ma20"]],
         on=["symbol", "week_end"],
@@ -250,6 +283,19 @@ def _polars_atr_expr():
     low_close = (pl.col("low") - pl.col("close").shift(1).over("symbol")).abs()
     true_range = pl.max_horizontal(high_low, high_close, low_close)
     return true_range.rolling_mean(window_size=14, min_samples=1).over("symbol")
+
+
+def _compiled_uses_any(compiled: CompiledStrategy, columns: set[str]) -> bool:
+    for factor in compiled.factor_definitions:
+        if str(factor.get("source_column") or factor.get("name") or "") in columns:
+            return True
+    for rule in [*compiled.entry_rules, *compiled.exit_rules]:
+        params = rule.get("params") or {}
+        if any(str(params.get(key) or "") in columns for key in ("left", "right", "field", "indicator")):
+            return True
+        if any(str(item) in columns for item in rule.get("data_requirements") or []):
+            return True
+    return False
 
 
 def _has_module(name: str) -> bool:

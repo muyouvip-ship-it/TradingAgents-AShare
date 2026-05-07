@@ -30,7 +30,7 @@ def create_report(
 
 @router.get("/announcements/latest")
 def latest_announcement():
-    return {"announcement": {"title": "TradingAgents-AShare", "content": "No active announcement"}}
+    return {"announcement": {"title": "量化之神", "content": "No active announcement"}}
 
 
 @router.get("/reports")
@@ -41,15 +41,13 @@ def list_reports(
     db: Session = Depends(get_db),
     current_user=Depends(require_api_user),
 ):
-    return {
-        "reports": reports_service.list_reports(
-            db,
-            user_id=current_user.id,
-            symbol=symbol,
-            offset=skip,
-            limit=limit,
-        )
-    }
+    return reports_service.list_reports(
+        db,
+        user_id=current_user.id,
+        symbol=symbol,
+        offset=skip,
+        limit=limit,
+    )
 
 
 @router.post("/reports/latest-by-symbols")

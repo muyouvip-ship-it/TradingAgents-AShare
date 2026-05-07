@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Database, Landmark, RefreshCw, Send, Wifi, WifiOff, XCircle } from 'lucide-react'
 
+import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
+import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
-import type { QmtBulkSellTask, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
+import type { QmtBulkSellTask, VirtualWarehouseBackgroundRefresh, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
 
 function formatMoney(value?: number | null) {
   if (value == null || Number.isNaN(value)) return '--'
@@ -43,6 +45,18 @@ function normalizeTimeValue(value?: string | null) {
   if (!Number.isNaN(parsed.getTime())) return parsed
 
   const digits = value.replace(/[^\d]/g, '')
+  if (digits.length === 13) {
+    const epoch = Number(digits)
+    const fallback = new Date(epoch)
+    if (!Number.isNaN(fallback.getTime())) return fallback
+  }
+
+  if (digits.length === 10) {
+    const epoch = Number(digits) * 1000
+    const fallback = new Date(epoch)
+    if (!Number.isNaN(fallback.getTime())) return fallback
+  }
+
   if (digits.length === 14) {
     const year = Number(digits.slice(0, 4))
     const month = Number(digits.slice(4, 6)) - 1
@@ -143,9 +157,11 @@ export function WarehousePage({
   pageDescription = '对接 QMT 模拟账户，展示资产总览与实时持仓。',
 }: WarehousePageProps) {
   const [payload, setPayload] = useState<VirtualWarehouseOverviewResponse | null>(null)
+  const [backgroundRefresh, setBackgroundRefresh] = useState<VirtualWarehouseBackgroundRefresh | null>(null)
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [triggeringRefresh, setTriggeringRefresh] = useState(false)
   const [diagnosing, setDiagnosing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [diagnostics, setDiagnostics] = useState<VirtualWarehouseDiagnosticsResponse | null>(null)
@@ -163,7 +179,7 @@ export function WarehousePage({
     quantity: 100,
     priceType: 'limit',
     price: '',
-    strategyName: 'TradingAgents',
+    strategyName: '量化之神',
     remark: '',
   })
   const bulkSellStreamAbortRef = useRef<AbortController | null>(null)
@@ -247,19 +263,15 @@ export function WarehousePage({
     setError(null)
   }, [])
 
+  const activeAccountKey = payload?.active_account_key || selectedAccountKey || null
+
   const load = useCallback(async (silent = false, accountKey?: string | null) => {
     try {
       if (silent) setRefreshing(true)
       else setLoading(true)
-      let response = await api.getQmtVirtualWarehouseOverview(accountKey || undefined)
-      if (!accountKey) {
-        const active = response.accounts?.find(item => item.account_key === response.active_account_key)
-        const firstMatch = response.accounts?.find(item => item.role === roleFilter)
-        if (firstMatch && active?.role !== roleFilter) {
-          response = await api.getQmtVirtualWarehouseOverview(firstMatch.account_key)
-        }
-      }
+      const response = await api.getQmtVirtualWarehouseOverview(accountKey || undefined, accountKey ? undefined : roleFilter, true)
       setPayload(response)
+      setBackgroundRefresh(response.background_refresh || null)
       setSelectedAccountKey(response.active_account_key || accountKey || null)
       setError(null)
     } catch (err) {
@@ -344,15 +356,17 @@ export function WarehousePage({
   }, [handleBulkSellTaskState, stopBulkSellStream])
 
   useEffect(() => {
-    void load(false, selectedAccountKey)
-  }, [load, selectedAccountKey])
+    void load(false)
+  }, [load])
 
-  useEffect(() => {
-    if (bulkSellTask && isBulkSellTaskActive(bulkSellTask.status)) return undefined
-    const intervalSeconds = payload?.refresh_interval_seconds || 10
-    const timer = window.setInterval(() => { void load(true, selectedAccountKey) }, intervalSeconds * 1000)
-    return () => window.clearInterval(timer)
-  }, [bulkSellTask, load, payload?.refresh_interval_seconds, selectedAccountKey])
+  usePolling(
+    () => load(true, activeAccountKey),
+    {
+      enabled: !(bulkSellTask && isBulkSellTaskActive(bulkSellTask.status)),
+      intervalMs: (payload?.refresh_interval_seconds || 10) * 1000,
+      runImmediately: false,
+    },
+  )
 
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
@@ -392,6 +406,25 @@ export function WarehousePage({
       setDiagnosing(false)
     }
   }, [selectedAccountKey])
+
+  const handleTriggerRefresh = useCallback(async () => {
+    setTriggeringRefresh(true)
+    setActionMessage(null)
+    try {
+      const response = await api.triggerQmtVirtualWarehouseRefresh(
+        selectedAccountKey || undefined,
+        selectedAccountKey ? undefined : roleFilter,
+      )
+      setBackgroundRefresh(response.background_refresh || null)
+      setActionMessage(response.message)
+      setError(null)
+      await load(true, selectedAccountKey || payload?.active_account_key || null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'QMT 后台刷新启动失败')
+    } finally {
+      setTriggeringRefresh(false)
+    }
+  }, [load, payload?.active_account_key, roleFilter, selectedAccountKey])
 
   const handleSubmitOrder = useCallback(async () => {
     if (roleFilter !== 'paper') {
@@ -475,7 +508,7 @@ export function WarehousePage({
     try {
       const response = await api.startQmtBulkSell({
         account_key: payload?.active_account_key || selectedAccountKey || undefined,
-        strategy_name: orderForm.strategyName.trim() || 'TradingAgents',
+        strategy_name: orderForm.strategyName.trim() || '量化之神',
       })
       setBulkSellTask(response.task)
       setBulkSelling(true)
@@ -494,6 +527,63 @@ export function WarehousePage({
     return quoteTime || payload?.fetched_at || null
   }, [payload?.fetched_at, positions])
   const lastSyncTime = payload?.last_synced_at || null
+  const backgroundRefreshLabel = useMemo(() => {
+    if (backgroundRefresh?.active) {
+      return `后台刷新中，开始于 ${formatDateTime(backgroundRefresh.started_at)}`
+    }
+    if (backgroundRefresh?.last_error) {
+      return `上次后台刷新失败：${backgroundRefresh.last_error}`
+    }
+    if (backgroundRefresh?.last_success_at) {
+      return `上次后台刷新完成于 ${formatDateTime(backgroundRefresh.last_success_at)}`
+    }
+    if (backgroundRefresh?.finished_at) {
+      return `上次后台任务结束于 ${formatDateTime(backgroundRefresh.finished_at)}`
+    }
+    return '页面默认优先展示本地快照，后台会异步补最新数据'
+  }, [backgroundRefresh])
+  const backendGovernance = payload?.data_governance || null
+  const governanceWarnings = useMemo(() => {
+    if (backendGovernance?.warnings?.length) {
+      const merged = [...backendGovernance.warnings]
+      if (error && !merged.includes(error)) merged.push(error)
+      return merged
+    }
+    const warnings: string[] = []
+    if (connection?.message) warnings.push(connection.message)
+    if (backgroundRefresh?.last_error) warnings.push(`后台刷新异常：${backgroundRefresh.last_error}`)
+    if (error) warnings.push(error)
+    return warnings
+  }, [backgroundRefresh?.last_error, backendGovernance?.warnings, connection?.message, error])
+  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
+    if (backendGovernance?.items?.length) return backendGovernance.items
+    return ([
+    {
+      label: '账户数据源',
+      value: payload?.data_source || connection?.provider || '--',
+      detail: connection?.connected ? '账户、持仓、订单与成交都从当前 QMT 链路生成' : '当前未建立有效账户连接',
+      tone: payload?.is_stale ? 'warn' : connection?.connected ? 'good' : 'bad',
+    },
+    {
+      label: '页面状态',
+      value: payload?.is_stale ? '缓存快照' : '最新同步',
+      detail: payload?.is_stale ? '当前显示最近一次成功同步的本地快照' : '当前显示最近一次成功实时查询结果',
+      tone: payload?.is_stale ? 'warn' : 'good',
+    },
+    {
+      label: '最近同步',
+      value: formatDateTime(lastSyncTime || payload?.fetched_at),
+      detail: payload?.fetched_at ? `页面读取时间 ${formatDateTime(payload.fetched_at)}` : '等待下一次刷新',
+      tone: 'info',
+    },
+    {
+      label: '后台刷新',
+      value: backgroundRefresh?.active ? '刷新中' : backgroundRefresh?.last_error ? '最近失败' : backgroundRefresh?.last_success_at ? '最近成功' : '等待任务',
+      detail: backgroundRefreshLabel,
+      tone: backgroundRefresh?.active ? 'info' : backgroundRefresh?.last_error ? 'bad' : backgroundRefresh?.last_success_at ? 'good' : 'neutral',
+    },
+  ])
+  }, [backgroundRefresh?.active, backgroundRefresh?.last_error, backgroundRefresh?.last_success_at, backgroundRefreshLabel, backendGovernance?.items, connection?.connected, connection?.provider, lastSyncTime, payload?.data_source, payload?.fetched_at, payload?.is_stale])
 
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">{pageTitle}加载中...</div>
@@ -537,14 +627,13 @@ export function WarehousePage({
             {accountCards.length > 1 ? (
               <div className="flex flex-wrap gap-2">
                 {accountCards.map(item => {
-                  const active = (payload?.active_account_key || selectedAccountKey) === item.account_key
+                  const active = activeAccountKey === item.account_key
                   return (
                     <button
                       key={item.account_key}
                       type="button"
                       onClick={() => {
-                        setSelectedAccountKey(item.account_key)
-                        void load(false, item.account_key)
+                        void load(true, item.account_key)
                       }}
                       className={`rounded-xl px-3 py-2 text-sm transition ${
                         active
@@ -562,6 +651,9 @@ export function WarehousePage({
             {connection?.message ? (
               <p className={`text-sm ${connection.connected ? 'text-slate-500 dark:text-slate-400' : 'text-amber-600 dark:text-amber-300'}`}>{connection.message}</p>
             ) : null}
+            <p className={`text-sm ${backgroundRefresh?.last_error ? 'text-rose-600 dark:text-rose-300' : 'text-slate-500 dark:text-slate-400'}`}>
+              {backgroundRefreshLabel}
+            </p>
             {actionMessage ? <p className="text-sm text-emerald-600 dark:text-emerald-300">{actionMessage}</p> : null}
             {error ? <p className="text-sm text-rose-600 dark:text-rose-300">{error}</p> : null}
             {bulkSellTask ? (
@@ -594,11 +686,19 @@ export function WarehousePage({
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={() => void load(true)}
+              onClick={() => void handleTriggerRefresh()}
+              className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              <RefreshCw className={`h-4 w-4 ${triggeringRefresh || backgroundRefresh?.active ? 'animate-spin' : ''}`} />
+              {triggeringRefresh || backgroundRefresh?.active ? '后台刷新中...' : '立即刷新 QMT'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void load(true, activeAccountKey)}
               className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             >
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-              刷新
+              刷新页面快照
             </button>
             <button
               type="button"
@@ -611,6 +711,13 @@ export function WarehousePage({
           </div>
         </div>
       </section>
+
+      <DataSourceGovernanceCard
+        title="数据源治理"
+        description={backendGovernance?.description || '明确区分当前页是实时 QMT 返回、缓存快照回退，还是后台刷新中的中间状态。'}
+        items={governanceItems}
+        warnings={governanceWarnings}
+      />
 
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <MetricCard label="证券账户名称" value={account?.security_account_name || connection?.account_name || '--'} subValue={account?.account_id ? `证券账号 ${account.account_id}` : '待连接 QMT 账户'} />
@@ -783,11 +890,10 @@ export function WarehousePage({
               key={item.account_key}
               type="button"
               onClick={() => {
-                setSelectedAccountKey(item.account_key)
-                void load(false, item.account_key)
+                void load(true, item.account_key)
               }}
               className={`rounded-2xl border p-4 text-left shadow-sm transition ${
-                (payload?.active_account_key || selectedAccountKey) === item.account_key
+                activeAccountKey === item.account_key
                   ? 'border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-900'
                   : 'border-slate-200 bg-white text-slate-800 hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'
               }`}

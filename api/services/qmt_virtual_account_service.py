@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import logging
 import math
 import os
@@ -8,10 +9,11 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import requests
 from sqlalchemy.orm import Session
 
@@ -19,13 +21,23 @@ from api.core.stock_map import get_reverse_stock_map_cached_only
 from api.core.settings import settings
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, VirtualPositionStateDB
 from api.services import auth_service, portfolio_import_service
+from api.services.data_source_governance import build_virtual_warehouse_governance
 
 
 logger = logging.getLogger(__name__)
 SOURCE_NAME = "qmt_virtual"
+CN_TZ = timezone(timedelta(hours=8))
 _BULK_SELL_TASKS: dict[str, dict[str, Any]] = {}
 _BULK_SELL_TASKS_LOCK = threading.RLock()
 _BULK_SELL_TASK_RETENTION_SECONDS = 60 * 60 * 6
+_QMT_SNAPSHOT_TIMEOUT_SECONDS = max(float(os.getenv("QMT_SNAPSHOT_TIMEOUT_SECONDS", "6")), 1.0)
+_QMT_RECENT_PAYLOAD_TTL_SECONDS = max(float(os.getenv("QMT_RECENT_PAYLOAD_TTL_SECONDS", "5")), 1.0)
+_QMT_FAILURE_COOLDOWN_SECONDS = max(float(os.getenv("QMT_FAILURE_COOLDOWN_SECONDS", "15")), 1.0)
+_QMT_RECENT_PAYLOADS: dict[str, dict[str, Any]] = {}
+_QMT_RECENT_FAILURES: dict[str, dict[str, Any]] = {}
+_QMT_FETCH_LOCKS: dict[str, threading.Lock] = {}
+_QMT_BACKGROUND_REFRESH_STATE: dict[str, dict[str, Any]] = {}
+_QMT_FETCH_STATE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -77,7 +89,7 @@ def create_qmt_bulk_sell_task(
         "account_id": config.account_id,
         "account_name": config.account_name,
         "status": "pending",
-        "strategy_name": str(strategy_name or "TradingAgents").strip() or "TradingAgents",
+        "strategy_name": str(strategy_name or "量化之神").strip() or "量化之神",
         "total": len(sellable_positions),
         "processed": 0,
         "success_count": 0,
@@ -119,20 +131,29 @@ def get_qmt_virtual_account_overview(
     user_id: str,
     *,
     account_key: str | None = None,
+    preferred_role: str | None = None,
+    prefer_cache: bool = False,
     sync_to_imports: bool = False,
+    allow_cache_fallback: bool = True,
 ) -> dict[str, Any]:
-    configs = _runtime_configs(db=db, user_id=user_id)
+    configs = _load_runtime_configs(db=db, user_id=user_id)
     account_summaries: list[dict[str, Any]] = []
     active_payload: dict[str, Any] | None = None
-    active_key = _resolve_active_key(configs, account_key)
+    active_key = _resolve_active_key(configs, account_key, preferred_role=preferred_role)
 
     for config in configs:
         is_active = config.key == active_key
-        payload = (
-            _load_account_payload(db, user_id, config, sync_to_imports=sync_to_imports and is_active)
-            if is_active
-            else _load_empty_payload(config)
-        )
+        if is_active:
+            payload = _load_account_payload(
+                db,
+                user_id,
+                config,
+                prefer_cache=prefer_cache and is_active,
+                sync_to_imports=sync_to_imports and is_active,
+                allow_cache_fallback=allow_cache_fallback,
+            )
+        else:
+            payload = _load_cached_payload(db, user_id, config) or _load_empty_payload(config)
         account_summaries.append({
             "account_key": config.key,
             "role": config.role,
@@ -150,10 +171,35 @@ def get_qmt_virtual_account_overview(
     if active_payload is None:
         active_payload = _load_empty_payload(_pick_active_config(configs, active_key))
 
-    return {
+    active_account_key = active_payload["connection"].get("account_key")
+    response_payload = {
         **active_payload,
-        "active_account_key": active_payload["connection"].get("account_key"),
+        "active_account_key": active_account_key,
         "accounts": account_summaries,
+        "background_refresh": _get_background_refresh_status(
+            _qmt_fetch_cache_key(user_id, active_account_key) if active_account_key else None,
+        ),
+    }
+    response_payload["data_governance"] = build_virtual_warehouse_governance(response_payload)
+    return response_payload
+
+
+def trigger_qmt_background_refresh(
+    db: Session,
+    user_id: str,
+    *,
+    account_key: str | None = None,
+    preferred_role: str | None = None,
+) -> dict[str, Any]:
+    configs = _load_runtime_configs(db=db, user_id=user_id)
+    active_key = _resolve_active_key(configs, account_key, preferred_role=preferred_role)
+    scheduled = _schedule_qmt_background_refresh(user_id, active_key)
+    cache_key = _qmt_fetch_cache_key(user_id, active_key)
+    return {
+        "message": "QMT 后台刷新已启动" if scheduled else "QMT 后台刷新已在进行中",
+        "scheduled": scheduled,
+        "account_key": active_key,
+        "background_refresh": _get_background_refresh_status(cache_key),
     }
 
 
@@ -205,6 +251,7 @@ def submit_qmt_order(
     strategy_name: str | None = None,
     order_remark: str | None = None,
     include_overview: bool = True,
+    overview_allow_cache_fallback: bool = True,
 ) -> dict[str, Any]:
     config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
     request_id = uuid4().hex
@@ -246,7 +293,16 @@ def submit_qmt_order(
     except Exception as exc:
         _audit_qmt_action("submit_order.error", config, request_id, status="error", error=str(exc))
         raise RuntimeError(f"QMT 委托提交失败：{exc}") from exc
-    overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key) if include_overview else None
+    overview = (
+        get_qmt_virtual_account_overview(
+            db,
+            user_id,
+            account_key=config.key,
+            allow_cache_fallback=overview_allow_cache_fallback,
+        )
+        if include_overview
+        else None
+    )
     return {
         "message": "QMT 委托已提交",
         "account_key": config.key,
@@ -497,7 +553,7 @@ def _audit_qmt_action(action: str, config: QmtRuntimeConfig, request_id: str, **
 
 
 def diagnose_qmt_accounts(db: Session | None = None, user_id: str | None = None, account_key: str | None = None, run_connect_test: bool = False) -> dict[str, Any]:
-    configs = _runtime_configs(db=db, user_id=user_id)
+    configs = _load_runtime_configs(db=db, user_id=user_id)
     active_key = _resolve_active_key(configs, account_key)
     items = [_diagnose_single_account(config, run_connect_test=run_connect_test) for config in configs]
     return {
@@ -552,8 +608,16 @@ def _runtime_configs(*, db: Session | None = None, user_id: str | None = None) -
     ]
 
 
+def _load_runtime_configs(*, db: Session | None = None, user_id: str | None = None) -> list[QmtRuntimeConfig]:
+    try:
+        return _runtime_configs(db=db, user_id=user_id)
+    except TypeError:
+        # 测试里会用不接收 kwargs 的 monkeypatch 替换 _runtime_configs，这里做兼容。
+        return _runtime_configs()
+
+
 def _resolve_runtime_config(account_key: str | None, *, db: Session | None = None, user_id: str | None = None) -> QmtRuntimeConfig:
-    configs = _runtime_configs(db=db, user_id=user_id)
+    configs = _load_runtime_configs(db=db, user_id=user_id)
     active_key = _resolve_active_key(configs, account_key)
     return _pick_active_config(configs, active_key)
 
@@ -565,12 +629,22 @@ def _pick_active_config(configs: list[QmtRuntimeConfig], account_key: str | None
     return configs[0]
 
 
-def _resolve_active_key(configs: list[QmtRuntimeConfig], account_key: str | None) -> str:
+def _resolve_active_key(configs: list[QmtRuntimeConfig], account_key: str | None, *, preferred_role: str | None = None) -> str:
     if account_key:
         return account_key
+    normalized_role = str(preferred_role or "").strip().lower()
     default_key = (settings.qmt_default_account_key or "").strip()
     if default_key:
-        return default_key
+        default_config = next((config for config in configs if config.key == default_key), None)
+        if default_config and (not normalized_role or default_config.role == normalized_role):
+            return default_key
+    if normalized_role:
+        for config in configs:
+            if config.enabled and config.role == normalized_role:
+                return config.key
+        for config in configs:
+            if config.role == normalized_role:
+                return config.key
     for config in configs:
         if config.enabled:
             return config.key
@@ -582,7 +656,9 @@ def _load_account_payload(
     user_id: str,
     config: QmtRuntimeConfig,
     *,
+    prefer_cache: bool = False,
     sync_to_imports: bool = False,
+    allow_cache_fallback: bool = True,
 ) -> dict[str, Any]:
     connection = {
         "account_key": config.key,
@@ -614,50 +690,96 @@ def _load_account_payload(
             connection["message"] = f"缺少 bridge_base_url / userdata_path，且端口探测未通过：{reachability_message}"
         return empty
 
+    cache_key = _qmt_fetch_cache_key(user_id, config.key)
+    recent_failure = _get_recent_fetch_failure(cache_key)
+    if recent_failure and not sync_to_imports and allow_cache_fallback:
+        cached = _load_cached_payload(db, user_id, config, connection_override={**connection, "message": recent_failure})
+        if cached is not None:
+            return cached
+        connection["message"] = recent_failure
+        return empty
+
+    if prefer_cache and not sync_to_imports and allow_cache_fallback:
+        recent_live_payload = _get_recent_live_payload(cache_key, ttl_seconds=_recent_payload_ttl_seconds(config))
+        if recent_live_payload is not None and recent_failure is None:
+            recent_payload = copy.deepcopy(recent_live_payload)
+            recent_payload["fetched_at"] = _iso_now()
+            recent_payload["data_source"] = "cache_recent"
+            recent_payload["is_stale"] = False
+            _schedule_qmt_background_refresh(user_id, config.key)
+            return recent_payload
+        cached_message = "页面已优先展示本地快照，后台正在刷新 QMT 数据"
+        if recent_failure:
+            cached_message = f"{recent_failure}；当前先展示本地快照"
+        cached = _load_cached_payload(db, user_id, config, connection_override={**connection, "message": cached_message})
+        if recent_failure is None:
+            _schedule_qmt_background_refresh(user_id, config.key)
+        if cached is not None:
+            return cached
+        connection["message"] = (
+            f"{recent_failure}，暂无可用本地快照" if recent_failure else "正在后台刷新 QMT 数据，页面先展示本地空状态"
+        )
+        return empty
+
+    fetch_lock = _get_qmt_fetch_lock(cache_key)
+    acquired = fetch_lock.acquire(blocking=False)
+    if not acquired:
+        if sync_to_imports:
+            fetch_lock.acquire()
+            acquired = True
+        elif not allow_cache_fallback:
+            acquired = fetch_lock.acquire(timeout=3.0)
+            if not acquired:
+                connection["message"] = "QMT 快照刷新中，实时监控禁止使用缓存，已跳过本轮快照"
+                return empty
+        else:
+            cached = _load_cached_payload(
+                db,
+                user_id,
+                config,
+                connection_override={**connection, "message": "QMT 快照刷新中，已先返回最近缓存"},
+            )
+            if cached is not None:
+                return cached
+            connection["message"] = "QMT 快照刷新中，请稍后重试"
+            return empty
+
     try:
+        if acquired and not sync_to_imports and allow_cache_fallback:
+            recent_failure = _get_recent_fetch_failure(cache_key)
+            if recent_failure:
+                cached = _load_cached_payload(db, user_id, config, connection_override={**connection, "message": recent_failure})
+                if cached is not None:
+                    return cached
+                connection["message"] = recent_failure
+                return empty
         snapshot = _query_qmt_snapshot(config)
     except ImportError as exc:
         connection["message"] = f"xtquant 未安装：{exc}"
+        _remember_fetch_failure(cache_key, connection["message"])
+        if not allow_cache_fallback:
+            return empty
         cached = _load_cached_payload(db, user_id, config, connection_override=connection)
         return cached or empty
     except Exception as exc:
         logger.exception("[qmt] fetch overview failed for %s", config.key)
         connection["message"] = f"QMT 连接失败：{exc}"
+        _remember_fetch_failure(cache_key, connection["message"])
+        if not allow_cache_fallback:
+            return empty
         cached = _load_cached_payload(db, user_id, config, connection_override=connection)
         return cached or empty
+    finally:
+        if acquired:
+            fetch_lock.release()
 
-    security_name_map = _security_name_map_from_cache()
-    positions = _build_position_items(db, user_id, config, snapshot.get("positions") or [], security_name_map)
-    quote_map = _fetch_live_quotes([item["symbol"] for item in positions])
-    positions = _apply_quote_metrics(positions, quote_map)
-    _sync_position_state(db, user_id, config.account_id, positions)
-    if sync_to_imports:
-        _sync_qmt_positions_to_imports(db, user_id, config.key, positions)
-    account_payload = _build_account_payload(config, snapshot, positions)
-    connection["connected"] = True
-    connection["message"] = f"已连接 QMT {('模拟' if config.role == 'paper' else '实盘')}账户"
-    payload = {
-        "connection": connection,
-        "account": account_payload,
-        "positions": positions,
-        "orders": _build_order_items(snapshot.get("orders") or [], security_name_map),
-        "trades": _build_trade_items(snapshot.get("trades") or [], security_name_map),
-        "summary": {
-            "total_asset": account_payload["total_asset"],
-            "total_pnl": account_payload["total_pnl"],
-            "today_pnl": account_payload["today_pnl"],
-            "market_value": account_payload["market_value"],
-            "available_cash": account_payload["available_cash"],
-            "position_count": len(positions),
-        },
-        "refresh_interval_seconds": config.refresh_interval_seconds,
-        "fetched_at": _iso_now(),
-        "last_synced_at": _iso_now(),
-        "data_source": "live",
-        "is_stale": False,
-    }
-    _persist_account_snapshot(db, user_id, config, payload)
-    return payload
+    return _materialize_qmt_snapshot_payload(
+        db,
+        user_id,
+        config,
+        snapshot,
+        sync_to_imports=sync_to_imports,
+    )
 
 
 def _load_empty_payload(
@@ -754,15 +876,24 @@ def _load_cached_payload(
     if row is None:
         return None
     connection = dict(row.connection_json or {})
+    cached_connected = bool(connection.get("connected"))
     if connection_override:
-        connection.update(connection_override)
-    connection["connected"] = False
+        override = dict(connection_override)
+        override_connected = override.pop("connected", None)
+        connection.update(override)
+        if override_connected is True:
+            cached_connected = True
+        elif override_connected is False:
+            cached_connected = cached_connected or False
+    connection["connected"] = cached_connected
     base_message = str(connection_override.get("message") if connection_override else "").strip()
     if row.fetched_at:
         cached_label = row.fetched_at.astimezone(timezone.utc).isoformat()
-        connection["message"] = f"{base_message or 'QMT 当前不可用'}，已回退到最近快照（{cached_label}）"
+        prefix = base_message or ("页面展示最近一次成功同步的 QMT 快照" if cached_connected else "QMT 当前不可用")
+        connection["message"] = f"{prefix}，已回退到最近快照（{cached_label}）"
     else:
-        connection["message"] = f"{base_message or 'QMT 当前不可用'}，已回退到本地缓存"
+        prefix = base_message or ("页面展示最近一次成功同步的 QMT 快照" if cached_connected else "QMT 当前不可用")
+        connection["message"] = f"{prefix}，已回退到本地缓存"
     return {
         "connection": connection,
         "account": dict(row.account_json or {}) if row.account_json else None,
@@ -776,6 +907,203 @@ def _load_cached_payload(
         "data_source": "cache",
         "is_stale": True,
     }
+
+
+def _qmt_fetch_cache_key(user_id: str, account_key: str) -> str:
+    return f"{user_id}:{account_key}"
+
+
+def _recent_payload_ttl_seconds(config: QmtRuntimeConfig) -> float:
+    return max(_QMT_RECENT_PAYLOAD_TTL_SECONDS, float(config.refresh_interval_seconds) + 2.0)
+
+
+def _get_qmt_fetch_lock(cache_key: str) -> threading.Lock:
+    with _QMT_FETCH_STATE_LOCK:
+        lock = _QMT_FETCH_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _QMT_FETCH_LOCKS[cache_key] = lock
+        return lock
+
+
+def _schedule_qmt_background_refresh(user_id: str, account_key: str) -> bool:
+    cache_key = _qmt_fetch_cache_key(user_id, account_key)
+    with _QMT_FETCH_STATE_LOCK:
+        current = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {}
+        worker = current.get("thread")
+        if worker is not None and getattr(worker, "is_alive", lambda: False)():
+            return False
+        thread = threading.Thread(
+            target=_run_qmt_background_refresh,
+            args=(user_id, account_key),
+            daemon=True,
+            name=f"qmt-bg-refresh-{account_key[:12]}",
+        )
+        _QMT_BACKGROUND_REFRESH_STATE[cache_key] = {
+            "thread": thread,
+            "started_at": time.time(),
+            "finished_at": current.get("finished_at"),
+            "last_error": None,
+        }
+    thread.start()
+    return True
+
+
+def _run_qmt_background_refresh(user_id: str, account_key: str) -> None:
+    cache_key = _qmt_fetch_cache_key(user_id, account_key)
+    try:
+        from api.database import get_db_ctx
+
+        with get_db_ctx() as db:
+            config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
+            if config.bridge_base_url:
+                snapshot = asyncio.run(_query_qmt_snapshot_via_bridge_async(config))
+                _materialize_qmt_snapshot_payload(db, user_id, config, snapshot)
+            else:
+                _load_account_payload(db, user_id, config, prefer_cache=False, sync_to_imports=False)
+        with _QMT_FETCH_STATE_LOCK:
+            state = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {}
+            state["last_error"] = None
+            state["last_success_at"] = time.time()
+            _QMT_BACKGROUND_REFRESH_STATE[cache_key] = state
+    except Exception as exc:
+        logger.exception("[qmt] background refresh failed for %s", cache_key)
+        with _QMT_FETCH_STATE_LOCK:
+            state = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {}
+            state["last_error"] = str(exc)
+            _QMT_BACKGROUND_REFRESH_STATE[cache_key] = state
+    finally:
+        with _QMT_FETCH_STATE_LOCK:
+            state = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key)
+            if state is not None:
+                state["finished_at"] = time.time()
+                state.pop("thread", None)
+
+
+def _get_background_refresh_status(cache_key: str | None) -> dict[str, Any] | None:
+    if not cache_key:
+        return None
+    with _QMT_FETCH_STATE_LOCK:
+        state = dict(_QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {})
+    return {
+        "active": bool(state.get("thread") and getattr(state.get("thread"), "is_alive", lambda: False)()),
+        "started_at": _epoch_to_iso(state.get("started_at")),
+        "finished_at": _epoch_to_iso(state.get("finished_at")),
+        "last_success_at": _epoch_to_iso(state.get("last_success_at")),
+        "last_error": state.get("last_error"),
+    }
+
+
+def _epoch_to_iso(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _materialize_qmt_snapshot_payload(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+    snapshot: dict[str, Any],
+    *,
+    sync_to_imports: bool = False,
+) -> dict[str, Any]:
+    security_name_map = _security_name_map_from_cache()
+    positions = _build_position_items(db, user_id, config, snapshot.get("positions") or [], security_name_map)
+    quote_map = _fetch_live_quotes([item["symbol"] for item in positions], account_key=config.key, db=db, user_id=user_id)
+    positions = _apply_quote_metrics(positions, quote_map)
+    _sync_position_state(db, user_id, config.account_id, positions)
+    if sync_to_imports:
+        _sync_qmt_positions_to_imports(db, user_id, config.key, positions)
+    account_payload = _build_account_payload(config, snapshot, positions)
+    payload = {
+        "connection": {
+            "account_key": config.key,
+            "role": config.role,
+            "enabled": config.enabled,
+            "provider": "xtquant",
+            "host": config.host,
+            "port": config.port,
+            "account_id": config.account_id,
+            "account_type": config.account_type,
+            "account_name": config.account_name,
+            "userdata_path": config.userdata_path,
+            "bridge_base_url": config.bridge_base_url,
+            "connected": True,
+            "message": f"已连接 QMT {('模拟' if config.role == 'paper' else '实盘')}账户",
+        },
+        "account": account_payload,
+        "positions": positions,
+        "orders": _build_order_items(snapshot.get("orders") or [], security_name_map),
+        "trades": _build_trade_items(snapshot.get("trades") or [], security_name_map),
+        "summary": {
+            "total_asset": account_payload["total_asset"],
+            "total_pnl": account_payload["total_pnl"],
+            "today_pnl": account_payload["today_pnl"],
+            "market_value": account_payload["market_value"],
+            "available_cash": account_payload["available_cash"],
+            "position_count": len(positions),
+        },
+        "refresh_interval_seconds": config.refresh_interval_seconds,
+        "fetched_at": _iso_now(),
+        "last_synced_at": _iso_now(),
+        "data_source": "live",
+        "is_stale": False,
+    }
+    _persist_account_snapshot(db, user_id, config, payload)
+    _remember_live_payload(_qmt_fetch_cache_key(user_id, config.key), payload)
+    _clear_recent_fetch_failure(_qmt_fetch_cache_key(user_id, config.key))
+    return payload
+
+
+def _remember_live_payload(cache_key: str, payload: dict[str, Any]) -> None:
+    with _QMT_FETCH_STATE_LOCK:
+        _QMT_RECENT_PAYLOADS[cache_key] = {
+            "stored_at": time.time(),
+            "payload": copy.deepcopy(payload),
+        }
+
+
+def _get_recent_live_payload(cache_key: str, *, ttl_seconds: float) -> dict[str, Any] | None:
+    now = time.time()
+    with _QMT_FETCH_STATE_LOCK:
+        entry = _QMT_RECENT_PAYLOADS.get(cache_key)
+        if entry is None:
+            return None
+        stored_at = float(entry.get("stored_at") or 0)
+        if now - stored_at > max(ttl_seconds, 0):
+            _QMT_RECENT_PAYLOADS.pop(cache_key, None)
+            return None
+        return copy.deepcopy(entry.get("payload") or {})
+
+
+def _remember_fetch_failure(cache_key: str, message: str) -> None:
+    with _QMT_FETCH_STATE_LOCK:
+        _QMT_RECENT_FAILURES[cache_key] = {
+            "failed_at": time.time(),
+            "message": str(message or "QMT 连接失败"),
+        }
+
+
+def _get_recent_fetch_failure(cache_key: str) -> str | None:
+    now = time.time()
+    with _QMT_FETCH_STATE_LOCK:
+        entry = _QMT_RECENT_FAILURES.get(cache_key)
+        if entry is None:
+            return None
+        failed_at = float(entry.get("failed_at") or 0)
+        if now - failed_at > _QMT_FAILURE_COOLDOWN_SECONDS:
+            _QMT_RECENT_FAILURES.pop(cache_key, None)
+            return None
+        return str(entry.get("message") or "QMT 连接失败")
+
+
+def _clear_recent_fetch_failure(cache_key: str) -> None:
+    with _QMT_FETCH_STATE_LOCK:
+        _QMT_RECENT_FAILURES.pop(cache_key, None)
 
 
 def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool) -> dict[str, Any]:
@@ -972,10 +1300,35 @@ def _query_qmt_snapshot_via_bridge(config: QmtRuntimeConfig) -> dict[str, Any]:
         f"{base_url}/snapshot",
         params={"account_id": config.account_id, "account_type": config.account_type, "account_key": config.key},
         headers=headers,
-        timeout=20,
+        timeout=_QMT_SNAPSHOT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     payload = response.json()
+    return {
+        "fund": payload.get("fund") or {},
+        "positions": payload.get("positions") or [],
+        "asset": payload.get("asset") or {},
+        "orders": payload.get("orders") or [],
+        "trades": payload.get("trades") or [],
+        "bridge": payload.get("bridge") or {},
+    }
+
+
+async def _query_qmt_snapshot_via_bridge_async(config: QmtRuntimeConfig) -> dict[str, Any]:
+    base_url = str(config.bridge_base_url or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("bridge_base_url 为空")
+    headers = {}
+    if config.bridge_token:
+        headers["Authorization"] = f"Bearer {config.bridge_token}"
+    async with httpx.AsyncClient(timeout=_QMT_SNAPSHOT_TIMEOUT_SECONDS) as client:
+        response = await client.get(
+            f"{base_url}/snapshot",
+            params={"account_id": config.account_id, "account_type": config.account_type, "account_key": config.key},
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
     return {
         "fund": payload.get("fund") or {},
         "positions": payload.get("positions") or [],
@@ -1167,7 +1520,7 @@ def _submit_qmt_order_via_local_xttrader(
             int(quantity),
             price_mode_map[price_key],
             float(price or 0.0),
-            str(strategy_name or "TradingAgents"),
+            str(strategy_name or "量化之神"),
             str(order_remark or ""),
         )
     finally:
@@ -1246,49 +1599,53 @@ def _build_position_items(
     }
     items: list[dict[str, Any]] = []
     for raw in raw_positions:
-        payload = raw if isinstance(raw, dict) else _object_to_dict(raw)
-        symbol = _normalize_symbol(payload.get("stockCode") or payload.get("stock_code"))
-        quantity = _to_float(payload.get("totalAmt"), payload.get("volume"))
-        if not symbol or quantity in (None, 0):
+        try:
+            payload = raw if isinstance(raw, dict) else _object_to_dict(raw)
+            symbol = _normalize_symbol(payload.get("stockCode") or payload.get("stock_code"))
+            quantity = _to_float(payload.get("totalAmt"), payload.get("volume"))
+            if not symbol or quantity in (None, 0):
+                continue
+            available = _to_float(payload.get("enableAmount"), payload.get("can_use_volume"))
+            current_price = _to_float(payload.get("lastPrice"))
+            avg_price = _to_float(payload.get("costPrice"), payload.get("avg_price"), payload.get("open_price"))
+            market_value = _to_float(payload.get("marketValue"), payload.get("market_value"))
+            if market_value is None and current_price is not None and quantity is not None:
+                market_value = round(current_price * quantity, 2)
+            total_pnl = _to_float(payload.get("income"))
+            if total_pnl is None and current_price is not None and avg_price is not None:
+                total_pnl = round((current_price - avg_price) * quantity, 2)
+            total_pnl_pct = None
+            if current_price is not None and avg_price not in (None, 0):
+                total_pnl_pct = round(((current_price - avg_price) / avg_price) * 100, 2)
+            state = tracked_states.get(symbol)
+            first_seen_at = state.first_seen_at if state and (state.last_quantity or 0) > 0 else datetime.now(timezone.utc)
+            holding_days = max((datetime.now(timezone.utc).date() - first_seen_at.date()).days + 1, 1)
+            break_even_rise_pct = 0.0
+            if current_price not in (None, 0) and avg_price and current_price < avg_price:
+                break_even_rise_pct = round(((avg_price / current_price) - 1) * 100, 2)
+            items.append(
+                {
+                    "symbol": symbol,
+                    "name": _resolve_security_name(payload, symbol, security_name_map),
+                    "account_id": config.account_id,
+                    "current_position": round(float(quantity), 2),
+                    "available_position": round(float(available or 0.0), 2),
+                    "average_cost": round(float(avg_price or 0.0), 4),
+                    "current_price": round(float(current_price or 0.0), 4) if current_price is not None else None,
+                    "market_value": round(float(market_value or 0.0), 2),
+                    "total_pnl": round(float(total_pnl or 0.0), 2),
+                    "total_pnl_pct": total_pnl_pct,
+                    "today_pnl": None,
+                    "today_pnl_pct": None,
+                    "holding_days": holding_days,
+                    "break_even_rise_pct": break_even_rise_pct,
+                    "position_pct": None,
+                    "raw": payload,
+                }
+            )
+        except Exception:
+            logger.exception("[qmt] build position item failed for account=%s raw=%s", config.key, raw)
             continue
-        available = _to_float(payload.get("enableAmount"), payload.get("can_use_volume"))
-        current_price = _to_float(payload.get("lastPrice"))
-        avg_price = _to_float(payload.get("costPrice"), payload.get("avg_price"), payload.get("open_price"))
-        market_value = _to_float(payload.get("marketValue"), payload.get("market_value"))
-        if market_value is None and current_price is not None and quantity is not None:
-            market_value = round(current_price * quantity, 2)
-        total_pnl = _to_float(payload.get("income"))
-        if total_pnl is None and current_price is not None and avg_price is not None:
-            total_pnl = round((current_price - avg_price) * quantity, 2)
-        total_pnl_pct = None
-        if current_price is not None and avg_price not in (None, 0):
-            total_pnl_pct = round(((current_price - avg_price) / avg_price) * 100, 2)
-        state = tracked_states.get(symbol)
-        first_seen_at = state.first_seen_at if state and (state.last_quantity or 0) > 0 else datetime.now(timezone.utc)
-        holding_days = max((datetime.now(timezone.utc).date() - first_seen_at.date()).days + 1, 1)
-        break_even_rise_pct = 0.0
-        if current_price not in (None, 0) and avg_price and current_price < avg_price:
-            break_even_rise_pct = round(((avg_price / current_price) - 1) * 100, 2)
-        items.append(
-            {
-                "symbol": symbol,
-                "name": _resolve_security_name(payload, symbol, security_name_map),
-                "account_id": config.account_id,
-                "current_position": round(float(quantity), 2),
-                "available_position": round(float(available or 0.0), 2),
-                "average_cost": round(float(avg_price or 0.0), 4),
-                "current_price": round(float(current_price or 0.0), 4) if current_price is not None else None,
-                "market_value": round(float(market_value or 0.0), 2),
-                "total_pnl": round(float(total_pnl or 0.0), 2),
-                "total_pnl_pct": total_pnl_pct,
-                "today_pnl": None,
-                "today_pnl_pct": None,
-                "holding_days": holding_days,
-                "break_even_rise_pct": break_even_rise_pct,
-                "position_pct": None,
-                "raw": payload,
-            }
-        )
     total_market_value = sum(float(item["market_value"] or 0.0) for item in items)
     if total_market_value > 0:
         for item in items:
@@ -1301,23 +1658,42 @@ def _build_order_items(raw_orders: list[Any], security_name_map: dict[str, str] 
     items: list[dict[str, Any]] = []
     for raw in raw_orders:
         payload = raw if isinstance(raw, dict) else _object_to_dict(raw)
-        symbol = _normalize_symbol(payload.get("stockCode") or payload.get("stock_code") or payload.get("symbol"))
+        symbol = _normalize_symbol(_first_present(payload, "stockCode", "stock_code", "symbol", "m_strStockCode"))
         if not symbol:
             continue
-        order_time = payload.get("orderTime") or payload.get("insert_time") or payload.get("order_time") or payload.get("created_at")
+        order_time = _normalize_qmt_time(_first_present(payload, "orderTime", "insert_time", "order_time", "created_at", "m_nOrderTime"))
+        quantity = _to_float(
+            payload.get("orderVolume"),
+            payload.get("order_volume"),
+            payload.get("volume"),
+            payload.get("orderQty"),
+            payload.get("m_nOrderVolume"),
+        )
+        filled_quantity = _to_float(
+            payload.get("tradedVolume"),
+            payload.get("traded_volume"),
+            payload.get("business_amount"),
+            payload.get("filled_quantity"),
+            payload.get("m_nTradedVolume"),
+        )
+        price = _to_float(payload.get("orderPrice"), payload.get("price"), payload.get("m_dPrice"))
+        amount = _to_float(payload.get("orderAmount"), payload.get("amount"))
+        if amount is None and price is not None and quantity is not None:
+            amount = round(float(price) * float(quantity), 2)
+        status = _normalize_order_status(payload, quantity=quantity, filled_quantity=filled_quantity)
         items.append(
             {
-                "order_id": str(payload.get("orderId") or payload.get("order_id") or payload.get("entrust_no") or ""),
+                "order_id": str(_first_present(payload, "orderId", "order_id", "entrust_no", "m_nOrderID") or ""),
                 "symbol": symbol,
                 "name": _resolve_security_name(payload, symbol, security_name_map),
-                "side": _normalize_side(payload.get("orderType") or payload.get("side") or payload.get("entrust_bs")),
-                "status": str(payload.get("orderStatus") or payload.get("status") or payload.get("status_name") or "unknown"),
-                "price": _to_float(payload.get("orderPrice"), payload.get("price")),
-                "quantity": _to_float(payload.get("orderVolume"), payload.get("volume"), payload.get("orderQty")),
-                "filled_quantity": _to_float(payload.get("tradedVolume"), payload.get("business_amount"), payload.get("filled_quantity")),
-                "amount": _to_float(payload.get("orderAmount"), payload.get("amount")),
-                "order_time": str(order_time) if order_time is not None else None,
-                "can_cancel": _is_order_cancelable(payload),
+                "side": _normalize_side(_first_present(payload, "orderType", "order_type", "side", "entrust_bs", "m_nOrderType")),
+                "status": status,
+                "price": price,
+                "quantity": quantity,
+                "filled_quantity": filled_quantity,
+                "amount": amount,
+                "order_time": order_time,
+                "can_cancel": _is_order_cancelable(payload, status=status, quantity=quantity, filled_quantity=filled_quantity),
                 "raw": payload,
             }
         )
@@ -1329,23 +1705,24 @@ def _build_trade_items(raw_trades: list[Any], security_name_map: dict[str, str] 
     items: list[dict[str, Any]] = []
     for raw in raw_trades:
         payload = raw if isinstance(raw, dict) else _object_to_dict(raw)
-        symbol = _normalize_symbol(payload.get("stockCode") or payload.get("stock_code") or payload.get("symbol"))
+        symbol = _normalize_symbol(_first_present(payload, "stockCode", "stock_code", "symbol", "m_strStockCode"))
         if not symbol:
             continue
-        trade_time = payload.get("tradedTime") or payload.get("trade_time") or payload.get("business_time") or payload.get("executed_at")
-        quantity = _to_float(payload.get("tradedVolume"), payload.get("volume"), payload.get("business_amount"))
-        price = _to_float(payload.get("tradedPrice"), payload.get("price"), payload.get("business_price"))
+        trade_time = _normalize_qmt_time(_first_present(payload, "tradedTime", "traded_time", "business_time", "executed_at", "m_nTradedTime"))
+        quantity = _to_float(payload.get("tradedVolume"), payload.get("traded_volume"), payload.get("volume"), payload.get("business_amount"), payload.get("m_nTradedVolume"))
+        price = _to_float(payload.get("tradedPrice"), payload.get("traded_price"), payload.get("price"), payload.get("business_price"), payload.get("m_dTradedPrice"))
+        amount = _to_float(payload.get("tradedAmount"), payload.get("traded_amount"), payload.get("amount"), payload.get("business_balance"), payload.get("m_dTradedAmount"))
         items.append(
             {
-                "trade_id": str(payload.get("tradedId") or payload.get("trade_id") or payload.get("business_no") or ""),
-                "order_id": str(payload.get("orderId") or payload.get("order_id") or payload.get("entrust_no") or ""),
+                "trade_id": str(_first_present(payload, "tradedId", "traded_id", "traded_id1", "trade_id", "business_no", "m_strTradedID", "m_strTradedIDNew") or ""),
+                "order_id": str(_first_present(payload, "orderId", "order_id", "entrust_no", "m_nOrderID") or ""),
                 "symbol": symbol,
                 "name": _resolve_security_name(payload, symbol, security_name_map),
-                "side": _normalize_side(payload.get("orderType") or payload.get("side") or payload.get("entrust_bs")),
+                "side": _normalize_side(_first_present(payload, "orderType", "order_type", "side", "entrust_bs", "m_nOrderType")),
                 "price": price,
                 "quantity": quantity,
-                "amount": round(float(quantity or 0.0) * float(price or 0.0), 2) if quantity is not None and price is not None else _to_float(payload.get("amount")),
-                "trade_time": str(trade_time) if trade_time is not None else None,
+                "amount": amount if amount is not None else round(float(quantity or 0.0) * float(price or 0.0), 2) if quantity is not None and price is not None else None,
+                "trade_time": trade_time,
                 "raw": payload,
             }
         )
@@ -1353,14 +1730,22 @@ def _build_trade_items(raw_trades: list[Any], security_name_map: dict[str, str] 
     return items[:50]
 
 
-def _is_order_cancelable(payload: dict[str, Any]) -> bool:
-    order_id = str(payload.get("orderId") or payload.get("order_id") or payload.get("entrust_no") or "").strip()
+def _is_order_cancelable(
+    payload: dict[str, Any],
+    *,
+    status: str | None = None,
+    quantity: float | None = None,
+    filled_quantity: float | None = None,
+) -> bool:
+    order_id = str(_first_present(payload, "orderId", "order_id", "entrust_no", "m_nOrderID") or "").strip()
     if not order_id:
         return False
-    status_text = str(payload.get("orderStatus") or payload.get("status") or payload.get("status_name") or "").strip().lower()
+    if quantity is not None and filled_quantity is not None and quantity > 0 and filled_quantity >= quantity:
+        return False
+    status_text = str(status or _first_present(payload, "orderStatus", "status", "status_name", "order_status", "m_nOrderStatus") or "").strip().lower()
     if not status_text:
         return True
-    terminal_keywords = ("filled", "cancel", "rejected", "invalid", "expired", "done", "success_all")
+    terminal_keywords = ("filled", "cancel", "rejected", "invalid", "expired", "done", "success_all", "废", "撤", "成")
     return not any(keyword in status_text for keyword in terminal_keywords)
 
 
@@ -1370,40 +1755,44 @@ def _apply_quote_metrics(
 ) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     for item in items:
-        quote = quote_map.get(item["symbol"]) or {}
-        resolved_name = _resolve_security_name(quote, item["symbol"], _security_name_map_from_cache())
-        current_price = _to_float(quote.get("price"), item.get("current_price"))
-        previous_close = _to_float(quote.get("previous_close"))
-        price_change = _to_float(quote.get("change"))
-        if price_change is None and current_price is not None and previous_close not in (None, 0):
-            price_change = round(current_price - previous_close, 4)
-        today_pnl = round(float(price_change or 0.0) * float(item.get("current_position") or 0.0), 2) if price_change is not None else None
-        today_pnl_pct = _to_float(quote.get("change_pct"))
-        total_pnl = item.get("total_pnl")
-        total_pnl_pct = _to_float(item.get("total_pnl_pct"))
-        avg_price = _to_float(item.get("average_cost"))
-        if current_price is not None and avg_price not in (None, 0):
-            total_pnl = round((current_price - avg_price) * float(item.get("current_position") or 0.0), 2)
-            total_pnl_pct = round(((current_price - avg_price) / avg_price) * 100, 2)
-            item["break_even_rise_pct"] = round(max((avg_price / current_price) - 1, 0) * 100, 2) if current_price > 0 else None
-        market_value = item.get("market_value")
-        if current_price is not None:
-            market_value = round(current_price * float(item.get("current_position") or 0.0), 2)
-        enriched.append(
-            {
-                **item,
-                "name": resolved_name if resolved_name and not _looks_like_symbol(resolved_name) else item.get("name"),
-                "current_price": round(float(current_price), 4) if current_price is not None else item.get("current_price"),
-                "market_value": market_value,
-                "total_pnl": total_pnl,
-                "total_pnl_pct": total_pnl_pct,
-                "today_pnl": today_pnl,
-                "today_pnl_pct": today_pnl_pct,
-                "previous_close": previous_close,
-                "quote_time": quote.get("quote_time"),
-                "quote_source": quote.get("source"),
-            }
-        )
+        try:
+            quote = quote_map.get(item["symbol"]) or {}
+            resolved_name = _resolve_security_name(quote, item["symbol"], _security_name_map_from_cache())
+            current_price = _to_float(quote.get("price"), item.get("current_price"))
+            previous_close = _to_float(quote.get("previous_close"))
+            price_change = _to_float(quote.get("change"))
+            if price_change is None and current_price is not None and previous_close not in (None, 0):
+                price_change = round(current_price - previous_close, 4)
+            today_pnl = round(float(price_change or 0.0) * float(item.get("current_position") or 0.0), 2) if price_change is not None else None
+            today_pnl_pct = _to_float(quote.get("change_pct"))
+            total_pnl = item.get("total_pnl")
+            total_pnl_pct = _to_float(item.get("total_pnl_pct"))
+            avg_price = _to_float(item.get("average_cost"))
+            if current_price is not None and avg_price not in (None, 0):
+                total_pnl = round((current_price - avg_price) * float(item.get("current_position") or 0.0), 2)
+                total_pnl_pct = round(((current_price - avg_price) / avg_price) * 100, 2)
+                item["break_even_rise_pct"] = round(max((avg_price / current_price) - 1, 0) * 100, 2) if current_price > 0 else None
+            market_value = item.get("market_value")
+            if current_price is not None:
+                market_value = round(current_price * float(item.get("current_position") or 0.0), 2)
+            enriched.append(
+                {
+                    **item,
+                    "name": resolved_name if resolved_name and not _looks_like_symbol(resolved_name) else item.get("name"),
+                    "current_price": round(float(current_price), 4) if current_price is not None else item.get("current_price"),
+                    "market_value": market_value,
+                    "total_pnl": total_pnl,
+                    "total_pnl_pct": total_pnl_pct,
+                    "today_pnl": today_pnl,
+                    "today_pnl_pct": today_pnl_pct,
+                    "previous_close": previous_close,
+                    "quote_time": quote.get("quote_time"),
+                    "quote_source": quote.get("source"),
+                }
+            )
+        except Exception:
+            logger.exception("[qmt] apply quote metrics failed for symbol=%s", item.get("symbol"))
+            enriched.append({**item, "quote_source": item.get("quote_source") or "fallback"})
     return enriched
 
 
@@ -1528,13 +1917,26 @@ def _source_name(account_key: str, role: str = "paper") -> str:
     return f"{prefix}:{key}"
 
 
-def _fetch_live_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
+def _fetch_live_quotes(
+    symbols: list[str],
+    *,
+    account_key: str | None = None,
+    timeout_seconds: float | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
     try:
         from api.services.qmt_market_data_service import fetch_realtime_quotes
 
-        return fetch_realtime_quotes(symbols, account_key=settings.qmt_history_account_key)
+        return fetch_realtime_quotes(
+            symbols,
+            account_key=account_key or settings.qmt_history_account_key,
+            timeout_seconds=timeout_seconds,
+            db=db,
+            user_id=user_id,
+        )
     except Exception as exc:
         logger.warning("[qmt] realtime quote fetch failed: %s", exc)
         return {}
@@ -1604,6 +2006,14 @@ def _looks_like_symbol(value: str) -> bool:
     return False
 
 
+def _first_present(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _normalize_side(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"23", "buy", "b", "买入"}:
@@ -1611,6 +2021,86 @@ def _normalize_side(value: Any) -> str:
     if text in {"24", "sell", "s", "卖出"}:
         return "sell"
     return text or "unknown"
+
+
+def _normalize_order_status(
+    payload: dict[str, Any],
+    *,
+    quantity: float | None = None,
+    filled_quantity: float | None = None,
+) -> str:
+    status_value = _first_present(payload, "orderStatus", "status", "status_name", "order_status", "m_nOrderStatus")
+    status_text = str(status_value or "").strip().lower()
+    if quantity is not None and filled_quantity is not None and quantity > 0:
+        if filled_quantity >= quantity:
+            return "filled"
+        if filled_quantity > 0:
+            return "partially_filled"
+    if not status_text:
+        return "unknown"
+    if status_text in {"filled", "submitted", "cancelled", "rejected", "partially_filled"}:
+        return status_text
+    numeric_status = _safe_int(status_text)
+    if numeric_status is not None:
+        mapping = {
+            48: "pending",
+            49: "pending",
+            50: "submitted",
+            51: "submitted",
+            52: "partially_filled",
+            53: "partially_filled",
+            54: "cancelled",
+            55: "cancelled",
+            56: "filled",
+            57: "rejected",
+        }
+        return mapping.get(numeric_status, str(numeric_status))
+    if any(keyword in status_text for keyword in ("filled", "已成", "全成", "success_all")):
+        return "filled"
+    if any(keyword in status_text for keyword in ("partial", "部成")):
+        return "partially_filled"
+    if any(keyword in status_text for keyword in ("cancel", "已撤", "撤单")):
+        return "cancelled"
+    if any(keyword in status_text for keyword in ("reject", "废", "invalid")):
+        return "rejected"
+    return status_text
+
+
+def _normalize_qmt_time(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(CN_TZ).isoformat() if value.tzinfo else value.replace(tzinfo=CN_TZ).isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = text.replace(".", "", 1)
+    if digits.isdigit():
+        try:
+            number = float(text)
+            if number > 1_000_000_000_000:
+                return datetime.fromtimestamp(number / 1000, tz=CN_TZ).isoformat()
+            if number > 1_000_000_000:
+                return datetime.fromtimestamp(number, tz=CN_TZ).isoformat()
+        except Exception:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d%H%M%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=CN_TZ).isoformat()
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(CN_TZ).isoformat() if parsed.tzinfo else parsed.replace(tzinfo=CN_TZ).isoformat()
+    except Exception:
+        return text
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
 
 
 def _object_to_dict(obj: Any) -> dict[str, Any]:

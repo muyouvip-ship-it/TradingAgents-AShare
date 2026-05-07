@@ -16,7 +16,7 @@ def normalize_symbol(raw: str) -> str:
             if suffix == "SS":
                 return f"{code}.SH"
             return f"{code}.{suffix}"
-        if code.startswith(("4", "8")):
+        if code.startswith(("4", "8")) or code.startswith("92"):
             market = "BJ"
         elif code.startswith(("5", "6", "9")):
             market = "SH"

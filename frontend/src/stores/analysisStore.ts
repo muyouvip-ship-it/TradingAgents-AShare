@@ -151,19 +151,32 @@ function createDebouncedStorage(delay = 800) {
     let pending: [string, string] | null = null
     let timer: ReturnType<typeof setTimeout> | null = null
     return {
-        getItem: (name: string) => localStorage.getItem(name),
+        getItem: (name: string) => {
+            try {
+                return localStorage.getItem(name)
+            } catch {
+                return null
+            }
+        },
         setItem: (name: string, value: string) => {
             pending = [name, value]
             if (timer) clearTimeout(timer)
             timer = setTimeout(() => {
-                if (pending) { localStorage.setItem(pending[0], pending[1]); pending = null }
+                if (pending) {
+                    try {
+                        localStorage.setItem(pending[0], pending[1])
+                    } catch {}
+                    pending = null
+                }
                 timer = null
             }, delay)
         },
         removeItem: (name: string) => {
             pending = null
             if (timer) { clearTimeout(timer); timer = null }
-            localStorage.removeItem(name)
+            try {
+                localStorage.removeItem(name)
+            } catch {}
         },
     }
 }

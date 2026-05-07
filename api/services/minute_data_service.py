@@ -9,11 +9,15 @@ from typing import Any
 
 import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.engine import Engine
 
 from api.core.env import load_project_env
+from api.services.market_data_pipeline_service import preferred_minute_kline_table
 
 
 MINUTE_CACHE_ROOT = Path("data/artifacts/minute_cache")
+_minute_engine: Engine | None = None
+_minute_engine_url: str | None = None
 
 
 @dataclass
@@ -45,16 +49,40 @@ def load_aggregated_minute_bars(
     symbols: list[str],
     trade_date: str,
     timeframe: str,
+    allow_cache: bool = True,
+    allow_synthetic: bool = True,
 ) -> MinuteAggregationResult:
     normalized_symbols = _normalize_symbols(symbols)
+    if not normalized_symbols:
+        return MinuteAggregationResult(
+            timeframe=timeframe,
+            trade_date=trade_date,
+            items=[],
+            source="empty",
+            missing_symbols=[],
+            cache_path=None,
+            parquet_cache_path=None,
+        )
     frame = _try_load_minute_frame(normalized_symbols, trade_date)
-    source = "postgresql:stock_minute_kline"
+    source = f"postgresql:{preferred_minute_kline_table()}"
+    cache_paths: dict[str, str | None] = {"json": None, "parquet": None}
     if frame is None or frame.empty:
-        frame = pd.DataFrame(columns=["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"])
-        source = "empty"
-    aggregated = _aggregate_minute_frame(frame, timeframe)
+        cached = _try_load_cached_aggregated_frame(normalized_symbols, trade_date=trade_date, timeframe=timeframe)
+        if allow_cache and cached is not None:
+            aggregated, cache_source, cache_paths = cached
+            source = f"cache:{cache_source}"
+        elif allow_synthetic:
+            frame = _generate_synthetic_minute_frame(normalized_symbols, trade_date)
+            source = "synthetic:fallback" if not frame.empty else "empty"
+            aggregated = _aggregate_minute_frame(frame, timeframe)
+        else:
+            aggregated = pd.DataFrame(columns=["symbol", "bar_start", "bar_end", "open", "high", "low", "close", "volume", "amount", "vwap"])
+            source = "empty"
+    else:
+        aggregated = _aggregate_minute_frame(frame, timeframe)
     missing_symbols = sorted(set(normalized_symbols) - set(aggregated["symbol"].unique())) if not aggregated.empty else normalized_symbols
-    cache_paths = _write_minute_cache(aggregated, trade_date=trade_date, timeframe=timeframe, source=source)
+    if not cache_paths.get("json") and not cache_paths.get("parquet"):
+        cache_paths = _write_minute_cache(aggregated, trade_date=trade_date, timeframe=timeframe, source=source)
     return MinuteAggregationResult(
         timeframe=timeframe,
         trade_date=trade_date,
@@ -71,8 +99,16 @@ def evaluate_intraday_confirmation(
     symbols: list[str],
     trade_date: str,
     timeframe: str = "30m",
+    allow_cache: bool = True,
+    allow_synthetic: bool = True,
 ) -> MinuteAggregationResult:
-    result = load_aggregated_minute_bars(symbols=symbols, trade_date=trade_date, timeframe=timeframe)
+    result = load_aggregated_minute_bars(
+        symbols=symbols,
+        trade_date=trade_date,
+        timeframe=timeframe,
+        allow_cache=allow_cache,
+        allow_synthetic=allow_synthetic,
+    )
     frame = pd.DataFrame(result.items)
     if frame.empty:
         result.items = []
@@ -82,7 +118,11 @@ def evaluate_intraday_confirmation(
     prev_close = grouped["close"].shift(1)
     prev_vwap = grouped["vwap"].shift(1)
     cross_above = (frame["close"] >= frame["vwap"]) & ((prev_close < prev_vwap) | prev_close.isna() | prev_vwap.isna())
-    confirmation_rows = grouped.apply(lambda group: _select_confirmation_row(group, cross_above.loc[group.index], group.name)).reset_index(drop=True)
+    confirmation_frames = [
+        _select_confirmation_row(group, cross_above.loc[group.index], str(symbol))
+        for symbol, group in frame.groupby("symbol", sort=False)
+    ]
+    confirmation_rows = pd.concat(confirmation_frames, ignore_index=True) if confirmation_frames else pd.DataFrame()
     result.items = confirmation_rows.to_dict("records") if not confirmation_rows.empty else []
     return result
 
@@ -102,14 +142,14 @@ def evaluate_first_day_band_signals(
             timeframe=timeframe,
             trade_date=trade_date,
             items=[],
-            source="postgresql:stock_minute_kline",
+            source=f"postgresql:{preferred_minute_kline_table()}",
             missing_symbols=[],
         )
 
     end_dt = datetime.fromisoformat(str(trade_date))
     start_dt = (end_dt - timedelta(days=max(lookback_days, 1) + 3)).date().isoformat()
     frame = _try_load_minute_frame_range(normalized_symbols, start_date=start_dt, end_date=trade_date)
-    source = "postgresql:stock_minute_kline"
+    source = f"postgresql:{preferred_minute_kline_table()}"
     if supplement_frame is not None and not supplement_frame.empty:
         extra = supplement_frame.copy()
         if "symbol" in extra.columns:
@@ -205,23 +245,28 @@ def evaluate_first_day_band_signals(
 
 
 def _try_load_minute_frame(symbols: list[str], trade_date: str) -> pd.DataFrame | None:
-    load_project_env()
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url or not symbols:
+    engine = _get_minute_engine()
+    if engine is None or not symbols:
         return None
     try:
-        engine = create_engine(database_url)
+        table_name = preferred_minute_kline_table()
         query_symbols = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+        start_time, end_time = _date_range_bounds(trade_date, trade_date)
         statement = text(
-            """
+            f"""
             SELECT symbol, trade_time, open, high, low, close, volume, amount
-            FROM stock_minute_kline
+            FROM {table_name}
             WHERE symbol IN :symbols
-              AND DATE(trade_time) = :trade_date
+              AND trade_time >= :start_time
+              AND trade_time < :end_time
             ORDER BY symbol, trade_time
             """
         ).bindparams(bindparam("symbols", expanding=True))
-        frame = pd.read_sql_query(statement, engine, params={"symbols": query_symbols, "trade_date": trade_date})
+        frame = pd.read_sql_query(
+            statement,
+            engine,
+            params={"symbols": query_symbols, "start_time": start_time, "end_time": end_time},
+        )
         if frame.empty:
             return None
         frame["symbol"] = frame["symbol"].map(_normalize_symbol)
@@ -232,27 +277,27 @@ def _try_load_minute_frame(symbols: list[str], trade_date: str) -> pd.DataFrame 
 
 
 def _try_load_minute_frame_range(symbols: list[str], *, start_date: str, end_date: str) -> pd.DataFrame | None:
-    load_project_env()
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url or not symbols:
+    engine = _get_minute_engine()
+    if engine is None or not symbols:
         return None
     try:
-        engine = create_engine(database_url)
+        table_name = preferred_minute_kline_table()
         query_symbols = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+        start_time, end_time = _date_range_bounds(start_date, end_date)
         statement = text(
-            """
+            f"""
             SELECT symbol, trade_time, open, high, low, close, volume, amount
-            FROM stock_minute_kline
+            FROM {table_name}
             WHERE symbol IN :symbols
-              AND DATE(trade_time) >= :start_date
-              AND DATE(trade_time) <= :end_date
+              AND trade_time >= :start_time
+              AND trade_time < :end_time
             ORDER BY symbol, trade_time
             """
         ).bindparams(bindparam("symbols", expanding=True))
         frame = pd.read_sql_query(
             statement,
             engine,
-            params={"symbols": query_symbols, "start_date": start_date, "end_date": end_date},
+            params={"symbols": query_symbols, "start_time": start_time, "end_time": end_time},
         )
         if frame.empty:
             return None
@@ -261,6 +306,28 @@ def _try_load_minute_frame_range(symbols: list[str], *, start_date: str, end_dat
         return frame
     except Exception:
         return None
+
+
+def _get_minute_engine() -> Engine | None:
+    global _minute_engine, _minute_engine_url
+    load_project_env()
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return None
+    if _minute_engine is None or _minute_engine_url != database_url:
+        if _minute_engine is not None:
+            _minute_engine.dispose()
+        _minute_engine = create_engine(database_url)
+        _minute_engine_url = database_url
+    return _minute_engine
+
+
+def _date_range_bounds(start_date: str, end_date: str) -> tuple[datetime, datetime]:
+    start_day = pd.to_datetime(start_date).date()
+    end_day = pd.to_datetime(end_date).date()
+    start_time = datetime.combine(start_day, datetime.min.time())
+    end_time = datetime.combine(end_day + timedelta(days=1), datetime.min.time())
+    return start_time, end_time
 
 
 def _generate_synthetic_minute_frame(symbols: list[str], trade_date: str) -> pd.DataFrame:
@@ -294,6 +361,70 @@ def _generate_synthetic_minute_frame(symbols: list[str], trade_date: str) -> pd.
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _try_load_cached_aggregated_frame(
+    symbols: list[str],
+    *,
+    trade_date: str,
+    timeframe: str,
+) -> tuple[pd.DataFrame, str, dict[str, str | None]] | None:
+    cache_dir = get_minute_cache_root() / trade_date / timeframe
+    if not cache_dir.exists():
+        return None
+
+    normalized_symbols = set(_normalize_symbols(symbols))
+    for parquet_path in sorted(cache_dir.glob("*.parquet")):
+        try:
+            frame = pd.read_parquet(parquet_path)
+        except Exception:
+            continue
+        prepared = _prepare_cached_aggregated_frame(frame, normalized_symbols)
+        if prepared is None:
+            continue
+        json_path = parquet_path.with_suffix(".json")
+        return prepared, parquet_path.stem, {
+            "json": str(json_path) if json_path.exists() else None,
+            "parquet": str(parquet_path),
+        }
+
+    for json_path in sorted(cache_dir.glob("*.json")):
+        try:
+            frame = pd.read_json(json_path)
+        except Exception:
+            continue
+        prepared = _prepare_cached_aggregated_frame(frame, normalized_symbols)
+        if prepared is None:
+            continue
+        parquet_path = json_path.with_suffix(".parquet")
+        return prepared, json_path.stem, {
+            "json": str(json_path),
+            "parquet": str(parquet_path) if parquet_path.exists() else None,
+        }
+
+    return None
+
+
+def _prepare_cached_aggregated_frame(frame: pd.DataFrame, normalized_symbols: set[str]) -> pd.DataFrame | None:
+    if frame.empty or "symbol" not in frame.columns:
+        return None
+    prepared = frame.copy()
+    prepared["symbol"] = prepared["symbol"].map(_normalize_symbol)
+    if normalized_symbols:
+        prepared = prepared[prepared["symbol"].isin(normalized_symbols)]
+    if prepared.empty:
+        return None
+    for column in ("bar_start", "bar_end"):
+        if column in prepared.columns:
+            prepared[column] = pd.to_datetime(prepared[column])
+    for column in ("open", "high", "low", "close", "volume", "amount", "vwap"):
+        if column in prepared.columns:
+            prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
+    columns = ["symbol", "bar_start", "bar_end", "open", "high", "low", "close", "volume", "amount", "vwap"]
+    available = [column for column in columns if column in prepared.columns]
+    if len(available) != len(columns):
+        return None
+    return prepared[columns].sort_values(["symbol", "bar_end"]).reset_index(drop=True)
 
 
 def _aggregate_minute_frame(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:

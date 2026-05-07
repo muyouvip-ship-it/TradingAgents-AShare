@@ -9,14 +9,13 @@ const NewsEye = lazy(() => import('./pages/NewsEye'))
 const StockMarket = lazy(() => import('./pages/StockMarket'))
 const Analysis = lazy(() => import('./pages/Analysis'))
 const Reports = lazy(() => import('./pages/Reports'))
+const DailyReview = lazy(() => import('./pages/DailyReview'))
 const Settings = lazy(() => import('./pages/Settings'))
 const Portfolio = lazy(() => import('./pages/Portfolio'))
 const TrackingBoard = lazy(() => import('./pages/TrackingBoard'))
 const Login = lazy(() => import('./pages/Login'))
 const Feedback = lazy(() => import('./pages/Feedback'))
 const DebugLogs = lazy(() => import('./pages/DebugLogs'))
-const Sponsor = lazy(() => import('./pages/Sponsor'))
-const Thanks = lazy(() => import('./pages/Thanks'))
 const StrategiesV2 = lazy(() => import('./pages/StrategiesV2'))
 const StrategyCreate = lazy(() => import('./pages/StrategyCreate'))
 const Backtest = lazy(() => import('./pages/Backtest'))
@@ -24,15 +23,6 @@ const BacktestResult = lazy(() => import('./pages/BacktestResult'))
 const RealtimeMonitor = lazy(() => import('./pages/RealtimeMonitor'))
 const VirtualWarehouse = lazy(() => import('./pages/VirtualWarehouse'))
 const LiveWarehouse = lazy(() => import('./pages/LiveWarehouse'))
-
-const ONLINE_HOST = 'app.510168.xyz'
-const isOnline = typeof window !== 'undefined' && window.location.hostname === ONLINE_HOST
-
-function ExternalRedirect({ to, fallback }: { to: string; fallback: JSX.Element }) {
-  if (isOnline) return fallback
-  window.location.href = to
-  return null
-}
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const { user, hydrated, hydrate } = useAuthStore()
@@ -62,8 +52,8 @@ function App() {
       <Suspense fallback={<PageLoading />}>
         <Routes>
           <Route path="/login" element={<Login />} />
-          <Route path="/sponsor" element={<ExternalRedirect to={`https://${ONLINE_HOST}/sponsor`} fallback={<Sponsor />} />} />
-          <Route path="/thanks" element={<ExternalRedirect to={`https://${ONLINE_HOST}/thanks`} fallback={<Thanks />} />} />
+          <Route path="/sponsor" element={<Navigate to="/" replace />} />
+          <Route path="/thanks" element={<Navigate to="/" replace />} />
           <Route
             path="*"
             element={
@@ -76,6 +66,7 @@ function App() {
                     <Route path="/tracking-board" element={<TrackingBoard />} />
                     <Route path="/analysis" element={<Analysis />} />
                     <Route path="/reports" element={<Reports />} />
+                    <Route path="/daily-review" element={<DailyReview />} />
                     <Route path="/portfolio" element={<Portfolio />} />
                     <Route path="/strategies" element={<StrategiesV2 />} />
                     <Route path="/strategies/create" element={<StrategyCreate />} />

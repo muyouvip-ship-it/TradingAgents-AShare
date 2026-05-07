@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, Clock3, FileText, RefreshCw, ShieldAlert, TerminalSquare } from 'lucide-react'
 
+import VirtualList from '@/components/VirtualList'
 import { api } from '@/services/api'
 import type { RuntimeLogSource, RuntimeLogsResponse } from '@/types'
 
@@ -29,6 +30,9 @@ export default function DebugLogs() {
     () => sources.find(item => item.id === selectedSource) ?? sources[0] ?? null,
     [selectedSource, sources],
   )
+  const logViewportHeight = typeof window !== 'undefined'
+    ? Math.max(360, Math.min(Math.floor(window.innerHeight * 0.72), 780))
+    : 640
 
   const loadSources = async () => {
     try {
@@ -293,13 +297,28 @@ export default function DebugLogs() {
           )}
 
           <div className="mt-4 rounded-2xl bg-slate-950 p-4">
-            <pre className="max-h-[72vh] overflow-auto whitespace-pre-wrap break-all font-mono text-xs leading-6 text-slate-100">
-              {payload?.lines?.length
-                ? payload.lines.join('\n')
-                : currentSource?.exists
+            {payload?.lines?.length ? (
+              <VirtualList
+                items={payload.lines}
+                height={logViewportHeight}
+                estimateSize={24}
+                overscan={12}
+                className="font-mono text-xs leading-6 text-slate-100"
+                itemKey={(_, index) => index}
+                renderItem={(line, index) => (
+                  <div className="whitespace-pre break-all">
+                    <span className="mr-3 inline-block w-12 select-none text-right text-slate-500">{index + 1}</span>
+                    <span>{line}</span>
+                  </div>
+                )}
+              />
+            ) : (
+              <div className="py-6 font-mono text-xs leading-6 text-slate-100">
+                {currentSource?.exists
                   ? '当前日志暂无内容。'
                   : '当前日志文件不存在，请先启动对应程序或检查日志输出配置。'}
-            </pre>
+              </div>
+            )}
           </div>
         </section>
       </div>

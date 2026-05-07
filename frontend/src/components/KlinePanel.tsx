@@ -17,6 +17,7 @@ import {
     createChart,
 } from 'lightweight-charts'
 import { Activity, CandlestickChart, Layers3 } from 'lucide-react'
+import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type { ChanlunOverlayResponse, KlineCandle, MarketQuote } from '@/types'
 import { useAnalysisStore } from '@/stores/analysisStore'
@@ -408,14 +409,22 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             }
         }
         void loadQuote()
-        const timer = window.setInterval(() => {
-            void loadQuote()
-        }, 15000)
         return () => {
             cancelled = true
-            window.clearInterval(timer)
         }
     }, [symbol])
+
+    usePolling(
+        async () => {
+            try {
+                const response = await api.getQuote(symbol)
+                setQuote(response.quote)
+            } catch {
+                setQuote(null)
+            }
+        },
+        { intervalMs: 15000, runImmediately: false },
+    )
 
     useEffect(() => {
         const targetDate = normalizeDateKey(focusDate)

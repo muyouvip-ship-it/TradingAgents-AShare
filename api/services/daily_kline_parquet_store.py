@@ -24,17 +24,11 @@ DAILY_KLINE_NUMERIC_COLUMNS = [
     "total_market_cap",
     "net_profit_ttm",
 ]
+_DAILY_KLINE_SCHEMA_CACHE: dict[tuple[str, ...], set[str]] = {}
 
 
 def normalize_daily_kline_symbol(value: Any) -> str:
     text = str(value or "").strip().upper()
-    if not text:
-        return ""
-    text = re.sub(r"^(SH|SZ|BJ)", "", text)
-    text = re.sub(r"\.(SH|SZ|BJ)$", "", text)
-    match = re.search(r"(\d{6})", text)
-    if match:
-        return match.group(1)
     return text
 
 
@@ -130,75 +124,47 @@ def load_daily_kline_slice_from_parquet(
     start_date: str,
     end_date: str,
     root: Path | None = None,
+    columns: list[str] | None = None,
 ) -> pd.DataFrame | None:
-    if not _has_module("duckdb"):
-        return None
     root = root or get_daily_kline_parquet_root()
-    files = sorted(root.glob("*.parquet"))
+    files = _daily_kline_files_for_range(root, start_date, end_date)
     if not files:
         return None
+    selected_columns = _resolve_daily_kline_columns(files, columns)
+    duckdb_frame = _load_daily_kline_slice_with_duckdb(
+        files=files,
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+        columns=selected_columns,
+    )
+    if duckdb_frame is not None:
+        return duckdb_frame
     try:
-        import duckdb
-
-        symbol_list = list(symbols)
-        normalized_symbols = [normalize_daily_kline_symbol(symbol) for symbol in symbol_list if normalize_daily_kline_symbol(symbol)]
-        if symbol_list:
-            query = """
-                WITH normalized AS (
-                    SELECT
-                        regexp_replace(
-                            regexp_replace(upper(trim(symbol)), '^(SH|SZ|BJ)', ''),
-                            '\\.(SH|SZ|BJ)$',
-                            ''
-                        ) AS normalized_symbol,
-                        CAST(date AS DATE) AS date,
-                        open, high, low, close, volume, amount,
-                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                    FROM read_parquet(?, union_by_name=true)
-                )
-                SELECT normalized_symbol AS symbol, date, open, high, low, close, volume, amount,
-                       turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                FROM normalized
-                WHERE date >= CAST(? AS DATE)
-                  AND date <= CAST(? AS DATE)
-                  AND normalized_symbol IN (SELECT UNNEST(?))
-                QUALIFY row_number() OVER (PARTITION BY normalized_symbol, date ORDER BY date DESC) = 1
-                ORDER BY date, symbol
-            """
-            frame = duckdb.execute(
-                query,
-                ([str(path) for path in files], start_date, end_date, normalized_symbols),
-            ).fetchdf()
-        else:
-            query = """
-                WITH normalized AS (
-                    SELECT
-                        regexp_replace(
-                            regexp_replace(upper(trim(symbol)), '^(SH|SZ|BJ)', ''),
-                            '\\.(SH|SZ|BJ)$',
-                            ''
-                        ) AS normalized_symbol,
-                        CAST(date AS DATE) AS date,
-                        open, high, low, close, volume, amount,
-                        turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                    FROM read_parquet(?, union_by_name=true)
-                )
-                SELECT normalized_symbol AS symbol, date, open, high, low, close, volume, amount,
-                       turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                FROM normalized
-                WHERE date >= CAST(? AS DATE)
-                  AND date <= CAST(? AS DATE)
-                  AND normalized_symbol <> ''
-                QUALIFY row_number() OVER (PARTITION BY normalized_symbol, date ORDER BY date DESC) = 1
-                ORDER BY date, symbol
-            """
-            frame = duckdb.execute(
-                query,
-                ([str(path) for path in files], start_date, end_date),
-            ).fetchdf()
-        if frame.empty:
+        frames = [_read_daily_kline_parquet_frame(path, selected_columns) for path in files]
+        usable_frames = [frame for frame in frames if not frame.empty and not frame.dropna(how="all").empty]
+        merged = pd.concat(usable_frames, ignore_index=True) if usable_frames else pd.DataFrame()
+        if merged.empty:
             return None
-        return frame
+        normalized = _normalize_daily_kline_frame_for_parquet(merged)
+        normalized["date"] = pd.to_datetime(normalized["date"]).dt.date
+        start = pd.to_datetime(start_date).date()
+        end = pd.to_datetime(end_date).date()
+        normalized = normalized[(normalized["date"] >= start) & (normalized["date"] <= end)]
+        if normalized.empty:
+            return None
+
+        if symbols:
+            exact_symbols = {normalize_daily_kline_symbol(symbol) for symbol in symbols if normalize_daily_kline_symbol(symbol)}
+            symbol_codes = {symbol.split(".", 1)[0] for symbol in exact_symbols}
+            symbol_series = normalized["symbol"].astype(str).str.upper()
+            code_series = symbol_series.str.split(".", n=1).str[0]
+            normalized = normalized[symbol_series.isin(exact_symbols) | code_series.isin(symbol_codes)]
+            if normalized.empty:
+                return None
+
+        normalized = normalized.drop_duplicates(["symbol", "date"], keep="last").sort_values(["date", "symbol"]).reset_index(drop=True)
+        return normalized
     except Exception:
         return None
 
@@ -226,6 +192,185 @@ def write_daily_kline_parquet_cache(
         payload.to_parquet(path, index=False)
         written_paths.append(str(path))
     return ",".join(written_paths) if written_paths else None
+
+
+def _daily_kline_files_for_range(root: Path, start_date: str, end_date: str) -> list[Path]:
+    files = sorted(root.glob("*.parquet"))
+    if not files:
+        return []
+    try:
+        start_year = pd.to_datetime(start_date).year
+        end_year = pd.to_datetime(end_date).year
+    except Exception:
+        return files
+    selected: list[Path] = []
+    for path in files:
+        match = re.search(r"(19|20)\d{2}", path.stem)
+        if not match:
+            selected.append(path)
+            continue
+        year = int(match.group(0))
+        if start_year <= year <= end_year:
+            selected.append(path)
+    return selected
+
+
+def _load_daily_kline_slice_with_duckdb(
+    *,
+    files: list[Path],
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    columns: list[str] | None = None,
+) -> pd.DataFrame | None:
+    if not files or not _has_module("duckdb"):
+        return None
+    try:
+        import duckdb
+
+        exact_symbols = sorted({
+            normalize_daily_kline_symbol(symbol)
+            for symbol in symbols
+            if normalize_daily_kline_symbol(symbol)
+        })
+        symbol_codes = sorted({symbol.split(".", 1)[0] for symbol in exact_symbols})
+
+        symbol_filters: list[str] = []
+        params: list[Any] = [[str(path) for path in files], start_date, end_date]
+        if exact_symbols:
+            symbol_filters.append(f"__symbol_upper IN ({','.join(['?'] * len(exact_symbols))})")
+            params.extend(exact_symbols)
+        if symbol_codes:
+            symbol_filters.append(f"__symbol_code IN ({','.join(['?'] * len(symbol_codes))})")
+            params.extend(symbol_codes)
+
+        where_symbol = f"AND ({' OR '.join(symbol_filters)})" if symbol_filters else ""
+        select_list = _daily_kline_duckdb_select_list(columns)
+        frame = duckdb.execute(
+            f"""
+            SELECT *
+            FROM (
+                SELECT
+                    {select_list},
+                    upper(trim(CAST(source."symbol" AS VARCHAR))) AS __symbol_upper,
+                    regexp_replace(
+                        regexp_replace(upper(trim(CAST(source."symbol" AS VARCHAR))), '^(SH|SZ|BJ)', ''),
+                        '\\.(SH|SZ|BJ)$',
+                        ''
+                    ) AS __symbol_code,
+                    CAST(source."date" AS DATE) AS __trade_date,
+                    row_number() OVER (
+                        PARTITION BY upper(trim(CAST(source."symbol" AS VARCHAR))), CAST(source."date" AS DATE)
+                        ORDER BY CAST(source."date" AS DATE) DESC
+                    ) AS __row_num
+                FROM read_parquet(?, union_by_name=true) AS source
+                WHERE source."symbol" IS NOT NULL
+                  AND source."date" IS NOT NULL
+                  AND CAST(source."date" AS DATE) >= CAST(? AS DATE)
+                  AND CAST(source."date" AS DATE) <= CAST(? AS DATE)
+            )
+            WHERE __row_num = 1
+              {where_symbol}
+            ORDER BY __trade_date, __symbol_upper
+            """,
+            params,
+        ).fetchdf()
+        if frame.empty:
+            return None
+        helper_columns = [column for column in frame.columns if column.startswith("__")]
+        if helper_columns:
+            frame = frame.drop(columns=helper_columns)
+        normalized = _normalize_daily_kline_frame_for_parquet(frame)
+        normalized = normalized.drop_duplicates(["symbol", "date"], keep="last").sort_values(["date", "symbol"]).reset_index(drop=True)
+        return normalized if not normalized.empty else None
+    except Exception:
+        return None
+
+
+def _resolve_daily_kline_columns(files: list[Path], columns: list[str] | None) -> list[str] | None:
+    if columns is None:
+        return None
+    requested = _unique_keep_order(["symbol", "date", *[str(column) for column in columns if str(column).strip()]])
+    existing = _daily_kline_existing_columns(files)
+    if existing is None:
+        return requested
+    selected = [column for column in requested if column in existing]
+    if "symbol" not in selected or "date" not in selected:
+        return None
+    return selected
+
+
+def _daily_kline_existing_columns(files: list[Path]) -> set[str] | None:
+    cache_key = tuple(sorted(str(path.resolve()) for path in files))
+    if cache_key in _DAILY_KLINE_SCHEMA_CACHE:
+        return _DAILY_KLINE_SCHEMA_CACHE[cache_key]
+    if not files:
+        return None
+    try:
+        if _has_module("duckdb"):
+            import duckdb
+
+            schema = duckdb.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+                ([str(path) for path in files],),
+            ).fetchdf()
+            columns = set(schema["column_name"].astype(str).tolist())
+            _DAILY_KLINE_SCHEMA_CACHE[cache_key] = columns
+            return columns
+        if _has_module("pyarrow"):
+            import pyarrow.parquet as pq
+
+            columns: set[str] = set()
+            for path in files:
+                columns.update(str(name) for name in pq.read_schema(path).names)
+            _DAILY_KLINE_SCHEMA_CACHE[cache_key] = columns
+            return columns
+    except Exception:
+        return None
+    return None
+
+
+def _read_daily_kline_parquet_frame(path: Path, columns: list[str] | None) -> pd.DataFrame:
+    if columns is None:
+        return pd.read_parquet(path)
+    try:
+        return pd.read_parquet(path, columns=columns)
+    except Exception:
+        existing = _daily_kline_existing_columns([path])
+        if not existing:
+            return pd.DataFrame()
+        available_columns = [column for column in columns if column in existing]
+        if "symbol" not in available_columns or "date" not in available_columns:
+            return pd.DataFrame()
+        frame = pd.read_parquet(path, columns=available_columns)
+        for column in columns:
+            if column not in frame.columns:
+                frame[column] = pd.NA
+        return frame[columns]
+
+
+def _daily_kline_duckdb_select_list(columns: list[str] | None) -> str:
+    if not columns:
+        return "source.*"
+    return ",\n                    ".join(
+        f"source.{_quote_duckdb_identifier(column)} AS {_quote_duckdb_identifier(column)}"
+        for column in columns
+    )
+
+
+def _quote_duckdb_identifier(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _unique_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 def _normalize_daily_kline_frame_for_parquet(frame: pd.DataFrame) -> pd.DataFrame:

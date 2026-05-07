@@ -1,15 +1,17 @@
 import { FileText, Download, Trash2, Search, ChevronLeft, ChevronRight, Loader2, History, Clock3 } from 'lucide-react'
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { Suspense, lazy, useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import TaskProgressBanner from '@/components/TaskProgressBanner'
 import { api } from '@/services/api'
 import type { Report, ReportDetail } from '@/types'
 import DecisionCard from '@/components/DecisionCard'
-import ReportViewer from '@/components/ReportViewer'
 import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
+import { usePolling } from '@/hooks/usePolling'
 import { useAuthStore } from '@/stores/authStore'
 import { advanceProgress, getReportRunProgress } from '@/utils/progressFeedback'
+
+const ReportViewer = lazy(() => import('@/components/ReportViewer'))
 
 type ProgressState = {
     status: 'idle' | 'loading' | 'success' | 'error'
@@ -36,6 +38,33 @@ const getDecisionColor = (decision?: string) => {
     if (action === 'add') return 'text-red-600 dark:text-red-400'
     if (action === 'reduce') return 'text-green-600 dark:text-green-400'
     return 'text-slate-600 dark:text-slate-400'
+}
+
+function extractConfidence(text?: string): number | undefined {
+    if (!text) return undefined
+    const m = text.match(/置信度[:：]\s*(\d+)%/i) ?? text.match(/confidence[:：]\s*(\d+)%/i)
+    if (!m) return undefined
+    const value = Number(m[1])
+    return Number.isFinite(value) && value >= 0 && value <= 100 ? value : undefined
+}
+
+function extractPrice(text: string | undefined, type: 'target' | 'stop'): number | undefined {
+    if (!text) return undefined
+    const patterns = type === 'target'
+        ? [/目标价[:：]\s*[¥$]?\s*([\d.]+)/, /目标价格[:：]\s*[¥$]?\s*([\d.]+)/, /target[:：]\s*[¥$]?\s*([\d.]+)/i]
+        : [/止损价[:：]\s*[¥$]?\s*([\d.]+)/, /止损价格[:：]\s*[¥$]?\s*([\d.]+)/, /stop[-\s_]?loss[:：]\s*[¥$]?\s*([\d.]+)/i]
+    for (const pattern of patterns) {
+        const m = text.match(pattern)
+        if (!m) continue
+        const value = Number(m[1])
+        if (Number.isFinite(value)) return value
+    }
+    return undefined
+}
+
+function formatPrice(value?: number | null): string {
+    if (value == null || !Number.isFinite(value)) return '-'
+    return `¥${Number(value).toFixed(2)}`
 }
 
 function getQueueHint(report: Pick<Report, 'status' | 'waiting_ahead_count' | 'scheduled_running_count' | 'scheduled_concurrency_limit'>): string | null {
@@ -197,30 +226,35 @@ export default function Reports() {
     const [detailProgress, setDetailProgress] = useState<ProgressState>(IDLE_PROGRESS)
 
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+    const totalDisplay = Number.isFinite(total) && total > 0 ? total : reports.length
 
-    useEffect(() => {
-        if (listProgress.status !== 'loading') return
-
-        const timer = window.setInterval(() => {
+    usePolling(
+        () => {
             setListProgress((prev) => prev.status === 'loading'
                 ? { ...prev, progress: advanceProgress(prev.progress) }
                 : prev)
-        }, 180)
+        },
+        {
+            enabled: listProgress.status === 'loading',
+            intervalMs: 180,
+            pauseWhenHidden: false,
+            runImmediately: false,
+        },
+    )
 
-        return () => window.clearInterval(timer)
-    }, [listProgress.status])
-
-    useEffect(() => {
-        if (detailProgress.status !== 'loading') return
-
-        const timer = window.setInterval(() => {
+    usePolling(
+        () => {
             setDetailProgress((prev) => prev.status === 'loading'
                 ? { ...prev, progress: advanceProgress(prev.progress) }
                 : prev)
-        }, 180)
-
-        return () => window.clearInterval(timer)
-    }, [detailProgress.status])
+        },
+        {
+            enabled: detailProgress.status === 'loading',
+            intervalMs: 180,
+            pauseWhenHidden: false,
+            runImmediately: false,
+        },
+    )
 
     const fetchReports = useCallback(async (targetPage: number, options?: { silent?: boolean }) => {
         const silent = options?.silent === true
@@ -362,31 +396,34 @@ export default function Reports() {
     })
     const hasActiveReport = reports.some(report => report.status === 'pending' || report.status === 'running')
 
-    useEffect(() => {
-        if (loading || detailLoading || selectedReport || !hasActiveReport) return
-
-        const timer = window.setInterval(() => {
-            void fetchReports(page, { silent: true })
-        }, 4000)
-
-        return () => window.clearInterval(timer)
-    }, [detailLoading, fetchReports, hasActiveReport, loading, page, selectedReport])
+    usePolling(
+        () => fetchReports(page, { silent: true }),
+        {
+            enabled: !loading && !detailLoading && !selectedReport && hasActiveReport,
+            intervalMs: 4000,
+            runImmediately: false,
+        },
+    )
 
     const selectedReportRef = useRef(selectedReport)
     selectedReportRef.current = selectedReport
 
-    useEffect(() => {
-        if (!selectedReport || detailLoading) return
-        if (selectedReport.status !== 'pending' && selectedReport.status !== 'running') return
-
-        const timer = window.setInterval(() => {
+    usePolling(
+        () => {
             const current = selectedReportRef.current
             if (!current || (current.status !== 'pending' && current.status !== 'running')) return
-            void loadReportDetail(current.id, { silent: true, preserveHistory: true })
-        }, 4000)
-
-        return () => window.clearInterval(timer)
-    }, [detailLoading, loadReportDetail, selectedReport?.id, selectedReport?.status])
+            return loadReportDetail(current.id, { silent: true, preserveHistory: true })
+        },
+        {
+            enabled: Boolean(
+                selectedReport
+                && !detailLoading
+                && (selectedReport.status === 'pending' || selectedReport.status === 'running'),
+            ),
+            intervalMs: 4000,
+            runImmediately: false,
+        },
+    )
 
     // ─── 详情视图 ────────────────────────────────────────────────────────────
     if (detailLoading) {
@@ -399,6 +436,14 @@ export default function Reports() {
 
     if (selectedReport) {
         const { action } = parseDecision(selectedReport.decision)
+        const derivedConfidence = selectedReport.confidence ?? extractConfidence(selectedReport.final_trade_decision)
+        const derivedTargetPrice = selectedReport.target_price
+            ?? extractPrice(selectedReport.final_trade_decision, 'target')
+            ?? extractPrice(selectedReport.trader_investment_plan, 'target')
+        const derivedStopLoss = selectedReport.stop_loss_price
+            ?? extractPrice(selectedReport.final_trade_decision, 'stop')
+            ?? extractPrice(selectedReport.trader_investment_plan, 'stop')
+        const isLightweightRecoveryReport = (selectedReport.final_trade_decision || '').includes('本地轻量分析结果')
         const selectedReportProgressStatus = selectedReport.status === 'pending' || selectedReport.status === 'running'
             ? 'loading'
             : selectedReport.status === 'failed'
@@ -459,6 +504,14 @@ export default function Reports() {
                     <span>分析日期：{selectedReport.trade_date}</span>
                     <span>生成时间：{selectedReport.created_at ? new Date(selectedReport.created_at).toLocaleString('zh-CN') : '-'}</span>
                 </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-300">
+                    <div>置信度表示当前分析结论的把握度，不等于上涨概率。</div>
+                    {isLightweightRecoveryReport ? (
+                        <div className="mt-1 text-amber-600 dark:text-amber-300">
+                            当前这份报告来自本地轻量恢复链路，所以常见 64%-68% 这类保守值，且通常不会给出目标价/止损价。
+                        </div>
+                    ) : null}
+                </div>
 
                 {/* 历史决策时间线 */}
                 {symbolHistory.length > 1 && (
@@ -496,9 +549,9 @@ export default function Reports() {
                             name={selectedReport.name}
                             decision={action}
                             direction={selectedReport.direction}
-                            confidence={selectedReport.confidence ?? undefined}
-                            targetPrice={selectedReport.target_price ?? undefined}
-                            stopLoss={selectedReport.stop_loss_price ?? undefined}
+                            confidence={derivedConfidence}
+                            targetPrice={derivedTargetPrice}
+                            stopLoss={derivedStopLoss}
                             reasoning={selectedReport.final_trade_decision?.slice(0, 300) ?? undefined}
                         />
                     ) : selectedReport.status === 'failed' ? (
@@ -519,7 +572,15 @@ export default function Reports() {
                 </div>
 
                 <div className="card">
-                    <ReportViewer reportData={selectedReport} />
+                    <Suspense
+                        fallback={(
+                            <div className="flex min-h-[240px] items-center justify-center p-8">
+                                <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
+                            </div>
+                        )}
+                    >
+                        <ReportViewer reportData={selectedReport} />
+                    </Suspense>
                 </div>
             </div>
         )
@@ -532,8 +593,9 @@ export default function Reports() {
                 <div>
                     <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">历史报告</h1>
                     <p className="text-slate-500 dark:text-slate-400 mt-1">
-                        {user?.email ? `${user.email} 的私有分析记录 · 共 ${total} 份` : `共 ${total} 份分析报告`}
+                        {user?.email ? `${user.email} 的私有分析记录 · 共 ${totalDisplay} 份` : `共 ${totalDisplay} 份分析报告`}
                     </p>
+                    <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">置信度表示结论把握度，不等于涨跌概率。</p>
                 </div>
             </div>
 
@@ -632,7 +694,7 @@ export default function Reports() {
                                                 )}
                                             </td>
                                             <td className="py-3 px-4 text-sm text-slate-600 dark:text-slate-400">
-                                                {report.target_price != null ? `¥${report.target_price}` : '-'} / {report.stop_loss_price != null ? `¥${report.stop_loss_price}` : '-'}
+                                                {formatPrice(report.target_price)} / {formatPrice(report.stop_loss_price)}
                                             </td>
                                             <td className="py-3 px-4 text-sm text-slate-500 dark:text-slate-400">
                                                 {report.created_at ? new Date(report.created_at).toLocaleString('zh-CN') : '-'}
@@ -683,6 +745,7 @@ export default function Reports() {
                         <div className="flex items-center justify-between px-4 py-3 border-t border-slate-200 dark:border-slate-700">
                             <span className="text-sm text-slate-500 dark:text-slate-400">
                                 第 {page + 1} / {totalPages} 页，共 {total} 条
+                                
                             </span>
                             <div className="flex items-center gap-2">
                                 <button

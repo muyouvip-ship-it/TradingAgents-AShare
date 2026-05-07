@@ -403,7 +403,7 @@ export default function AgentCollaboration({ onSelectSection, onOpenDebate, sele
                 <div className="flex items-center gap-3">
                     <div className={`w-3 h-3 rounded-full ${isAnalyzing ? 'bg-blue-500 animate-pulse shadow-[0_0_12px_#3b82f6]' : 'bg-slate-300'}`} />
                     <h3 className="text-lg font-black text-slate-900 dark:text-white tracking-tighter uppercase">
-                        TradingAgents 协同工作流
+                        量化之神协同工作流
                     </h3>
                 </div>
                 {isAnalyzing && (

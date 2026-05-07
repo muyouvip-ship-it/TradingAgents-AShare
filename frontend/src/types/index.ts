@@ -400,6 +400,51 @@ export interface ChanlunOverlayResponse {
     buy_sell_points: ChanlunPoint[]
 }
 
+export type ApiDataSourceTone = 'neutral' | 'good' | 'warn' | 'bad' | 'info'
+
+export interface ApiDataSourceGovernanceItem {
+    label: string
+    value: string
+    detail?: string
+    tone?: ApiDataSourceTone
+}
+
+export interface ApiDataSourceDescriptor {
+    key: string
+    token?: string
+    label: string
+    category: string
+    kind: string
+    reliability: string
+    description: string
+    caveat?: string
+}
+
+export interface ApiDataSourceGovernancePayload {
+    domain: string
+    title?: string
+    description?: string
+    items: ApiDataSourceGovernanceItem[]
+    warnings?: string[]
+    sources?: ApiDataSourceDescriptor[]
+    updated_at?: string
+}
+
+export interface SystemDataSourceRegistryResponse {
+    updated_at: string
+    sources: ApiDataSourceDescriptor[]
+    surfaces: Array<{
+        id: string
+        name: string
+        route: string
+        description: string
+        domains: string[]
+        source_keys: string[]
+        sources: ApiDataSourceDescriptor[]
+        notes: string[]
+    }>
+}
+
 export interface MarketTickerItem {
     symbol: string
     name: string
@@ -432,6 +477,7 @@ export interface MarketOverviewResponse {
     updated_at: string
     source?: string
     fallback?: boolean
+    data_governance?: ApiDataSourceGovernancePayload | null
 }
 
 export interface NewsEyeSymbolTag {
@@ -460,6 +506,7 @@ export interface NewsEyeListResponse {
     updated_at: string
     source?: string
     fallback?: boolean
+    data_governance?: ApiDataSourceGovernancePayload | null
     background?: {
         enabled?: boolean
         interval_seconds?: number
@@ -471,6 +518,15 @@ export interface NewsEyeListResponse {
         tracked_symbols?: string[]
         saved_count?: number
     }
+    history: {
+        offset: number
+        limit: number
+        returned: number
+        has_more: boolean
+        earliest_published_at?: string | null
+        latest_published_at?: string | null
+        total_available: number
+    }
 }
 
 export interface NewsEyeRefreshResponse {
@@ -479,6 +535,33 @@ export interface NewsEyeRefreshResponse {
     fallback: boolean
     message?: string
     updated_at: string
+}
+
+export interface NewsEyeAnalyzeRequest {
+    content: string
+    source?: string
+    published_at?: string | null
+    sentiment?: string
+    positive_sectors?: string[]
+    negative_sectors?: string[]
+    positive_symbols?: NewsEyeSymbolTag[]
+    negative_symbols?: NewsEyeSymbolTag[]
+    related_symbols?: NewsEyeSymbolTag[]
+}
+
+export interface NewsEyeAnalyzeResponse {
+    provider: string
+    model: string
+    summary: string
+    sentiment: 'positive' | 'negative' | 'neutral' | string
+    sentiment_reason: string
+    positive_sectors: string[]
+    negative_sectors: string[]
+    positive_symbols: string[]
+    negative_symbols: string[]
+    trading_takeaway: string
+    generated_at: string
+    raw?: string | null
 }
 
 // Structured extraction types
@@ -692,6 +775,76 @@ export interface PortfolioOverviewResponse {
     portfolio_import: PortfolioImportState | null
 }
 
+export interface DailyReviewTheme {
+    theme: string
+    summary?: string
+    strength?: string
+    catalyst?: string
+    related_symbols?: string[]
+}
+
+export interface DailyReviewStock {
+    symbol: string
+    name: string
+    role?: string
+    bias?: string
+    reason?: string
+    source?: string
+    decision?: string
+    confidence?: number | null
+}
+
+export interface DailyReviewRisk {
+    title: string
+    detail: string
+    level?: string
+}
+
+export interface DailyReviewSectionSummary {
+    headline?: string
+    bullets?: string[]
+    holdings?: Array<Record<string, unknown>>
+}
+
+export interface DailyReview {
+    id: string
+    user_id: string
+    trade_date: string
+    status: 'pending' | 'running' | 'completed' | 'failed' | string
+    market_summary: DailyReviewSectionSummary
+    portfolio_summary: DailyReviewSectionSummary
+    current_main_themes: DailyReviewTheme[]
+    current_key_stocks: DailyReviewStock[]
+    next_main_themes: DailyReviewTheme[]
+    next_candidate_stocks: DailyReviewStock[]
+    risk_watchpoints: DailyReviewRisk[]
+    raw_result_data?: Record<string, unknown>
+    push_status?: string | null
+    push_error?: string | null
+    last_pushed_at?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface DailyReviewHistoryItem {
+    id: string
+    trade_date: string
+    status: string
+    headline: string
+    push_status?: string | null
+    updated_at?: string | null
+    created_at?: string | null
+}
+
+export interface DailyReviewConfig {
+    enabled: boolean
+    trigger_time: string
+    push_enabled: boolean
+    last_run_date?: string | null
+    last_run_status?: string | null
+    last_error?: string | null
+}
+
 export interface TrackingBoardAnalysis {
     report_id: string
     trade_date: string
@@ -746,9 +899,13 @@ export interface RuntimeConfig {
     deep_think_llm: string
     quick_think_llm: string
     backend_url: string
+    news_llm_provider: string
+    news_backend_url: string
+    news_analysis_llm: string
     max_debate_rounds: number
     max_risk_discuss_rounds: number
     has_api_key?: boolean
+    has_news_api_key?: boolean
     has_wecom_webhook?: boolean
     wecom_webhook_display?: string | null
     server_fallback_enabled?: boolean
@@ -763,6 +920,7 @@ export interface RuntimeConfigUpdateResponse {
     message: string
     applied: RuntimeConfigUpdate
     has_api_key: boolean
+    has_news_api_key?: boolean
     current: RuntimeConfig
     warmup?: RuntimeConfigWarmup
 }
@@ -772,11 +930,16 @@ export interface RuntimeConfigUpdate {
     deep_think_llm?: string
     quick_think_llm?: string
     backend_url?: string
+    news_llm_provider?: string
+    news_backend_url?: string
+    news_analysis_llm?: string
     max_debate_rounds?: number
     max_risk_discuss_rounds?: number
     api_key?: string
+    news_api_key?: string
     wecom_webhook_url?: string
     clear_api_key?: boolean
+    clear_news_api_key?: boolean
     clear_wecom_webhook?: boolean
     email_report_enabled?: boolean
     wecom_report_enabled?: boolean
@@ -1110,6 +1273,7 @@ export interface BacktestRun {
     }
     artifact_root?: string
     error_message?: string | null
+    data_governance?: ApiDataSourceGovernancePayload | null
     created_at: string
     started_at?: string | null
     completed_at?: string | null
@@ -1238,10 +1402,17 @@ export interface BacktestEquityPoint {
 export interface BacktestWatchlistItem {
     date: string
     symbol: string
+    name?: string
     factor_score: number
     rank: number
     stage: string
     weekly_trend_pass?: boolean
+    sw_industry_l1?: string | null
+    sw_industry_l2?: string | null
+    sw_industry_l3?: string | null
+    sector?: string | null
+    industry?: string | null
+    concepts?: string | null
 }
 
 export interface BacktestMinuteConfirmationItem {
@@ -1439,6 +1610,8 @@ export interface VirtualWarehouseTrade {
 }
 
 export interface VirtualWarehouseOverviewResponse {
+    data_governance?: ApiDataSourceGovernancePayload | null
+    background_refresh?: VirtualWarehouseBackgroundRefresh | null
     active_account_key?: string
     accounts: Array<{
         account_key: string
@@ -1476,6 +1649,21 @@ export interface VirtualWarehouseOverviewResponse {
     last_synced_at?: string | null
     data_source?: string
     is_stale?: boolean
+}
+
+export interface VirtualWarehouseBackgroundRefresh {
+    active: boolean
+    started_at?: string | null
+    finished_at?: string | null
+    last_success_at?: string | null
+    last_error?: string | null
+}
+
+export interface QmtBackgroundRefreshResponse {
+    message: string
+    scheduled: boolean
+    account_key: string
+    background_refresh?: VirtualWarehouseBackgroundRefresh | null
 }
 
 export interface VirtualWarehouseDiagnosticItem {
@@ -1667,6 +1855,7 @@ export interface RealtimeMonitor {
     resolved_symbol_count?: number
     display_symbols?: string[]
     display_symbol_count?: number
+    data_governance?: ApiDataSourceGovernancePayload | null
     created_at?: string | null
     updated_at?: string | null
 }
@@ -1716,4 +1905,5 @@ export interface RealtimeMonitorPositionsResponse {
     account?: VirtualWarehouseAccount | null
     connection?: VirtualWarehouseConnection | null
     fetched_at?: string | null
+    data_governance?: ApiDataSourceGovernancePayload | null
 }

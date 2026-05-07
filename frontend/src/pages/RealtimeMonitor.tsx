@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Bot, Play, Plus, Power, RefreshCw, TimerReset, Trash2, Waves, X } from 'lucide-react'
+import { Activity, Bot, Pause, Play, Plus, Power, RefreshCw, TimerReset, Trash2, Waves, X } from 'lucide-react'
 
+import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
+import VirtualList from '@/components/VirtualList'
+import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type {
   RealtimeEvent,
@@ -11,6 +14,8 @@ import type {
 } from '@/types'
 
 type ControlAction = 'start' | 'pause' | 'stop' | 'resume' | 'fuse-reset'
+const REALTIME_EVENT_LIMIT = 1000
+const REALTIME_INITIAL_EVENT_LIMIT = 500
 
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
@@ -52,6 +57,10 @@ function formatCurrency(value?: number | null) {
   return `${prefix}¥${formatPrice(amount)}`
 }
 
+function normalizeSymbol(value?: string | null) {
+  return String(value || '').trim().toUpperCase()
+}
+
 function parseFiniteNumber(value: unknown) {
   const numberValue = Number(value)
   return Number.isFinite(numberValue) ? numberValue : null
@@ -87,15 +96,23 @@ function parseSseBlock(block: string): { event: string; data: Record<string, unk
 }
 
 function mergeRealtimeEvents(current: RealtimeEvent[], incoming: RealtimeEvent[]) {
-  const merged = [...current]
+  let merged = current.slice()
+  const indexById = new Map(merged.map((row, index) => [row.id, index]))
+  let needsSort = false
   for (const item of incoming) {
-    const index = merged.findIndex(row => row.id === item.id)
-    if (index >= 0) merged[index] = item
-    else merged.push(item)
+    const index = indexById.get(item.id)
+    if (typeof index === 'number') merged[index] = item
+    else {
+      const last = merged[merged.length - 1]
+      if (last && String(item.created_at || '') < String(last.created_at || '')) needsSort = true
+      indexById.set(item.id, merged.length)
+      merged.push(item)
+    }
   }
-  return merged
-    .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
-    .slice(-1500)
+  if (needsSort) {
+    merged = merged.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
+  }
+  return merged.slice(-REALTIME_EVENT_LIMIT)
 }
 
 function statusLabel(status: string) {
@@ -119,6 +136,153 @@ function statusTone(status: string) {
     fused: 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
     error: 'bg-rose-100 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
   }[status] || 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+}
+
+function strategyLifecycleLabel(status?: string | null) {
+  return {
+    active: '已启用',
+    paused: '已暂停',
+    draft: '草稿',
+    archived: '已归档',
+    candidate: '候选',
+  }[String(status || '')] || '--'
+}
+
+function strategyLifecycleTone(status?: string | null) {
+  return {
+    active: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
+    paused: 'bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
+    draft: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
+    archived: 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200',
+    candidate: 'bg-violet-100 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300',
+  }[String(status || '')] || 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+}
+
+function strategyRuntimeLabel(strategy: StrategyDefinition | null, monitor: RealtimeMonitor | null) {
+  if (monitor) return statusLabel(monitor.status)
+  if (!strategy) return '未绑定'
+  if (strategy.status === 'active') return '未启动'
+  return strategyLifecycleLabel(strategy.status)
+}
+
+function strategyRuntimeTone(strategy: StrategyDefinition | null, monitor: RealtimeMonitor | null) {
+  if (monitor) return statusTone(monitor.status)
+  if (!strategy) return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+  if (strategy.status === 'active') return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+  return strategyLifecycleTone(strategy.status)
+}
+
+function canRunMonitorOnce(status?: string | null) {
+  return ['ready', 'paused', 'running'].includes(String(status || ''))
+}
+
+function canStopMonitor(status?: string | null) {
+  return ['ready', 'running', 'paused', 'error'].includes(String(status || ''))
+}
+
+function primaryControlMeta(status?: string | null) {
+  const normalized = String(status || '')
+  if (normalized === 'running') {
+    return {
+      action: 'pause' as ControlAction,
+      label: '暂停',
+      icon: Pause,
+      className: 'bg-amber-500 text-white',
+    }
+  }
+  if (normalized === 'paused') {
+    return {
+      action: 'resume' as ControlAction,
+      label: '恢复',
+      icon: Play,
+      className: 'bg-blue-600 text-white',
+    }
+  }
+  if (normalized === 'fused') {
+    return {
+      action: 'fuse-reset' as ControlAction,
+      label: '解除熔断',
+      icon: TimerReset,
+      className: 'bg-rose-600 text-white',
+    }
+  }
+  if (normalized === 'error') {
+    return {
+      action: 'start' as ControlAction,
+      label: '重新启动',
+      icon: RefreshCw,
+      className: 'bg-rose-600 text-white',
+    }
+  }
+  return {
+    action: 'start' as ControlAction,
+    label: '启动',
+    icon: Play,
+    className: 'bg-emerald-600 text-white',
+  }
+}
+
+function controlSuccessMessage(action: ControlAction) {
+  return {
+    start: '监控实例已启动',
+    pause: '监控实例已暂停',
+    stop: '监控实例已停止',
+    resume: '监控实例已恢复运行',
+    'fuse-reset': '熔断已解除，实例已切回暂停',
+  }[action]
+}
+
+function monitorDisplaySymbols(monitor: RealtimeMonitor | null | undefined) {
+  if (!monitor) return []
+  const candidates = [
+    ...(monitor.display_symbols || []),
+    ...(monitor.resolved_symbols || []),
+    ...(monitor.manual_symbols || []),
+  ]
+  return Array.from(new Set(candidates.map(item => normalizeSymbol(item)).filter(Boolean)))
+}
+
+function filterMonitorPositions(
+  monitor: RealtimeMonitor | null | undefined,
+  positions: RealtimeMonitorPositionsResponse['positions'] | undefined,
+) {
+  const items = positions || []
+  const symbols = monitorDisplaySymbols(monitor)
+  if (!symbols.length) return items
+  const symbolSet = new Set(symbols)
+  return items.filter(position => symbolSet.has(normalizeSymbol(position.symbol)))
+}
+
+function buildMonitorPerformance(
+  monitor: RealtimeMonitor | null | undefined,
+  payload: RealtimeMonitorPositionsResponse | null | undefined,
+) {
+  const positions = filterMonitorPositions(monitor, payload?.positions)
+  const totalPnl = positions.reduce((sum, position) => sum + Number(position.total_pnl || 0), 0)
+  const todayPnl = positions.reduce((sum, position) => sum + Number(position.today_pnl || 0), 0)
+  const totalCost = positions.reduce(
+    (sum, position) => sum + Number(position.average_cost || 0) * Number(position.current_position || 0),
+    0,
+  )
+  const previousCloseValue = positions.reduce((sum, position) => {
+    const quantity = Number(position.current_position || 0)
+    if (!quantity) return sum
+    const previousClose = Number(position.previous_close || NaN)
+    if (Number.isFinite(previousClose) && previousClose > 0) {
+      return sum + previousClose * quantity
+    }
+    const marketValue = Number(position.market_value || 0)
+    const todayProfit = Number(position.today_pnl || 0)
+    return sum + Math.max(marketValue - todayProfit, 0)
+  }, 0)
+  return {
+    positions,
+    positionCount: positions.length,
+    totalPnl,
+    totalPnlPct: totalCost > 0 ? totalPnl / totalCost : null,
+    todayPnl,
+    todayPnlPct: previousCloseValue > 0 ? todayPnl / previousCloseValue : null,
+  }
 }
 
 function timeframeLabel(value?: string | null) {
@@ -227,132 +391,48 @@ function eventPositionChange(item: RealtimeEvent) {
   return currentPosition - previousPosition
 }
 
-function eventOrderId(item: RealtimeEvent) {
-  return String(
-    item.payload?.order_id ||
-    item.order_payload?.order_id ||
-    item.broker_result?.order_id ||
-    (item.broker_result?.order_result as Record<string, unknown> | undefined)?.order_id ||
-    '',
-  ).trim()
-}
-
-function eventLifecycleKey(item: RealtimeEvent) {
-  const correlationId = String(item.correlation_id || '').trim()
-  const symbol = eventSymbol(item)
-  if (correlationId && symbol) return `corr:${correlationId}:${symbol}`
-  const orderId = eventOrderId(item)
-  if (orderId) return `order:${orderId}`
-  return ''
-}
-
-function selectRepresentativeEvent(items: RealtimeEvent[]) {
-  const priorities = [
-    'trade_confirmed',
-    'order_status_changed',
-    'order_cancelled',
-    'order_rejected',
-    'order_error',
-    'order_cancel_error',
-    'order_replace_requested',
-    'order_cancel_requested',
-    'order_submitted',
-    'position_changed',
-  ]
-  for (const eventType of priorities) {
-    const matched = items.filter(item => item.event_type === eventType)
-    if (matched.length) return matched[matched.length - 1]
+function isTradingFlowEvent(item: RealtimeEvent) {
+  if (
+    [
+      'signal_generated',
+      'order_intent',
+      'signal_blocked',
+      'approval_created',
+      'approval_executed',
+      'approval_rejected',
+      'order_submitted',
+      'order_status_changed',
+      'order_snapshot_refreshed',
+      'trade_confirmed',
+      'order_cancel_requested',
+      'order_cancelled',
+      'order_cancel_error',
+      'order_replace_requested',
+      'order_rejected',
+      'order_error',
+      'live_readonly_guard',
+    ].includes(item.event_type)
+  ) {
+    return true
   }
-  return items[items.length - 1]
-}
-
-function mergeTradeLifecycleGroup(items: RealtimeEvent[]) {
-  const representative = selectRepresentativeEvent(items)
-  const mergedPayload = items.find(item => Object.keys(item.payload || {}).length)?.payload || representative.payload
-  const mergedSignalPayload = items.find(item => Object.keys(item.signal_payload || {}).length)?.signal_payload || representative.signal_payload
-  const mergedOrderPayload = items.find(item => Object.keys(item.order_payload || {}).length)?.order_payload || representative.order_payload
-  const mergedBrokerResult = [...items].reverse().find(item => Object.keys(item.broker_result || {}).length)?.broker_result || representative.broker_result
-  const mergedRiskPayload = items.find(item => Object.keys(item.risk_payload || {}).length)?.risk_payload || representative.risk_payload
-  const mergedErrorPayload = [...items].reverse().find(item => Object.keys(item.error_payload || {}).length)?.error_payload || representative.error_payload
-  return {
-    ...representative,
-    payload: mergedPayload,
-    signal_payload: mergedSignalPayload,
-    order_payload: mergedOrderPayload,
-    broker_result: mergedBrokerResult,
-    risk_payload: mergedRiskPayload,
-    error_payload: mergedErrorPayload,
+  if (item.event_type === 'position_changed') {
+    const change = eventPositionChange(item)
+    return change != null && change !== 0
   }
+  return false
 }
 
 function buildTradeFlowItems(events: RealtimeEvent[]) {
-  const groups: RealtimeEvent[][] = []
-  const groupsByOrderId = new Map<string, RealtimeEvent[]>()
-  const groupsByCorrelation = new Map<string, RealtimeEvent[]>()
-  const standalone: RealtimeEvent[] = []
-  for (const item of [...events].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))) {
-    if (!isTradeBehaviorEvent(item) && item.event_type !== 'order_snapshot_refreshed') continue
-    const symbol = eventSymbol(item)
-    const orderId = eventOrderId(item)
-    const correlationKey = (() => {
-      const correlationId = String(item.correlation_id || '').trim()
-      return correlationId && symbol ? `corr:${correlationId}:${symbol}` : ''
-    })()
-    let targetGroup: RealtimeEvent[] | undefined
-    if (orderId) {
-      targetGroup = groupsByOrderId.get(orderId)
-    }
-    if (!targetGroup && correlationKey) {
-      targetGroup = groupsByCorrelation.get(correlationKey)
-    }
-    if (!targetGroup && item.event_type === 'position_changed' && symbol) {
-      const itemTime = new Date(item.created_at || '').getTime()
-      if (Number.isFinite(itemTime)) {
-        targetGroup = [...groups].reverse().find(group => {
-          const latest = group[group.length - 1]
-          const latestTime = new Date(latest.created_at || '').getTime()
-          if (!Number.isFinite(latestTime)) return false
-          return eventSymbol(latest) === symbol && Math.abs(itemTime - latestTime) <= 90_000
-        })
-      }
-    }
-    if (!targetGroup) {
-      if (!isTradeBehaviorEvent(item)) continue
-      const key = eventLifecycleKey(item)
-      if (!key) {
-        standalone.push(item)
-        continue
-      }
-      targetGroup = [item]
-      groups.push(targetGroup)
-    } else {
-      targetGroup.push(item)
-    }
-    if (orderId) {
-      groupsByOrderId.set(orderId, targetGroup)
-    }
-    if (correlationKey) {
-      groupsByCorrelation.set(correlationKey, targetGroup)
-    }
-    if (!orderId && !correlationKey && !isTradeBehaviorEvent(item)) {
-      continue
-    }
-    if (!orderId && !correlationKey && isTradeBehaviorEvent(item) && !groups.includes(targetGroup)) {
-      if (isTradeBehaviorEvent(item)) standalone.push(item)
-    }
-  }
-  const merged = groups
-    .filter(items => items.some(item => isTradeBehaviorEvent(item)))
-    .map(items => mergeTradeLifecycleGroup(items))
-  return [...standalone, ...merged]
+  return events
+    .filter(isTradingFlowEvent)
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
-    .slice(0, 40)
 }
 
 function eventExecutionState(item: RealtimeEvent) {
   if (item.event_type === 'trade_confirmed') return '已成交'
   if (item.event_type === 'order_submitted') return '未成交'
   if (item.event_type === 'order_rejected') return '已拒单'
+  if (item.event_type === 'signal_blocked') return '已拦截'
   if (item.event_type === 'order_error') return '执行异常'
   if (item.event_type === 'order_cancel_requested' || item.event_type === 'order_replace_requested') return '处理中'
   if (item.event_type === 'order_cancelled') return '已撤单'
@@ -384,6 +464,7 @@ function eventStatusKind(item: RealtimeEvent) {
   if (item.event_type === 'monitor_fused') return 'risk'
   if (state === '执行异常') return 'error'
   if (state === '已拒单') return 'rejected'
+  if (state === '已拦截') return 'risk'
   if (state === '已撤单') return 'cancelled'
   if (state === '部分成交') return 'partial'
   if (state === '已成交') return 'filled'
@@ -414,7 +495,11 @@ function eventTagLabel(item: RealtimeEvent) {
   if (['minute_features', 'minute_capture', 'market_snapshot', 'cycle_started', 'cycle_skipped', 'no_signal'].includes(item.event_type)) {
     return '分钟判定'
   }
+  if (['monitor_created', 'monitor_started', 'monitor_resumed', 'monitor_paused', 'monitor_stopped', 'manual_cycle_requested', 'fuse_reset'].includes(item.event_type)) {
+    return '运行状态'
+  }
   if (['signal_generated', 'order_intent'].includes(item.event_type)) return '交易信号'
+  if (item.event_type === 'signal_blocked') return '信号拦截'
   if (['order_submitted', 'order_status_changed', 'order_snapshot_refreshed'].includes(item.event_type)) return '委托跟踪'
   if (['trade_confirmed'].includes(item.event_type)) return '成交回报'
   if (['order_cancel_requested', 'order_cancelled', 'order_replace_requested'].includes(item.event_type)) return '撤补流程'
@@ -472,32 +557,45 @@ function eventAccent(item: RealtimeEvent) {
   }[eventStatusKind(item)]
 }
 
-function isTradeBehaviorEvent(item: RealtimeEvent) {
-  if (
-    ![
-      'order_submitted',
-      'order_status_changed',
-      'order_cancel_requested',
-      'order_cancelled',
-      'order_cancel_error',
-      'order_replace_requested',
-      'order_rejected',
-      'order_error',
-      'trade_confirmed',
-      'position_changed',
-    ].includes(item.event_type)
-  ) {
-    return false
-  }
-  if (item.event_type === 'position_changed') {
-    const change = eventPositionChange(item)
-    return change != null && change !== 0
-  }
-  return true
-}
-
 function getEventSummary(item: RealtimeEvent, positionMap: Map<string, number>) {
   const payload = item.payload || {}
+  if (item.event_type === 'monitor_created') {
+    return '监控实例已创建，等待启动'
+  }
+
+  if (item.event_type === 'monitor_started') {
+    return '策略监控已开始运行'
+  }
+
+  if (item.event_type === 'monitor_resumed') {
+    return '策略监控已恢复运行'
+  }
+
+  if (item.event_type === 'monitor_paused') {
+    return '策略监控已暂停'
+  }
+
+  if (item.event_type === 'monitor_stopped') {
+    return '策略监控已停止'
+  }
+
+  if (item.event_type === 'fuse_reset') {
+    return '熔断已解除，等待重新运行'
+  }
+
+  if (item.event_type === 'manual_cycle_requested') {
+    return '手动触发一轮实时监控'
+  }
+
+  if (item.event_type === 'cycle_started') {
+    return `开始执行本轮监控，覆盖 ${formatNumber(Number(payload.symbol_count || 0))} 只股票`
+  }
+
+  if (item.event_type === 'market_snapshot') {
+    const quoteCount = Object.keys(payload.quotes || {}).length
+    return `已获取 QMT 实时行情快照，样本 ${formatNumber(quoteCount)} 只`
+  }
+
   if (item.event_type === 'minute_capture') {
     const success = Boolean(payload.success)
     const rows = Number(payload.rows || 0)
@@ -523,6 +621,29 @@ function getEventSummary(item: RealtimeEvent, positionMap: Map<string, number>) 
     const side = signalSideLabel(String(item.signal_payload?.side || ''))
     const reason = String(item.signal_payload?.reason || item.payload?.reason || '--')
     return `产生${side}信号，原因：${reason}`
+  }
+
+  if (item.event_type === 'order_intent') {
+    const side = signalSideLabel(String(item.order_payload?.side || item.payload?.side || ''))
+    return `生成${side}委托意图，等待执行检查`
+  }
+
+  if (item.event_type === 'cycle_skipped') {
+    const reason = String(payload.reason || '')
+    if (reason === 'outside_trading_session') {
+      return `当前不在 A 股交易时段，已跳过本轮检测。仅在工作日 09:30-11:30、13:00-15:00 执行`
+    }
+    if (reason === 'empty_universe') {
+      return '当前监控池为空，已跳过本轮检测'
+    }
+  }
+
+  if (item.event_type === 'signal_blocked') {
+    const side = signalSideLabel(String(item.signal_payload?.side || ''))
+    const available = parseFiniteNumber(item.payload?.available_position)
+    const lotSize = parseFiniteNumber(item.payload?.lot_size)
+    const currentPosition = eventCurrentPosition(item, positionMap)
+    return `产生${side}信号，但可卖 ${formatNumber(available ?? 0)} 股不足一手 ${formatNumber(lotSize ?? 0)} 股，当前持仓 ${formatNumber(currentPosition ?? 0)} 股，未下单`
   }
 
   if (item.event_type === 'no_signal') {
@@ -628,12 +749,37 @@ function renderEventDetail(item: RealtimeEvent) {
     )
   }
 
+  if (item.event_type === 'cycle_skipped') {
+    return (
+      <div className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
+        <div>原因：{String(payload.reason || '--')}</div>
+        {payload.reason === 'outside_trading_session' ? (
+          <div className="mt-1">执行时段：{String(payload.session || '09:30-11:30,13:00-15:00')}</div>
+        ) : null}
+      </div>
+    )
+  }
+
   if (item.event_type === 'signal_generated') {
     return (
       <div className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
         <div>方向：{signalSideLabel(String(item.signal_payload?.side || ''))}</div>
         <div className="mt-1">原因：{String(item.signal_payload?.reason || '--')}</div>
         <div className="mt-1">目标仓位：{formatPercent(Number(item.signal_payload?.target_position_pct ?? NaN))}</div>
+      </div>
+    )
+  }
+
+  if (item.event_type === 'signal_blocked') {
+    return (
+      <div className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
+        <div>方向：{signalSideLabel(String(item.signal_payload?.side || ''))}</div>
+        <div className="mt-1">处理：{String(item.payload?.message || '当前信号已拦截')}</div>
+        <div className="mt-1">
+          可卖：{formatNumber(parseFiniteNumber(item.payload?.available_position))} 股 ｜ 当前持仓：
+          {formatNumber(parseFiniteNumber(item.payload?.current_position))} 股
+        </div>
+        <div className="mt-1">最小交易单位：{formatNumber(parseFiniteNumber(item.payload?.lot_size))} 股</div>
       </div>
     )
   }
@@ -645,6 +791,7 @@ export default function RealtimeMonitorPage() {
   const [strategies, setStrategies] = useState<StrategyDefinition[]>([])
   const [warehouse, setWarehouse] = useState<VirtualWarehouseOverviewResponse | null>(null)
   const [monitors, setMonitors] = useState<RealtimeMonitor[]>([])
+  const [monitorPositionsMap, setMonitorPositionsMap] = useState<Record<string, RealtimeMonitorPositionsResponse>>({})
   const [selectedMonitorId, setSelectedMonitorId] = useState<string | null>(null)
   const [selectedMonitor, setSelectedMonitor] = useState<RealtimeMonitor | null>(null)
   const [events, setEvents] = useState<RealtimeEvent[]>([])
@@ -660,6 +807,7 @@ export default function RealtimeMonitorPage() {
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<RealtimeMonitor | null>(null)
   const streamAbortRef = useRef<AbortController | null>(null)
+  const snapshotRefreshTimerRef = useRef<number | null>(null)
 
   const [form, setForm] = useState({
     name: '',
@@ -677,21 +825,48 @@ export default function RealtimeMonitorPage() {
     [accountOptions, form.account_key],
   )
 
+  const loadMonitorPositionMap = useCallback(async (items: RealtimeMonitor[]) => {
+    if (!items.length) {
+      setMonitorPositionsMap({})
+      return
+    }
+    const entries = await Promise.all(
+      items.map(async item => {
+        try {
+          const payload = await api.getRealtimeMonitorPositions(item.id)
+          return [item.id, payload] as const
+        } catch {
+          return null
+        }
+      }),
+    )
+    setMonitorPositionsMap(() => {
+      const next: Record<string, RealtimeMonitorPositionsResponse> = {}
+      for (const entry of entries) {
+        if (entry) next[entry[0]] = entry[1]
+      }
+      return next
+    })
+  }, [])
+
   const loadMonitors = useCallback(async () => {
     const response = await api.getRealtimeMonitors()
-    setMonitors(response.items || [])
-    setSelectedMonitorId(current => current || response.items?.[0]?.id || null)
-  }, [])
+    const items = response.items || []
+    setMonitors(items)
+    setSelectedMonitorId(current => current || items?.[0]?.id || null)
+    await loadMonitorPositionMap(items)
+  }, [loadMonitorPositionMap])
 
   const loadDetail = useCallback(async (monitorId: string) => {
     const [monitor, eventRes, positionRes] = await Promise.all([
       api.getRealtimeMonitor(monitorId),
-      api.getRealtimeMonitorEvents(monitorId, { limit: 1000 }),
+      api.getRealtimeMonitorEvents(monitorId, { limit: REALTIME_INITIAL_EVENT_LIMIT }),
       api.getRealtimeMonitorPositions(monitorId),
     ])
     setSelectedMonitor(monitor)
-    setEvents(current => mergeRealtimeEvents(current, eventRes.items || []))
+    setEvents(eventRes.items || [])
     setPositionsPayload(positionRes)
+    setMonitorPositionsMap(current => ({ ...current, [monitorId]: positionRes }))
   }, [])
 
   const loadMonitorSnapshot = useCallback(async (monitorId: string) => {
@@ -701,7 +876,16 @@ export default function RealtimeMonitorPage() {
     ])
     setSelectedMonitor(monitor)
     setPositionsPayload(positionRes)
+    setMonitorPositionsMap(current => ({ ...current, [monitorId]: positionRes }))
   }, [])
+
+  const scheduleMonitorSnapshotRefresh = useCallback((monitorId: string) => {
+    if (snapshotRefreshTimerRef.current != null) return
+    snapshotRefreshTimerRef.current = window.setTimeout(() => {
+      snapshotRefreshTimerRef.current = null
+      void loadMonitorSnapshot(monitorId)
+    }, 600)
+  }, [loadMonitorSnapshot])
 
   const loadPage = useCallback(async (silent = false, preferredMonitorId?: string | null) => {
     try {
@@ -709,17 +893,19 @@ export default function RealtimeMonitorPage() {
       else setLoading(true)
       const [strategyRes, warehouseRes, monitorRes] = await Promise.all([
         api.getStrategyPlatformList(),
-        api.getQmtVirtualWarehouseOverview(),
+        api.getQmtVirtualWarehouseOverview(undefined, undefined, true),
         api.getRealtimeMonitors(),
       ])
       setStrategies(strategyRes.strategies || [])
       setWarehouse(warehouseRes)
-      setMonitors(monitorRes.items || [])
+      const monitorItems = monitorRes.items || []
+      setMonitors(monitorItems)
+      await loadMonitorPositionMap(monitorItems)
 
       const nextMonitorId =
         preferredMonitorId === undefined
-          ? (selectedMonitorId || monitorRes.items?.[0]?.id || null)
-          : (preferredMonitorId || monitorRes.items?.[0]?.id || null)
+          ? (selectedMonitorId || monitorItems?.[0]?.id || null)
+          : (preferredMonitorId || monitorItems?.[0]?.id || null)
       if (!form.strategy_id && strategyRes.strategies?.[0]?.id) {
         setForm(current => ({ ...current, strategy_id: strategyRes.strategies[0].id }))
       }
@@ -735,11 +921,19 @@ export default function RealtimeMonitorPage() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [form.account_key, form.strategy_id, loadDetail, selectedMonitorId])
+  }, [form.account_key, form.strategy_id, loadDetail, loadMonitorPositionMap, selectedMonitorId])
 
   useEffect(() => {
     void loadPage()
   }, [loadPage])
+
+  useEffect(() => {
+    return () => {
+      if (snapshotRefreshTimerRef.current != null) {
+        window.clearTimeout(snapshotRefreshTimerRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!selectedMonitorId) return
@@ -747,12 +941,7 @@ export default function RealtimeMonitorPage() {
     void loadDetail(selectedMonitorId)
   }, [loadDetail, selectedMonitorId])
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void loadMonitors()
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [loadMonitors])
+  usePolling(loadMonitors, { intervalMs: 5000, runImmediately: false })
 
   useEffect(() => {
     if (!selectedMonitorId) {
@@ -768,7 +957,7 @@ export default function RealtimeMonitorPage() {
     const startStream = async () => {
       try {
         const response = await api.streamRealtimeMonitor(selectedMonitorId, {
-          initial_limit: 20,
+          initial_limit: REALTIME_INITIAL_EVENT_LIMIT,
           signal: controller.signal,
         })
         if (!response.body) throw new Error('实时监控流不可用')
@@ -819,7 +1008,7 @@ export default function RealtimeMonitorPage() {
                 'approval_executed',
                 'approval_rejected',
               ].includes(item.event_type)) {
-                void loadMonitorSnapshot(selectedMonitorId)
+                scheduleMonitorSnapshotRefresh(selectedMonitorId)
               }
             }
           }
@@ -834,7 +1023,7 @@ export default function RealtimeMonitorPage() {
 
     void startStream()
     return () => controller.abort()
-  }, [loadMonitorSnapshot, selectedMonitorId])
+  }, [scheduleMonitorSnapshotRefresh, selectedMonitorId])
 
   const handleCreate = useCallback(async () => {
     if (!form.strategy_id) {
@@ -896,7 +1085,7 @@ export default function RealtimeMonitorPage() {
       if (selectedMonitorId === currentMonitorId) {
         await loadDetail(currentMonitorId)
       }
-      setMessage(`监控实例已${statusLabel(result.status)}`)
+      setMessage(controlSuccessMessage(action))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : '操作失败')
@@ -956,26 +1145,13 @@ export default function RealtimeMonitorPage() {
     () => new Map(strategies.map(item => [item.id, item])),
     [strategies],
   )
-  const accountSummaryMap = useMemo(
-    () => new Map((warehouse?.accounts || []).map(item => [item.account_key, item.account || null])),
-    [warehouse?.accounts],
-  )
-
-  const getMonitorAccount = useCallback((monitor: RealtimeMonitor) => {
-    return accountSummaryMap.get(monitor.account_key) || null
-  }, [accountSummaryMap])
-
   const getMonitorStrategy = useCallback((monitor: RealtimeMonitor) => {
     return strategyMap.get(monitor.strategy_id) || null
   }, [strategyMap])
 
-  const getMonitorTodayPct = useCallback((monitor: RealtimeMonitor) => {
-    const account = getMonitorAccount(monitor)
-    if (!account) return null
-    const base = Number(account.total_asset || 0) - Number(account.today_pnl || 0)
-    if (!Number.isFinite(base) || base <= 0) return null
-    return Number(account.today_pnl || 0) / base
-  }, [getMonitorAccount])
+  const getMonitorPerformance = useCallback((monitor: RealtimeMonitor) => {
+    return buildMonitorPerformance(monitor, monitorPositionsMap[monitor.id] || null)
+  }, [monitorPositionsMap])
 
   const getMonitorDrawdown = useCallback((monitor: RealtimeMonitor) => {
     const strategy = getMonitorStrategy(monitor)
@@ -986,9 +1162,14 @@ export default function RealtimeMonitorPage() {
     return null
   }, [getMonitorStrategy])
 
+  const strategyPerformance = useMemo(
+    () => buildMonitorPerformance(selectedMonitor, positionsPayload),
+    [positionsPayload, selectedMonitor],
+  )
+
   const strategyPositions = useMemo(
-    () => (positionsPayload?.positions || []).slice().sort((a, b) => Number(b.market_value || 0) - Number(a.market_value || 0)),
-    [positionsPayload?.positions],
+    () => strategyPerformance.positions.slice().sort((a, b) => Number(b.market_value || 0) - Number(a.market_value || 0)),
+    [strategyPerformance.positions],
   )
 
   const strategyPositionMap = useMemo(
@@ -1007,6 +1188,88 @@ export default function RealtimeMonitorPage() {
   )
 
   const eventFlowItems = useMemo(() => buildTradeFlowItems(events), [events])
+  const selectedMonitorPrimaryControl = useMemo(
+    () => (selectedMonitor ? primaryControlMeta(selectedMonitor.status) : null),
+    [selectedMonitor],
+  )
+  const latestMarketDataSource = useMemo(() => {
+    const minuteEvent = [...events].reverse().find(item =>
+      ['minute_capture', 'minute_features', 'market_snapshot'].includes(item.event_type) && item.payload?.source,
+    )
+    return String(minuteEvent?.payload?.source || selectedMonitor?.quote_source || '--')
+  }, [events, selectedMonitor?.quote_source])
+  const backendGovernanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
+    const items = [
+      ...(selectedMonitor?.data_governance?.items || []),
+      ...(positionsPayload?.data_governance?.items || []),
+    ]
+    const seen = new Set<string>()
+    return items.filter(item => {
+      const key = `${item.label}-${item.value}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }, [positionsPayload?.data_governance?.items, selectedMonitor?.data_governance?.items])
+  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
+    const fallbackItems: DataSourceGovernanceItem[] = [
+      {
+        label: '监控数据源',
+        value: selectedMonitor?.quote_source || '--',
+        detail: '这是监控实例声明的主行情源，不等同于页面缓存或账户快照来源',
+        tone: selectedMonitor ? 'good' : 'neutral',
+      },
+      {
+        label: '分钟线判定源',
+        value: latestMarketDataSource,
+        detail: '最近一次分钟捕获 / 特征计算里记录的数据源',
+        tone: latestMarketDataSource.includes('synthetic') ? 'warn' : latestMarketDataSource === '--' ? 'neutral' : 'info',
+      },
+      {
+        label: '持仓快照',
+        value: positionsPayload?.connection?.provider || '--',
+        detail: positionsPayload?.fetched_at ? `快照时间 ${formatDateTime(positionsPayload.fetched_at)}` : '当前尚未拉到持仓快照',
+        tone: positionsPayload?.fetched_at ? 'good' : 'warn',
+      },
+      {
+        label: '事件流状态',
+        value: streamStatus,
+        detail: selectedMonitor?.state?.last_updated_at ? `最近监控循环 ${formatDateTime(selectedMonitor.state.last_updated_at)}` : '等待下一轮监控状态上报',
+        tone: streamStatus === '实时追踪中' ? 'good' : streamStatus === '连接中...' ? 'info' : streamStatus === '连接失败' ? 'bad' : 'warn',
+      },
+    ]
+    return [
+      ...(backendGovernanceItems.length ? backendGovernanceItems : fallbackItems),
+      {
+        label: '收益口径',
+        value: '策略股票汇总',
+        detail: `当前按监控策略覆盖股票 ${strategyPerformance.positionCount} 只汇总今日/累计收益`,
+        tone: 'info',
+      },
+    ]
+  }, [backendGovernanceItems, latestMarketDataSource, positionsPayload?.connection?.provider, positionsPayload?.fetched_at, selectedMonitor, streamStatus, strategyPerformance.positionCount])
+  const governanceWarnings = useMemo(() => {
+    const merged = [
+      ...(selectedMonitor?.data_governance?.warnings || []),
+      ...(positionsPayload?.data_governance?.warnings || []),
+    ]
+    if (merged.length) {
+      if (!selectedMonitor && !merged.includes('当前还没有选中监控实例，页面无法判断策略层分钟线与账户持仓是否同步。')) {
+        merged.push('当前还没有选中监控实例，页面无法判断策略层分钟线与账户持仓是否同步。')
+      }
+      if (streamStatus === '连接失败' && !merged.includes('事件流连接失败时，页面上的实例状态可能会滞后于后端实际运行状态。')) {
+        merged.push('事件流连接失败时，页面上的实例状态可能会滞后于后端实际运行状态。')
+      }
+      if (error && !merged.includes(error)) merged.push(error)
+      return merged
+    }
+    const warnings: string[] = []
+    if (!selectedMonitor) warnings.push('当前还没有选中监控实例，页面无法判断策略层分钟线与账户持仓是否同步。')
+    if (selectedMonitor?.status === 'fused' && selectedMonitor.fused_reason) warnings.push(`当前实例已熔断：${selectedMonitor.fused_reason}`)
+    if (streamStatus === '连接失败') warnings.push('事件流连接失败时，页面上的实例状态可能会滞后于后端实际运行状态。')
+    if (error) warnings.push(error)
+    return warnings
+  }, [error, positionsPayload?.data_governance?.warnings, selectedMonitor, selectedMonitor?.data_governance?.warnings, streamStatus])
 
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">实时监控模块加载中...</div>
@@ -1053,6 +1316,13 @@ export default function RealtimeMonitorPage() {
         ) : null}
       </section>
 
+      <DataSourceGovernanceCard
+        title="数据源治理"
+        description={selectedMonitor?.data_governance?.description || positionsPayload?.data_governance?.description || '实时监控同时依赖分钟线、账户快照和事件流状态，三者必须分开看。'}
+        items={governanceItems}
+        warnings={governanceWarnings}
+      />
+
       <div className="space-y-4">
         <section className="space-y-4">
           <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
@@ -1062,12 +1332,28 @@ export default function RealtimeMonitorPage() {
                     <Activity className="h-5 w-5 text-emerald-500" />
                     监控实例列表
                   </div>
-                  <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">选择实例后，下方查看策略持仓和股票交易事件流动。</div>
+              <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">选择实例后，下方查看策略持仓和股票交易事件流动。</div>
                 </div>
               <div className="flex flex-wrap gap-2">
                 <button onClick={() => setShowCreateModal(true)} className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-300"><Plus className="mr-1 inline h-4 w-4" />新建监控</button>
-                <button onClick={() => void handleRunOnce()} disabled={!selectedMonitorId || runningOnce} className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"><Activity className="mr-1 inline h-4 w-4" />{runningOnce ? '执行中' : '立即跑一轮'}</button>
-                <button onClick={() => void handleControl('fuse-reset')} disabled={!selectedMonitorId || !!actioning} className="rounded-xl bg-rose-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"><TimerReset className="mr-1 inline h-4 w-4" />解除熔断</button>
+                {selectedMonitorPrimaryControl ? (
+                  <button
+                    onClick={() => void handleControl(selectedMonitorPrimaryControl.action)}
+                    disabled={!selectedMonitorId || !!actioning}
+                    className={`rounded-xl px-3 py-2 text-sm font-semibold disabled:opacity-60 ${selectedMonitorPrimaryControl.className}`}
+                  >
+                    <selectedMonitorPrimaryControl.icon className={`mr-1 inline h-4 w-4 ${actioning === selectedMonitorPrimaryControl.action ? 'animate-spin' : ''}`} />
+                    {selectedMonitorPrimaryControl.label}
+                  </button>
+                ) : null}
+                <button
+                  onClick={() => void handleRunOnce()}
+                  disabled={!selectedMonitorId || runningOnce || !canRunMonitorOnce(selectedMonitor?.status)}
+                  className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
+                >
+                  <Activity className="mr-1 inline h-4 w-4" />
+                  {runningOnce ? '执行中' : '立即跑一轮'}
+                </button>
               </div>
             </div>
 
@@ -1082,11 +1368,26 @@ export default function RealtimeMonitorPage() {
                       : 'border-slate-200 bg-slate-50 hover:bg-white dark:border-slate-700 dark:bg-slate-950 dark:hover:bg-slate-900'
                   }`}
                 >
+                  {(() => {
+                    const strategy = getMonitorStrategy(item)
+                    const primaryControl = primaryControlMeta(item.status)
+                    return (
+                      <>
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <div className="text-sm font-semibold text-slate-900 dark:text-white">{item.name}</div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                        账户：{item.account_key} ｜ 模式：{item.execution_mode === 'auto' ? '自动交易' : '仅监控'}
+                        策略：{strategy?.name || item.strategy_id} ｜ 账户：{item.account_key} ｜ 模式：{item.execution_mode === 'auto' ? '自动交易' : '仅监控'}
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <span className={`rounded-full px-2 py-1 text-[11px] ${strategyRuntimeTone(strategy, item)}`}>
+                          策略状态：{strategyRuntimeLabel(strategy, item)}
+                        </span>
+                        {strategy ? (
+                          <span className={`rounded-full px-2 py-1 text-[11px] ${strategyLifecycleTone(strategy.status)}`}>
+                            生命周期：{strategyLifecycleLabel(strategy.status)}
+                          </span>
+                        ) : null}
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center justify-end gap-2">
@@ -1097,16 +1398,22 @@ export default function RealtimeMonitorPage() {
                     </div>
                   </div>
                   <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    {(() => {
+                      const performance = getMonitorPerformance(item)
+                      return (
+                        <>
                     <div className="rounded-2xl bg-white/80 px-3 py-3 dark:bg-slate-900/70">
                       <div className="text-[11px] tracking-[0.16em] text-slate-400">今日收益</div>
-                      <div className={`mt-2 text-sm font-semibold ${pnlTone(getMonitorAccount(item)?.today_pnl)}`}>
-                        {formatPercent(getMonitorTodayPct(item))} ｜ {formatCurrency(getMonitorAccount(item)?.today_pnl)}
+                      <div className={`mt-2 text-sm font-semibold ${pnlTone(performance.todayPnl)}`}>
+                        {formatCurrency(performance.todayPnl)}
+                        {performance.todayPnlPct != null ? ` ｜ ${formatPercent(performance.todayPnlPct)}` : ''}
                       </div>
                     </div>
                     <div className="rounded-2xl bg-white/80 px-3 py-3 dark:bg-slate-900/70">
                       <div className="text-[11px] tracking-[0.16em] text-slate-400">累计收益</div>
-                      <div className={`mt-2 text-sm font-semibold ${pnlTone(getMonitorAccount(item)?.total_pnl)}`}>
-                        {formatPercent((getMonitorAccount(item)?.total_pnl_pct ?? null) != null ? Number(getMonitorAccount(item)?.total_pnl_pct) / 100 : null)} ｜ {formatCurrency(getMonitorAccount(item)?.total_pnl)}
+                      <div className={`mt-2 text-sm font-semibold ${pnlTone(performance.totalPnl)}`}>
+                        {formatCurrency(performance.totalPnl)}
+                        {performance.totalPnlPct != null ? ` ｜ ${formatPercent(performance.totalPnlPct)}` : ''}
                       </div>
                     </div>
                     <div className="rounded-2xl bg-white/80 px-3 py-3 dark:bg-slate-900/70">
@@ -1118,9 +1425,12 @@ export default function RealtimeMonitorPage() {
                     <div className="rounded-2xl bg-white/80 px-3 py-3 dark:bg-slate-900/70">
                       <div className="text-[11px] tracking-[0.16em] text-slate-400">持仓数量</div>
                       <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-white">
-                        {formatNumber(getMonitorAccount(item)?.position_count)}
+                        {formatNumber(performance.positionCount)}
                       </div>
                     </div>
+                        </>
+                      )
+                    })()}
                   </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
@@ -1130,20 +1440,20 @@ export default function RealtimeMonitorPage() {
                       <button
                         onClick={event => {
                           event.stopPropagation()
-                          void handleControl('start', item.id)
+                          void handleControl(primaryControl.action, item.id)
                         }}
-                        disabled={!!actioning || item.status === 'running' || item.status === 'fused'}
-                        className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                        disabled={!!actioning}
+                        className={`rounded-xl px-3 py-2 text-xs font-semibold disabled:opacity-60 ${primaryControl.className}`}
                       >
-                        <Play className="mr-1 inline h-3.5 w-3.5" />
-                        启动
+                        <primaryControl.icon className={`mr-1 inline h-3.5 w-3.5 ${actioning === primaryControl.action ? 'animate-spin' : ''}`} />
+                        {primaryControl.label}
                       </button>
                       <button
                         onClick={event => {
                           event.stopPropagation()
                           void handleControl('stop', item.id)
                         }}
-                        disabled={!!actioning || item.status === 'halted'}
+                        disabled={!!actioning || !canStopMonitor(item.status)}
                         className="rounded-xl bg-slate-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
                       >
                         <Power className="mr-1 inline h-3.5 w-3.5" />
@@ -1162,6 +1472,9 @@ export default function RealtimeMonitorPage() {
                     </div>
                   </div>
                   {item.fused_reason ? <div className="mt-2 text-xs text-rose-600 dark:text-rose-300">熔断原因：{item.fused_reason}</div> : null}
+                      </>
+                    )
+                  })()}
                 </div>
               )) : (
                 <div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">还没有实时监控实例，先点右上角新建一个。</div>
@@ -1178,37 +1491,50 @@ export default function RealtimeMonitorPage() {
                     策略持仓
                   </div>
                   <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                    账户：{positionsPayload?.account?.account_name || selectedMonitor.account_key} ｜ 显示当前监控账户的股票持仓列表
+                    账户：{positionsPayload?.account?.account_name || selectedMonitor.account_key} ｜ 显示当前监控策略覆盖股票的持仓列表
                   </div>
                   <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                     监控池：实际解析 {selectedMonitor.display_symbol_count ?? selectedMonitor.resolved_symbol_count ?? 0} 只
                     {typeof selectedMonitor.manual_symbol_count === 'number' ? ` ｜ 手动配置 ${selectedMonitor.manual_symbol_count} 只` : ''}
                   </div>
-                  <div className="mt-4 space-y-3">
-                    {strategyPositions.length ? strategyPositions.map(position => (
-                      <div key={`${position.symbol}-${position.account_id}`} className="rounded-2xl border border-slate-200 p-4 dark:border-slate-700">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="text-sm font-semibold text-slate-900 dark:text-white">{position.name || position.symbol}</div>
-                            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{position.symbol}</div>
-                          </div>
-                          <div className={`text-right text-sm font-semibold ${pnlTone(position.total_pnl)}`}>
-                            {formatCurrency(position.total_pnl)}
-                            <div className="mt-1 text-xs font-normal">
-                              {formatPercent((position.total_pnl_pct ?? null) != null ? Number(position.total_pnl_pct) / 100 : null)}
+                  <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    策略收益口径：当前持仓 {strategyPerformance.positionCount} 只 ｜ 今日 {formatCurrency(strategyPerformance.todayPnl)} ｜ 累计 {formatCurrency(strategyPerformance.totalPnl)}
+                  </div>
+                  <div className="mt-4">
+                    <VirtualList
+                      items={strategyPositions}
+                      height={560}
+                      estimateSize={136}
+                      gap={12}
+                      overscan={4}
+                      className="pr-1"
+                      empty={<div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">当前策略暂无持仓股票。</div>}
+                      itemKey={(position) => `${position.symbol}-${position.account_id}`}
+                      renderItem={(position) => (
+                        <div>
+                          <div className="rounded-2xl border border-slate-200 p-4 dark:border-slate-700">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <div className="text-sm font-semibold text-slate-900 dark:text-white">{position.name || position.symbol}</div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{position.symbol}</div>
+                              </div>
+                              <div className={`text-right text-sm font-semibold ${pnlTone(position.total_pnl)}`}>
+                                {formatCurrency(position.total_pnl)}
+                                <div className="mt-1 text-xs font-normal">
+                                  {formatPercent((position.total_pnl_pct ?? null) != null ? Number(position.total_pnl_pct) / 100 : null)}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="mt-3 grid gap-2 text-xs text-slate-500 dark:text-slate-400 md:grid-cols-2">
+                              <div>持仓：{formatNumber(position.current_position)} 股</div>
+                              <div>可用：{formatNumber(position.available_position)} 股</div>
+                              <div>成本：¥{formatPrice(position.average_cost)}</div>
+                              <div>现价：¥{formatPrice(position.current_price)}</div>
                             </div>
                           </div>
                         </div>
-                        <div className="mt-3 grid gap-2 text-xs text-slate-500 dark:text-slate-400 md:grid-cols-2">
-                          <div>持仓：{formatNumber(position.current_position)} 股</div>
-                          <div>可用：{formatNumber(position.available_position)} 股</div>
-                          <div>成本：¥{formatPrice(position.average_cost)}</div>
-                          <div>现价：¥{formatPrice(position.current_price)}</div>
-                        </div>
-                      </div>
-                    )) : (
-                      <div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">当前策略暂无持仓股票。</div>
-                    )}
+                      )}
+                    />
                   </div>
                 </div>
 
@@ -1217,78 +1543,87 @@ export default function RealtimeMonitorPage() {
                     <Activity className="h-5 w-5 text-blue-500" />
                     事件流动
                   </div>
-                  <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">显示股票交易相关的信号、委托、成交与风险事件。</div>
-                  <div className="mt-4 max-h-[980px] space-y-3 overflow-auto pr-1">
-                    {eventFlowItems.length ? eventFlowItems.map(item => (
-                      <div key={item.id} className={`rounded-2xl border border-l-4 p-4 ${eventTone(item)} ${eventAccent(item)}`}>
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className={`rounded-full px-2 py-1 text-[11px] font-semibold ${eventSideTone(item)}`}>
-                                {eventSideLabel(item)}
+                  <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">只显示交易相关事件：信号、委托、成交、撤补、拒单、风控拦截和真实持仓变化。</div>
+                  <div className="mt-4 pr-1">
+                    <VirtualList
+                      items={eventFlowItems}
+                      height={980}
+                      estimateSize={172}
+                      gap={12}
+                      overscan={5}
+                      empty={<div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">当前还没有交易相关事件，触发信号或委托后这里会持续刷新。</div>}
+                      itemKey={(item) => item.id}
+                      renderItem={(item) => (
+                        <div>
+                          <div className={`rounded-2xl border border-l-4 p-4 ${eventTone(item)} ${eventAccent(item)}`}>
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className={`rounded-full px-2 py-1 text-[11px] font-semibold ${eventSideTone(item)}`}>
+                                    {eventSideLabel(item)}
+                                  </span>
+                                  {(() => {
+                                    const symbol = eventSymbol(item)
+                                    const name = eventSecurityName(item, strategyPositionNameMap)
+                                    if (!symbol && !name) {
+                                      return (
+                                        <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
+                                          --
+                                        </span>
+                                      )
+                                    }
+                                    return (
+                                      <>
+                                        {symbol ? (
+                                          <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
+                                            {symbol}
+                                          </span>
+                                        ) : null}
+                                        {name ? (
+                                          <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                                            {name}
+                                          </span>
+                                        ) : null}
+                                      </>
+                                    )
+                                  })()}
+                                </div>
+                                <div className="mt-2 text-sm font-medium text-slate-800 dark:text-slate-100">
+                                  {getEventSummary(item, strategyPositionMap) || '事件已记录'}
+                                </div>
+                                {eventMetricLine(item) ? (
+                                  <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                                    {eventMetricLine(item)}
+                                  </div>
+                                ) : null}
+                              </div>
+                              <div className="shrink-0 text-right">
+                                <div className="text-xs text-slate-400 dark:text-slate-500">{formatDateTime(item.created_at)}</div>
+                                {item.request_id ? (
+                                  <div className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">请求 {item.request_id.slice(0, 8)}</div>
+                                ) : null}
+                              </div>
+                            </div>
+                            <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+                              <span className="rounded-full bg-slate-100 px-2 py-1 dark:bg-slate-800">
+                                {eventTagLabel(item)}
                               </span>
-                              {(() => {
-                                const symbol = eventSymbol(item)
-                                const name = eventSecurityName(item, strategyPositionNameMap)
-                                if (!symbol && !name) {
-                                  return (
-                                    <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
-                                      --
-                                    </span>
-                                  )
-                                }
-                                return (
-                                  <>
-                                    {symbol ? (
-                                      <span className="rounded-full bg-white/80 px-2 py-1 text-[11px] font-medium text-slate-500 shadow-sm dark:bg-slate-900/70 dark:text-slate-300">
-                                        {symbol}
-                                      </span>
-                                    ) : null}
-                                    {name ? (
-                                      <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-                                        {name}
-                                      </span>
-                                    ) : null}
-                                  </>
-                                )
-                              })()}
+                              {item.risk_payload?.reason ? (
+                                <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                                  风控：{String(item.risk_payload.reason)}
+                                </span>
+                              ) : null}
                             </div>
-                            <div className="mt-2 text-sm font-medium text-slate-800 dark:text-slate-100">
-                              {getEventSummary(item, strategyPositionMap) || '事件已记录'}
-                            </div>
-                            {eventMetricLine(item) ? (
-                              <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                                {eventMetricLine(item)}
+                            {renderEventDetail(item)}
+                            {Object.keys(item.error_payload || {}).length ? (
+                              <div className="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+                                异常：{JSON.stringify(item.error_payload)}
                               </div>
                             ) : null}
                           </div>
-                          <div className="shrink-0 text-right">
-                            <div className="text-xs text-slate-400 dark:text-slate-500">{formatDateTime(item.created_at)}</div>
-                            {item.request_id ? (
-                              <div className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">请求 {item.request_id.slice(0, 8)}</div>
-                            ) : null}
-                          </div>
                         </div>
-                        <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
-                          <span className="rounded-full bg-slate-100 px-2 py-1 dark:bg-slate-800">
-                            {eventTagLabel(item)}
-                          </span>
-                          {item.risk_payload?.reason ? (
-                            <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
-                              风控：{String(item.risk_payload.reason)}
-                            </span>
-                          ) : null}
-                        </div>
-                        {renderEventDetail(item)}
-                        {Object.keys(item.error_payload || {}).length ? (
-                          <div className="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
-                            异常：{JSON.stringify(item.error_payload)}
-                          </div>
-                        ) : null}
-                      </div>
-                    )) : (
-                      <div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">当前还没有股票交易事件，运行后这里会持续刷新。</div>
-                    )}
+                      )}
+                    />
                   </div>
                 </div>
               </div>
@@ -1411,6 +1746,16 @@ export default function RealtimeMonitorPage() {
 
                 <div className="rounded-2xl bg-slate-50 p-4 text-xs leading-6 text-slate-500 dark:bg-slate-950 dark:text-slate-400">
                   <div>当前策略：{selectedStrategy?.name || '未选择'}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full px-2 py-1 text-[11px] ${strategyRuntimeTone(selectedStrategy, null)}`}>
+                      策略状态：{strategyRuntimeLabel(selectedStrategy, null)}
+                    </span>
+                    {selectedStrategy ? (
+                      <span className={`rounded-full px-2 py-1 text-[11px] ${strategyLifecycleTone(selectedStrategy.status)}`}>
+                        生命周期：{strategyLifecycleLabel(selectedStrategy.status)}
+                      </span>
+                    ) : null}
+                  </div>
                   <div>实盘默认仅监控，自动交易白名单暂未在页面开放。</div>
                   <div>默认监控池：策略股票池 + 当前持仓 + 自选股 + 手动补充。</div>
                 </div>

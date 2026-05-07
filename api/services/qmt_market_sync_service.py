@@ -16,6 +16,7 @@ from api.services.qmt_market_data_service import (
     is_index_symbol,
     sync_major_index_daily,
 )
+from api.services.market_data_pipeline_service import preferred_daily_kline_table
 from api.services.qmt_minute_subscription_service import _resolve_capture_symbols
 from tradingagents.dataflows.trade_calendar import CN_TZ, is_cn_trading_day
 
@@ -231,7 +232,8 @@ def _extract_stock_codes(symbols: list[str]) -> list[str]:
 
 
 def _load_latest_stock_daily_trade_date(db) -> date | None:
-    return db.execute(text("SELECT MAX(trade_date) FROM stock_daily_kline")).scalar()
+    table_name = preferred_daily_kline_table()
+    return db.execute(text(f"SELECT MAX(trade_date) FROM {table_name}")).scalar()
 
 
 def _load_active_market_symbols(account_key: str) -> list[str]:

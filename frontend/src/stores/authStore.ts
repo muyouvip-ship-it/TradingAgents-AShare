@@ -3,6 +3,16 @@ import type { AuthUser } from '@/types'
 import { api } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 
+function createDevUser(): AuthUser {
+    const now = new Date().toISOString()
+    return {
+        id: 'test-user-001',
+        email: 'test@example.com',
+        created_at: now,
+        last_login_at: now,
+    }
+}
+
 interface AuthState {
     user: AuthUser | null
     token: string | null
@@ -20,44 +30,64 @@ export const useAuthStore = create<AuthState>((set) => ({
     hydrated: false,
 
     setAuth: (token, user) => {
-        localStorage.setItem('ta-access-token', token)
-        localStorage.setItem('ta-user', JSON.stringify(user))
+        try {
+            localStorage.setItem('ta-access-token', token)
+            localStorage.setItem('ta-user', JSON.stringify(user))
+        } catch {}
         useAnalysisStore.getState().clearSession()
         set({ token, user, hydrated: true })
     },
 
     logout: () => {
-        localStorage.removeItem('ta-access-token')
-        localStorage.removeItem('ta-user')
+        try {
+            localStorage.removeItem('ta-access-token')
+            localStorage.removeItem('ta-user')
+        } catch {}
         useAnalysisStore.getState().clearSession()
         set({ token: null, user: null, hydrated: true })
     },
 
     hydrate: async () => {
-        const token = localStorage.getItem('ta-access-token')
-        const userRaw = localStorage.getItem('ta-user')
-        
-        // 开发模式：如果没有token，设置一个测试token
+        let token: string | null = null
+        try {
+            token = localStorage.getItem('ta-access-token')
+        } catch {
+            token = null
+        }
+
+        // 开发模式下允许直接回退到本地测试用户，避免后端短暂不可用时整站卡死。
         if (!token) {
             const devToken = 'dev-test-token-001'
-            localStorage.setItem('ta-access-token', devToken)
-            set({ token: devToken, user: null, hydrated: true, loading: false })
-            return
-        }
-        
-        if (!token || !userRaw) {
-            set({ token: null, user: null, hydrated: true })
+            const devUser = createDevUser()
+            try {
+                localStorage.setItem('ta-access-token', devToken)
+                localStorage.setItem('ta-user', JSON.stringify(devUser))
+            } catch {}
+            set({ token: devToken, user: devUser, hydrated: true, loading: false })
             return
         }
 
         set({ loading: true })
         try {
             const user = await api.getMe()
-            localStorage.setItem('ta-user', JSON.stringify(user))
+            try {
+                localStorage.setItem('ta-user', JSON.stringify(user))
+            } catch {}
             set({ token, user, hydrated: true, loading: false })
         } catch {
-            localStorage.removeItem('ta-access-token')
-            localStorage.removeItem('ta-user')
+            if (import.meta.env.DEV) {
+                const devUser = createDevUser()
+                try {
+                    localStorage.setItem('ta-access-token', token)
+                    localStorage.setItem('ta-user', JSON.stringify(devUser))
+                } catch {}
+                set({ token, user: devUser, hydrated: true, loading: false })
+                return
+            }
+            try {
+                localStorage.removeItem('ta-access-token')
+                localStorage.removeItem('ta-user')
+            } catch {}
             set({ token: null, user: null, hydrated: true, loading: false })
         }
     },

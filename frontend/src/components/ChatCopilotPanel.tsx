@@ -1,12 +1,10 @@
-import { FormEvent, useState, useRef, useEffect } from 'react'
+import { FormEvent, Suspense, lazy, useState, useRef, useEffect } from 'react'
 import {
     Bot, Loader2, Send, Sparkles, FileText, ChevronRight, Trash2,
     TrendingUp, MessageCircle, Newspaper, Calculator, BarChart2, DollarSign,
     ArrowBigUp, ArrowBigDown, Brain, Briefcase, Flame, Scale, Shield, CheckCircle2,
     Activity,
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { api } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import type {
@@ -17,6 +15,8 @@ import type {
     ReportChunkEvent,
     Report,
 } from '@/types'
+
+const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
 
 interface ChatCopilotPanelProps {
     onSymbolDetected: (symbol: string) => void
@@ -341,7 +341,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                     `**分析完成**\n\n方向倾向：**${String(data.direction || '未知')}**\n\n执行动作：**${String(data.decision || 'HOLD')}**\n\n> 免责声明：以上内容由模型基于公开数据与规则生成，仅供研究参考，不构成任何投资建议或收益承诺。`
                 )
                 if ('Notification' in window && Notification.permission === 'granted') {
-                    new Notification('TradingAgents 分析完成', {
+                    new Notification('量化之神分析完成', {
                         body: data.direction ? `方向：${String(data.direction)} · 动作：${String(data.decision || 'HOLD')}` : '点击查看完整报告',
                         icon: '/favicon.ico',
                     })
@@ -823,10 +823,10 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                                     </button>
                                     {isExpanded && (
                                         <div className="px-3 pb-2 border-t border-slate-200 dark:border-slate-700/50 max-h-60 overflow-y-auto">
-                                            <div className="prose dark:prose-invert prose-xs max-w-none mt-2 text-[12px] leading-relaxed">
-                                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                                    {msg.content}
-                                                </ReactMarkdown>
+                                        <div className="prose dark:prose-invert prose-xs max-w-none mt-2 text-[12px] leading-relaxed">
+                                                <Suspense fallback={<div>{msg.content}</div>}>
+                                                    <MarkdownBlock content={msg.content} />
+                                                </Suspense>
                                             </div>
                                         </div>
                                     )}
@@ -863,9 +863,9 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                                 {isExpanded && !isPending && (
                                     <div className="px-3 pb-2 border-t border-slate-200 dark:border-slate-700/50 max-h-60 overflow-y-auto">
                                         <div className="prose dark:prose-invert prose-xs max-w-none mt-2 text-[12px] leading-relaxed">
-                                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                                {msg.content}
-                                            </ReactMarkdown>
+                                            <Suspense fallback={<div>{msg.content}</div>}>
+                                                <MarkdownBlock content={msg.content} />
+                                            </Suspense>
                                         </div>
                                     </div>
                                 )}
@@ -889,28 +889,28 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                                     msg.content
                                 ) : (
                                     <div className="prose dark:prose-invert prose-sm max-w-none">
-                                        <ReactMarkdown
-                                            remarkPlugins={[remarkGfm]}
-                                            components={{
-                                                table: ({ children }) => (
-                                                    <table className="w-full border-collapse border border-slate-300 dark:border-slate-600 my-2 text-xs">{children}</table>
-                                                ),
-                                                thead: ({ children }) => (
-                                                    <thead className="bg-slate-100 dark:bg-slate-700">{children}</thead>
-                                                ),
-                                                th: ({ children }) => (
-                                                    <th className="border border-slate-300 dark:border-slate-600 px-2 py-1 text-left font-semibold text-slate-700 dark:text-slate-300">{children}</th>
-                                                ),
-                                                td: ({ children }) => (
-                                                    <td className="border border-slate-300 dark:border-slate-600 px-2 py-1 text-slate-600 dark:text-slate-400">{children}</td>
-                                                ),
-                                                tr: ({ children }) => (
-                                                    <tr className="even:bg-slate-50 dark:even:bg-slate-800/50">{children}</tr>
-                                                ),
-                                            }}
-                                        >
-                                            {msg.content}
-                                        </ReactMarkdown>
+                                        <Suspense fallback={<div>{msg.content}</div>}>
+                                            <MarkdownBlock
+                                                content={msg.content}
+                                                components={{
+                                                    table: ({ children }: { children?: React.ReactNode }) => (
+                                                        <table className="w-full border-collapse border border-slate-300 dark:border-slate-600 my-2 text-xs">{children}</table>
+                                                    ),
+                                                    thead: ({ children }: { children?: React.ReactNode }) => (
+                                                        <thead className="bg-slate-100 dark:bg-slate-700">{children}</thead>
+                                                    ),
+                                                    th: ({ children }: { children?: React.ReactNode }) => (
+                                                        <th className="border border-slate-300 dark:border-slate-600 px-2 py-1 text-left font-semibold text-slate-700 dark:text-slate-300">{children}</th>
+                                                    ),
+                                                    td: ({ children }: { children?: React.ReactNode }) => (
+                                                        <td className="border border-slate-300 dark:border-slate-600 px-2 py-1 text-slate-600 dark:text-slate-400">{children}</td>
+                                                    ),
+                                                    tr: ({ children }: { children?: React.ReactNode }) => (
+                                                        <tr className="even:bg-slate-50 dark:even:bg-slate-800/50">{children}</tr>
+                                                    ),
+                                                }}
+                                            />
+                                        </Suspense>
                                     </div>
                                 )}
                             </div>

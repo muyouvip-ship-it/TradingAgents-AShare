@@ -8,9 +8,13 @@ from sqlalchemy.orm import Session
 from api.database import get_db
 from api.deps import require_api_user
 from api.schemas.analysis import AnalyzeResponse
-from api.services import portfolio_import_service, reports_service, scheduled_service, watchlist_service
+from api.services import portfolio_import_service, report_service, reports_service, scheduled_service, watchlist_service
 
 router = APIRouter(prefix="/v1", tags=["Scheduled"])
+
+
+def _new_scheduled_job_id(item_id: str) -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")[-16:] + item_id[-8:]
 
 
 @router.get("/scheduled")
@@ -115,8 +119,9 @@ async def trigger_scheduled_analyses_batch(body: dict = Body(...), current_user=
         task_snapshot["manual_user_context"] = compat._build_manual_imported_user_context(db, current_user.id, task["symbol"])
         if task_snapshot["manual_user_context"].get("current_position") is not None:
             with_position_context += 1
-        job_id = f"{datetime.now().timestamp():.0f}".replace(".", "")[-16:] + task["id"][-8:]
+        job_id = _new_scheduled_job_id(task["id"])
         compat._set_job(job_id, user_id=current_user.id, status="pending", symbol=task["symbol"], trade_date=actual_trade_date)
+        report_service.init_report(db, job_id, task["symbol"], actual_trade_date, user_id=current_user.id)
         compat._create_tracked_task(compat._run_scheduled_analysis_once(task_snapshot, requested_trade_date, job_id, mark_schedule_run=False))
         jobs.append(
             {
@@ -142,11 +147,12 @@ async def trigger_scheduled_analysis_once(item_id: str, current_user=Depends(req
         raise HTTPException(status_code=404, detail="未找到该定时任务")
     requested_trade_date = compat.cn_today_str()
     actual_trade_date = compat._resolve_scheduled_trade_date(requested_trade_date)
-    job_id = f"{datetime.now().timestamp():.0f}".replace(".", "")[-16:] + item_id[-8:]
+    job_id = _new_scheduled_job_id(item_id)
     task_snapshot = dict(task)
     task_snapshot["user_id"] = current_user.id
     task_snapshot["manual_user_context"] = compat._build_manual_imported_user_context(db, current_user.id, task["symbol"])
     compat._set_job(job_id, user_id=current_user.id, status="pending", symbol=task["symbol"], trade_date=actual_trade_date)
+    report_service.init_report(db, job_id, task["symbol"], actual_trade_date, user_id=current_user.id)
     compat._create_tracked_task(compat._run_scheduled_analysis_once(task_snapshot, requested_trade_date, job_id, mark_schedule_run=False))
     return {"job_id": job_id, "status": "pending"}
 

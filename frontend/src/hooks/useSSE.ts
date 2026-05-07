@@ -7,6 +7,11 @@ export function useSSE(jobId: string | null) {
     const eventSourceRef = useRef<EventSource | null>(null)
     const agentMessageMapRef = useRef<Record<string, string>>({})
     const firstTokenMapRef = useRef<Record<string, boolean>>({})
+    const tokenBufferRef = useRef<{
+        chat: Record<string, string>
+        reports: Record<string, { agent: string; report: string; token: string; horizon?: string }>
+    }>({ chat: {}, reports: {} })
+    const tokenFlushTimerRef = useRef<number | null>(null)
 
     const {
         setIsConnected,
@@ -24,6 +29,42 @@ export function useSSE(jobId: string | null) {
         appendToChatMessage,
         setMessageContent,
     } = useAnalysisStore()
+
+    const flushTokenBuffers = useCallback(() => {
+        if (tokenFlushTimerRef.current != null) {
+            window.clearTimeout(tokenFlushTimerRef.current)
+            tokenFlushTimerRef.current = null
+        }
+        const buffered = tokenBufferRef.current
+        tokenBufferRef.current = { chat: {}, reports: {} }
+        for (const [messageId, chunk] of Object.entries(buffered.chat)) {
+            if (chunk) appendToChatMessage(messageId, chunk)
+        }
+        for (const event of Object.values(buffered.reports)) {
+            if (event.token) addAgentToken(event)
+        }
+    }, [addAgentToken, appendToChatMessage])
+
+    const scheduleTokenFlush = useCallback(() => {
+        if (tokenFlushTimerRef.current != null) return
+        tokenFlushTimerRef.current = window.setTimeout(flushTokenBuffers, 80)
+    }, [flushTokenBuffers])
+
+    const bufferAgentToken = useCallback((
+        tokenData: { agent: string; report: string; token: string; horizon?: string },
+        messageId?: string,
+    ) => {
+        if (messageId) {
+            tokenBufferRef.current.chat[messageId] = (tokenBufferRef.current.chat[messageId] || '') + tokenData.token
+        }
+        const reportKey = `${tokenData.report}-${tokenData.agent}-${tokenData.horizon || 'main'}`
+        const current = tokenBufferRef.current.reports[reportKey]
+        tokenBufferRef.current.reports[reportKey] = {
+            ...tokenData,
+            token: (current?.token || '') + tokenData.token,
+        }
+        scheduleTokenFlush()
+    }, [scheduleTokenFlush])
 
     const connect = useCallback(() => {
         if (!jobId || eventSourceRef.current) return
@@ -70,6 +111,7 @@ export function useSSE(jobId: string | null) {
                     break
 
                 case 'job.completed':
+                    flushTokenBuffers()
                     setIsAnalyzing(false)
                     setReport((data.result || null) as AnalysisReport | null)
                     setStructuredData({
@@ -94,6 +136,7 @@ export function useSSE(jobId: string | null) {
                     break
 
                 case 'job.failed':
+                    flushTokenBuffers()
                     setIsAnalyzing(false)
                     addChatMessage({
                         id: `job-failed-${Date.now()}`,
@@ -145,11 +188,13 @@ export function useSSE(jobId: string | null) {
                             const horizonText = tokenData.horizon ? `(${tokenData.horizon === 'short' ? '短线' : '中线'})` : ''
                             setMessageContent(targetMsgId, `### ${tokenData.agent} ${horizonText}\n\n${tokenData.token}`)
                             firstTokenMapRef.current[targetMsgId] = false
+                            bufferAgentToken(tokenData)
                         } else {
-                            appendToChatMessage(targetMsgId, tokenData.token)
+                            bufferAgentToken(tokenData, targetMsgId)
                         }
+                    } else {
+                        bufferAgentToken(tokenData)
                     }
-                    addAgentToken(data as { agent: string; report: string; token: string; horizon?: string })
                     break
 
                 case 'agent.message':
@@ -197,6 +242,7 @@ export function useSSE(jobId: string | null) {
             eventSource.addEventListener(name, (evt: MessageEvent) => {
                 if (name === 'ping') return // Ignore ping events, they just keep connection alive
                 if (name === 'done' || evt.data === '[DONE]') {
+                    flushTokenBuffers()
                     eventSource.close()
                     eventSourceRef.current = null
                     setIsConnected(false)
@@ -228,11 +274,12 @@ export function useSSE(jobId: string | null) {
         }
 
         return () => {
+            flushTokenBuffers()
             eventSource.close()
             eventSourceRef.current = null
             setIsConnected(false)
         }
-    }, [jobId])
+    }, [bufferAgentToken, flushTokenBuffers, jobId])
 
     useEffect(() => {
         const cleanup = connect()
@@ -243,11 +290,12 @@ export function useSSE(jobId: string | null) {
 
     const disconnect = useCallback(() => {
         if (eventSourceRef.current) {
+            flushTokenBuffers()
             eventSourceRef.current.close()
             eventSourceRef.current = null
             setIsConnected(false)
         }
-    }, [])
+    }, [flushTokenBuffers])
 
     return { disconnect }
 }

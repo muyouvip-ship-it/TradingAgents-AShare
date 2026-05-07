@@ -17,6 +17,7 @@ import {
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
 import type { PortfolioPositionInput, TrackingBoardItem, TrackingBoardResponse } from '@/types'
@@ -81,43 +82,39 @@ export default function TrackingBoardPanel() {
         } catch {}
     }, [viewMode])
 
+    const loadTrackingBoard = useCallback(async (silent: boolean) => {
+        if (!user?.id) return
+        if (silent) {
+            setTrackingRefreshing(true)
+        } else {
+            setTrackingLoading(true)
+        }
+
+        try {
+            const response = await api.getDashboardTrackingBoard()
+            setTrackingBoard(response)
+            setTrackingError(null)
+        } catch (error) {
+            setTrackingError(error instanceof Error ? error.message : '跟踪看板加载失败')
+        } finally {
+            setTrackingLoading(false)
+            setTrackingRefreshing(false)
+        }
+    }, [user?.id])
+
     useEffect(() => {
         if (!user?.id) return
-        let cancelled = false
-
-        const loadTrackingBoard = async (silent: boolean) => {
-            if (silent) {
-                setTrackingRefreshing(true)
-            } else {
-                setTrackingLoading(true)
-            }
-
-            try {
-                const response = await api.getDashboardTrackingBoard()
-                if (cancelled) return
-                setTrackingBoard(response)
-                setTrackingError(null)
-            } catch (error) {
-                if (cancelled) return
-                setTrackingError(error instanceof Error ? error.message : '跟踪看板加载失败')
-            } finally {
-                if (!cancelled) {
-                    setTrackingLoading(false)
-                    setTrackingRefreshing(false)
-                }
-            }
-        }
-
         void loadTrackingBoard(false)
-        const intervalId = window.setInterval(() => {
-            void loadTrackingBoard(true)
-        }, trackingRefreshSeconds * 1000)
+    }, [loadTrackingBoard, user?.id])
 
-        return () => {
-            cancelled = true
-            window.clearInterval(intervalId)
-        }
-    }, [trackingRefreshSeconds, user?.id])
+    usePolling(
+        () => loadTrackingBoard(true),
+        {
+            enabled: Boolean(user?.id),
+            intervalMs: trackingRefreshSeconds * 1000,
+            runImmediately: false,
+        },
+    )
 
     const refreshBoard = useCallback(async () => {
         try {

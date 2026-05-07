@@ -20,10 +20,42 @@ import requests
 
 from api.core.env import load_project_env
 from api.core.settings import settings
+from api.services.market_data_pipeline_service import (
+    ingest_raw_daily_rows,
+    ingest_raw_minute_rows,
+    preferred_daily_kline_table,
+    preferred_minute_kline_table,
+    publish_minute_trade_date,
+    reconcile_daily_trade_dates,
+    sync_legacy_minute_to_raw,
+)
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 QmtProgressCallback = Callable[[int, str], Awaitable[None] | None]
+
+
+def _pick_frame_value(row: pd.Series, *candidates: str) -> float | None:
+    for column in candidates:
+        if column in row.index and pd.notna(row[column]):
+            try:
+                return float(row[column])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _normalize_symbol_for_query(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if "." in text:
+        return text
+    if len(text) == 6 and text.isdigit():
+        if text.startswith(("4", "8")):
+            return f"{text}.BJ"
+        if text.startswith(("5", "6", "9")):
+            return f"{text}.SH"
+        return f"{text}.SZ"
+    return text
 
 
 class DataDownloader:
@@ -36,14 +68,16 @@ class DataDownloader:
         """检查数据库中已有的数据范围"""
         try:
             if data_type == 'daily_kline':
+                table_name = preferred_daily_kline_table()
+                symbol_variants = sorted({symbol, symbol.split(".", 1)[0], _normalize_symbol_for_query(symbol)} - {""})
                 # 检查股票日K线数据
-                query = text("""
+                query = text(f"""
                     SELECT MIN(trade_date) as min_date, MAX(trade_date) as max_date, COUNT(*) as count
-                    FROM stock_daily_kline 
-                    WHERE symbol = :symbol 
+                    FROM {table_name}
+                    WHERE symbol IN :symbols
                       AND trade_date >= :start_date 
                       AND trade_date <= :end_date
-                """)
+                """).bindparams(bindparam("symbols", expanding=True))
             elif data_type == 'index_data':
                 # 检查指数数据
                 query = text("""
@@ -56,11 +90,15 @@ class DataDownloader:
             else:
                 return {"exists": False, "complete": False}
             
-            result = self.db.execute(query, {
-                "symbol": symbol,
+            params = {
                 "start_date": start_date,
-                "end_date": end_date
-            })
+                "end_date": end_date,
+            }
+            if data_type == 'daily_kline':
+                params["symbols"] = symbol_variants
+            else:
+                params["symbol"] = symbol
+            result = self.db.execute(query, params)
             row = result.fetchone()
             
             if row and row.count > 0:
@@ -87,8 +125,15 @@ class DataDownloader:
             return {"exists": False, "complete": False}
 
         
-    async def download_daily_kline(self, symbol: str, start_date: date, end_date: date, force: bool = False) -> Dict[str, Any]:
-        """下载股票日K线数据 - 使用新浪接口"""
+    async def download_daily_kline(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        force: bool = False,
+        source: str = "akshare",
+    ) -> Dict[str, Any]:
+        """下载股票日K线数据，并同步到 raw/norm/published 层。"""
         try:
             # 检查是否已有数据
             if not force:
@@ -99,64 +144,57 @@ class DataDownloader:
                 elif existing['exists']:
                     logger.info(f"股票 {symbol} 部分数据已存在，将增量更新")
             
-            logger.info(f"开始下载 {symbol} 日K线数据: {start_date} ~ {end_date}")
-            
-            # 使用新浪接口（更稳定）
-            # 新浪接口没有日期参数，会返回所有历史数据
-            df = ak.stock_zh_a_daily(symbol=f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}", adjust="qfq")
+            logger.info("开始下载 %s 日K线数据: %s ~ %s (source=%s)", symbol, start_date, end_date, source)
+
+            normalized_source = str(source or "akshare").strip().lower() or "akshare"
+            if normalized_source == "baostock":
+                df = self._fetch_daily_kline_via_baostock(symbol, start_date, end_date)
+            elif normalized_source == "efinance":
+                df = self._fetch_daily_kline_via_efinance(symbol, start_date, end_date)
+            else:
+                # 新浪接口没有日期参数，会返回所有历史数据
+                df = ak.stock_zh_a_daily(symbol=f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}", adjust="qfq")
             
             if df.empty:
                 logger.warning(f"股票 {symbol} 没有数据")
                 return {"success": False, "records": 0, "error": "无数据"}
             
             # 筛选日期范围
-            df['date'] = pd.to_datetime(df['date'])
+            date_column = 'date' if 'date' in df.columns else '日期' if '日期' in df.columns else None
+            if date_column is None:
+                return {"success": False, "records": 0, "error": "返回数据缺少日期列"}
+            df[date_column] = pd.to_datetime(df[date_column])
             start_datetime = pd.to_datetime(start_date)
             end_datetime = pd.to_datetime(end_date)
-            df_filtered = df[(df['date'] >= start_datetime) & (df['date'] <= end_datetime)]
+            df_filtered = df[(df[date_column] >= start_datetime) & (df[date_column] <= end_datetime)]
             
             if df_filtered.empty:
                 logger.warning(f"股票 {symbol} 在指定日期范围内没有数据")
                 return {"success": False, "records": 0, "error": "日期范围内无数据"}
             
-            # 数据清洗和入库
-            records_inserted = 0
+            records_data = []
             for _, row in df_filtered.iterrows():
-                try:
-                    insert_query = text("""
-                        INSERT INTO stock_daily_kline 
-                        (symbol, trade_date, open, high, low, close, volume, amount, turnover_rate)
-                        VALUES (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount, :turnover_rate)
-                        ON CONFLICT (symbol, trade_date) DO UPDATE SET
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close,
-                            volume = EXCLUDED.volume,
-                            amount = EXCLUDED.amount,
-                            turnover_rate = EXCLUDED.turnover_rate,
-                            updated_at = NOW()
-                    """)
-                    
-                    self.db.execute(insert_query, {
-                        "symbol": symbol,
-                        "trade_date": row['date'].date(),
-                        "open": float(row['open']) if pd.notna(row['open']) else None,
-                        "high": float(row['high']) if pd.notna(row['high']) else None,
-                        "low": float(row['low']) if pd.notna(row['low']) else None,
-                        "close": float(row['close']) if pd.notna(row['close']) else None,
-                        "volume": int(row['volume']) if pd.notna(row['volume']) else None,
-                        "amount": float(row['amount']) if pd.notna(row['amount']) else None,
-                        "turnover_rate": float(row['turnover']) if pd.notna(row['turnover']) else None
-                    })
-                    records_inserted += 1
-                except Exception as e:
-                    logger.error(f"插入数据失败 {symbol} {row['date']}: {e}")
-                    continue
-            
-            self.db.commit()
-            logger.info(f"成功下载 {symbol} 日K线数据 {records_inserted} 条")
-            return {"success": True, "records": records_inserted}
+                records_data.append({
+                    "symbol": symbol,
+                    "trade_date": row[date_column].date(),
+                    "open": _pick_frame_value(row, "open", "开盘"),
+                    "high": _pick_frame_value(row, "high", "最高"),
+                    "low": _pick_frame_value(row, "low", "最低"),
+                    "close": _pick_frame_value(row, "close", "收盘"),
+                    "volume": _pick_frame_value(row, "volume", "成交量"),
+                    "amount": _pick_frame_value(row, "amount", "成交额"),
+                    "turnover_rate": _pick_frame_value(row, "turnover", "换手率"),
+                    "pre_close": _pick_frame_value(row, "pre_close", "昨收"),
+                })
+
+            ingest_result = ingest_raw_daily_rows(source=normalized_source, rows=records_data)
+            if not ingest_result.get("success"):
+                return {"success": False, "records": 0, "error": ingest_result.get("error", "raw ingest failed")}
+            reconcile_daily_trade_dates(trade_dates=ingest_result.get("trade_dates") or [], symbols=[symbol])
+
+            records_inserted = len(records_data)
+            logger.info("成功下载 %s 日K线数据 %s 条 (source=%s)", symbol, records_inserted, normalized_source)
+            return {"success": True, "records": records_inserted, "source": normalized_source}
             
         except Exception as e:
             logger.error(f"下载 {symbol} 日K线数据失败: {e}")
@@ -237,7 +275,54 @@ class DataDownloader:
         except Exception as e:
             logger.error(f"获取股票列表失败: {e}")
             return []
-    
+
+    def _fetch_daily_kline_via_baostock(self, symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+        import baostock as bs
+
+        login_result = bs.login()
+        if login_result.error_code != "0":
+            raise RuntimeError(f"baostock login failed: {login_result.error_msg}")
+        try:
+            market_prefix = "sh" if symbol.startswith("6") else "sz"
+            rs = bs.query_history_k_data_plus(
+                f"{market_prefix}.{symbol}",
+                "date,open,high,low,close,volume,amount,turn",
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                frequency="d",
+                adjustflag="2",
+            )
+            rows = []
+            while rs.error_code == "0" and rs.next():
+                rows.append(rs.get_row_data())
+            frame = pd.DataFrame(rows, columns=rs.fields or [])
+            if frame.empty:
+                return frame
+            return frame.rename(columns={"date": "date", "turn": "turnover"})
+        finally:
+            bs.logout()
+
+    def _fetch_daily_kline_via_efinance(self, symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+        try:
+            import efinance as ef
+        except Exception as exc:
+            raise RuntimeError(f"efinance is not available: {exc}") from exc
+        frame = ef.stock.get_quote_history(symbol, beg=start_date.strftime("%Y%m%d"), end=end_date.strftime("%Y%m%d"), klt=101, fqt=1)
+        if not isinstance(frame, pd.DataFrame):
+            return pd.DataFrame()
+        rename_map = {
+            "日期": "日期",
+            "开盘": "开盘",
+            "最高": "最高",
+            "最低": "最低",
+            "收盘": "收盘",
+            "成交量": "成交量",
+            "成交额": "成交额",
+            "换手率": "换手率",
+            "昨收": "昨收",
+        }
+        return frame.rename(columns=rename_map)
+
     def get_main_index_symbols(self) -> List[str]:
         """获取主要指数代码"""
         return ['000001', '399001', '000300', '000016', '000905', '399006']
@@ -354,6 +439,12 @@ class DataDownloader:
         await self._emit_progress(progress_callback, 92, "QMT 脚本执行完成，正在统计导入结果")
         after_count = self._count_minute_kline_rows(normalized_symbols, start_date, end_date)
         inserted_rows = max(after_count - before_count, 0)
+        for offset in range((end_date - start_date).days + 1):
+            sync_legacy_minute_to_raw(
+                source="qmt",
+                trade_date=start_date + timedelta(days=offset),
+                symbols=normalized_symbols or None,
+            )
         logger.info("QMT 分钟线同步完成，新增/覆盖区间记录约 %s 条", inserted_rows)
         await self._emit_progress(progress_callback, 100, f"QMT 分钟线导入完成，区间记录约 {inserted_rows} 条")
         return {
@@ -500,6 +591,12 @@ class DataDownloader:
                 after_count = self._count_minute_kline_rows(symbols, start_date, end_date)
                 inserted_rows = max(after_count - before_count, 0)
                 bridge_rows = int(job.get("rows_total") or 0)
+                for offset in range((end_date - start_date).days + 1):
+                    sync_legacy_minute_to_raw(
+                        source="qmt",
+                        trade_date=start_date + timedelta(days=offset),
+                        symbols=symbols or None,
+                    )
                 logger.info(
                     "[qmt-audit] action=history_minute_sync.success request_id=%s account_key=%s role=%s bridge_url=%s bridge_job_id=%s records=%s",
                     request_id,
@@ -557,16 +654,24 @@ class DataDownloader:
 
     @staticmethod
     def _resolve_qmt_history_bridge() -> dict[str, str] | None:
+        preferred_history_key = (
+            getattr(settings, "qmt_minute_history_account_key", None)
+            or getattr(settings, "qmt_history_account_key", None)
+            or "paper_sim"
+        )
         history_account_key = (
-            str(os.getenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY") or settings.qmt_minute_history_account_key or "live_real").strip()
-            or "live_real"
+            str(os.getenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY") or os.getenv("QMT_HISTORY_ACCOUNT_KEY") or preferred_history_key).strip()
+            or "paper_sim"
         )
         explicit_base = str(os.getenv("QMT_MINUTE_HISTORY_BRIDGE_BASE_URL") or os.getenv("QMT_HISTORY_BRIDGE_BASE_URL") or "").strip()
         explicit_token = str(
             os.getenv("QMT_MINUTE_HISTORY_BRIDGE_TOKEN") or os.getenv("QMT_HISTORY_BRIDGE_TOKEN") or os.getenv("QMT_BRIDGE_TOKEN") or ""
         ).strip()
         if explicit_base:
-            return {"bridge_base_url": explicit_base, "bridge_token": explicit_token, "account_key": history_account_key, "role": "live"}
+            if DataDownloader._bridge_url_looks_live(explicit_base):
+                logger.warning("[qmt-audit] 显式配置的历史分钟线 bridge 指向实盘端口，已拒绝：%s", explicit_base)
+                return None
+            return {"bridge_base_url": explicit_base, "bridge_token": explicit_token, "account_key": history_account_key, "role": "paper"}
         for account in settings.qmt_accounts():
             if not bool(account.get("enabled", True)):
                 continue
@@ -574,22 +679,29 @@ class DataDownloader:
                 continue
             base_url = str(account.get("bridge_base_url") or "").strip()
             if base_url:
+                role = str(account.get("role") or "paper")
+                if role == "live" or DataDownloader._bridge_url_looks_live(base_url):
+                    logger.warning("[qmt-audit] 历史分钟线 bridge 命中了实盘账户，已拒绝：account_key=%s base_url=%s", history_account_key, base_url)
+                    return None
                 return {
                     "bridge_base_url": base_url,
                     "bridge_token": str(account.get("bridge_token") or ""),
                     "account_key": str(account.get("key") or history_account_key),
                     "account_id": str(account.get("account_id") or ""),
-                    "role": str(account.get("role") or "live"),
+                    "role": role,
                 }
-        if not settings.qmt_accounts_json and str(settings.qmt_default_account_key or "").strip() == history_account_key:
-            base_url = str(settings.qmt_bridge_base_url or "").strip()
+        if not getattr(settings, "qmt_accounts_json", "") and str(getattr(settings, "qmt_default_account_key", "") or "").strip() == history_account_key:
+            base_url = str(getattr(settings, "qmt_bridge_base_url", "") or "").strip()
             if base_url:
+                if DataDownloader._bridge_url_looks_live(base_url):
+                    logger.warning("[qmt-audit] 默认历史分钟线 bridge 指向实盘端口，已拒绝：%s", base_url)
+                    return None
                 return {
                     "bridge_base_url": base_url,
-                    "bridge_token": str(settings.qmt_bridge_token or ""),
+                    "bridge_token": str(getattr(settings, "qmt_bridge_token", "") or ""),
                     "account_key": history_account_key,
-                    "account_id": str(settings.qmt_account_id or ""),
-                    "role": "live",
+                    "account_id": str(getattr(settings, "qmt_account_id", "") or ""),
+                    "role": "paper",
                 }
         logger.warning("[qmt-audit] 未找到 QMT_MINUTE_HISTORY_ACCOUNT_KEY=%s 对应的历史分钟线 bridge", history_account_key)
         return None
@@ -660,12 +772,13 @@ class DataDownloader:
         start_dt = datetime.combine(start_date, datetime.min.time())
         end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
         variants = sorted({variant for symbol in symbols for variant in self._minute_symbol_variants(symbol)})
+        table_name = preferred_minute_kline_table()
         try:
             if variants:
                 query = text(
-                    """
+                    f"""
                     SELECT COUNT(*) AS count
-                    FROM stock_minute_kline
+                    FROM {table_name}
                     WHERE trade_time >= :start_dt
                       AND trade_time < :end_dt
                       AND symbol IN :symbols
@@ -673,9 +786,9 @@ class DataDownloader:
                 ).bindparams(bindparam("symbols", expanding=True))
             else:
                 query = text(
-                    """
+                    f"""
                     SELECT COUNT(*) AS count
-                    FROM stock_minute_kline
+                    FROM {table_name}
                     WHERE trade_time >= :start_dt
                       AND trade_time < :end_dt
                     """
@@ -706,8 +819,15 @@ class DataDownloader:
                 variants.add(f"{bare}.BJ")
         return sorted(variants)
     
-    async def download_minute_kline(self, symbol: str, start_date: date, end_date: date, force: bool = False) -> Dict[str, Any]:
-        """下载股票1分钟K线数据 - 使用AKShare东方财富接口"""
+    async def download_minute_kline(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        force: bool = False,
+        source: str = "akshare",
+    ) -> Dict[str, Any]:
+        """下载股票1分钟K线数据，并写入 raw/norm/published 层。"""
         import time
         import random
         
@@ -715,7 +835,11 @@ class DataDownloader:
         await asyncio.sleep(random.uniform(0.5, 1.5))
         
         try:
-            logger.info(f"开始下载 {symbol} 1分钟K线数据: {start_date} ~ {end_date}")
+            logger.info("开始下载 %s 1分钟K线数据: %s ~ %s (source=%s)", symbol, start_date, end_date, source)
+
+            normalized_source = str(source or "akshare").strip().lower() or "akshare"
+            if normalized_source != "akshare":
+                return {"success": False, "records": 0, "error": f"当前分钟下载仅支持 AKShare 补缺，收到 {source}"}
 
             # AKShare的分钟K线接口限制：只能获取最近30天的数据
             days_diff = (end_date - start_date).days
@@ -773,63 +897,16 @@ class DataDownloader:
                     logger.error(f"准备1分钟K线数据失败 {symbol} {row['时间']}: {e}")
                     continue
 
-            # 批量插入
-            if records_data:
-                values_list = []
-                for rec in records_data:
-                    values_list.append(f"('{rec['symbol']}', '{rec['trade_time']}', {rec['open']}, {rec['high']}, {rec['low']}, {rec['close']}, {rec['volume']}, {rec['amount']})")
-                
-                insert_sql = f"""
-                    INSERT INTO stock_minute_kline
-                    (symbol, trade_time, open, high, low, close, volume, amount)
-                    VALUES {', '.join(values_list)}
-                    ON CONFLICT (symbol, trade_time) DO UPDATE SET
-                        open = EXCLUDED.open,
-                        high = EXCLUDED.high,
-                        low = EXCLUDED.low,
-                        close = EXCLUDED.close,
-                        volume = EXCLUDED.volume,
-                        amount = EXCLUDED.amount,
-                        created_at = NOW()
-                """
-                
-                try:
-                    self.db.execute(text(insert_sql))
-                    self.db.commit()
-                    logger.info(f"成功下载 {symbol} 1分钟K线数据 {len(records_data)} 条")
-                    return {"success": True, "records": len(records_data)}
-                except Exception as e:
-                    logger.error(f"批量插入1分钟K线数据失败 {symbol}: {e}")
-                    # 回滚并尝试逐条插入
-                    self.db.rollback()
-                    
-                    records_inserted = 0
-                    for rec in records_data:
-                        try:
-                            insert_query = text("""
-                                INSERT INTO stock_minute_kline
-                                (symbol, trade_time, open, high, low, close, volume, amount)
-                                VALUES (:symbol, :trade_time, :open, :high, :low, :close, :volume, :amount)
-                                ON CONFLICT (symbol, trade_time) DO UPDATE SET
-                                    open = EXCLUDED.open,
-                                    high = EXCLUDED.high,
-                                    low = EXCLUDED.low,
-                                    close = EXCLUDED.close,
-                                    volume = EXCLUDED.volume,
-                                    amount = EXCLUDED.amount,
-                                    created_at = NOW()
-                            """)
-                            self.db.execute(insert_query, rec)
-                            records_inserted += 1
-                        except Exception as e2:
-                            logger.error(f"逐条插入失败 {symbol} {rec['trade_time']}: {e2}")
-                            continue
-                    
-                    self.db.commit()
-                    logger.info(f"成功下载 {symbol} 1分钟K线数据 {records_inserted} 条（逐条插入）")
-                    return {"success": True, "records": records_inserted}
-            else:
+            if not records_data:
                 return {"success": False, "records": 0, "error": "无有效数据"}
+
+            ingest_result = ingest_raw_minute_rows(source=normalized_source, rows=records_data)
+            if not ingest_result.get("success"):
+                return {"success": False, "records": 0, "error": ingest_result.get("error", "raw ingest failed")}
+            for trade_day in ingest_result.get("trade_dates") or []:
+                publish_minute_trade_date(trade_date=trade_day, symbols=[symbol], minimum_coverage_ratio=0.0)
+            logger.info("成功下载 %s 1分钟K线数据 %s 条", symbol, len(records_data))
+            return {"success": True, "records": len(records_data), "source": normalized_source}
 
         except Exception as e:
             logger.error(f"下载 {symbol} 1分钟K线数据失败: {e}")

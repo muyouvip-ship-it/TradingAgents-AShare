@@ -4,13 +4,22 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from api.services.qmt_market_data_service import capture_intraday_symbols
 
 
 logger = logging.getLogger(__name__)
 
 
-def capture_today_minute_bars(*, account_key: str, symbols: list[str], trade_date: str | None = None) -> dict[str, Any]:
+def capture_today_minute_bars(
+    *,
+    account_key: str,
+    symbols: list[str],
+    trade_date: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any]:
     normalized_symbols = _normalize_symbols(symbols)
     if not normalized_symbols:
         return {"success": False, "message": "empty symbols", "rows": 0, "symbols": []}
@@ -22,6 +31,8 @@ def capture_today_minute_bars(*, account_key: str, symbols: list[str], trade_dat
             trade_date=effective_trade_date,
             period="1m",
             account_key=account_key,
+            db=db,
+            user_id=user_id,
         )
         return result
     except Exception as exc:

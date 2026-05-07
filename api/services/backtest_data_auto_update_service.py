@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from api.database import SessionLocal
+from api.services.market_data_pipeline_service import preferred_daily_kline_table, preferred_minute_kline_table
 from tradingagents.dataflows.trade_calendar import is_cn_trading_day
 
 
@@ -315,9 +316,9 @@ def _resolve_target_data_date(today: date) -> date:
 
 def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -> date | None:
     table_mapping = {
-        "daily_kline": ("stock_daily_kline", "trade_date"),
+        "daily_kline": (preferred_daily_kline_table(), "trade_date"),
         "index_data": ("index_daily_data", "trade_date"),
-        "minute_kline": ("stock_minute_kline", "trade_time"),
+        "minute_kline": (preferred_minute_kline_table(), "trade_time"),
         "index_minute_kline": ("index_minute_kline", "trade_time"),
     }
     table_info = table_mapping.get(data_type)

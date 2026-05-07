@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone, time as dtime
 
@@ -179,14 +180,15 @@ def _resolve_capture_symbols(db, user_id: str, configured_symbols: list[str], *,
         _add_many([str(item.get("symbol") or "") for item in (overview.get("positions") or [])])
     except Exception as exc:
         logger.warning("[qmt-minute-subscription] load qmt positions failed user=%s account=%s error=%s", user_id, account_key, exc)
-    return symbols[:200]
+    return symbols
 
 
 def _capture_scope_key(symbols: list[str]) -> str:
     normalized = sorted({_normalize_symbol(item) for item in symbols if _normalize_symbol(item)})
     if not normalized:
         return _CAPTURE_SCOPE_PREFIX + "auto"
-    return _CAPTURE_SCOPE_PREFIX + ",".join(normalized[:200])
+    digest = hashlib.sha1(",".join(normalized).encode("utf-8")).hexdigest()[:12]
+    return f"{_CAPTURE_SCOPE_PREFIX}count={len(normalized)}:{digest}"
 
 
 def _touch_intraday_watermark(

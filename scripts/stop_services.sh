@@ -7,10 +7,15 @@ FRONTEND_PORT="${FRONTEND_PORT:-5174}"
 
 cd "$ROOT"
 
+pid_is_running() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
 for pidfile in .runtime/backend.pid .runtime/frontend.pid .runtime/scheduler.pid; do
   if [[ -f "$pidfile" ]]; then
-    pid="$(cat "$pidfile")"
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    pid="$(tr -d '[:space:]' < "$pidfile")"
+    if pid_is_running "$pid"; then
       kill "$pid" || true
     fi
     rm -f "$pidfile"

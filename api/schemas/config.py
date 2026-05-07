@@ -23,9 +23,13 @@ class UserRuntimeConfigResponse(BaseModel):
     deep_think_llm: str
     quick_think_llm: str
     backend_url: str
+    news_llm_provider: str = ""
+    news_backend_url: str = ""
+    news_analysis_llm: str = ""
     max_debate_rounds: int
     max_risk_discuss_rounds: int
     has_api_key: bool = False
+    has_news_api_key: bool = False
     has_wecom_webhook: bool = False
     wecom_webhook_display: Optional[str] = None
     server_fallback_enabled: bool = True
@@ -41,13 +45,18 @@ class UserRuntimeConfigUpdateRequest(BaseModel):
     deep_think_llm: Optional[str] = None
     quick_think_llm: Optional[str] = None
     backend_url: Optional[str] = None
+    news_llm_provider: Optional[str] = None
+    news_backend_url: Optional[str] = None
+    news_analysis_llm: Optional[str] = None
     max_debate_rounds: Optional[int] = None
     max_risk_discuss_rounds: Optional[int] = None
     email_report_enabled: Optional[bool] = None
     wecom_report_enabled: Optional[bool] = None
     api_key: Optional[str] = None
+    news_api_key: Optional[str] = None
     wecom_webhook_url: Optional[str] = None
     clear_api_key: bool = False
+    clear_news_api_key: bool = False
     clear_wecom_webhook: bool = False
     warmup: bool = True
     force_warmup: bool = False

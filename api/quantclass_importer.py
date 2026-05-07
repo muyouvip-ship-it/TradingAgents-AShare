@@ -2,9 +2,9 @@
 量化课堂数据导入到数据库
 """
 import pandas as pd
-from sqlalchemy import text
 import logging
-from datetime import datetime
+
+from api.services.market_data_pipeline_service import ingest_raw_daily_rows, reconcile_daily_trade_dates
 
 logger = logging.getLogger(__name__)
 
@@ -35,141 +35,58 @@ def import_stock_daily_from_quantclass(db_session, csv_file_path: str) -> dict:
         
         logger.info(f"读取到 {len(df)} 行数据，{df['股票代码'].nunique()} 只股票")
         
-        # 数据清洗
-        records_imported = 0
+        # 数据清洗后写入 raw/norm/pub 增量治理链路；不再回写旧的 stock_daily_kline。
+        records = []
         errors = []
         
         for idx, row in df.iterrows():
             try:
-                # 处理股票代码（去掉市场前缀）
-                symbol = row['股票代码']
-                if symbol.startswith('bj'):
-                    # 北交所股票，保留原代码
-                    pass
-                elif symbol.startswith(('sh', 'sz')):
-                    # 沪深股票，去掉前缀
-                    symbol = symbol[2:]
+                symbol = _normalize_quantclass_symbol(row['股票代码'])
                 
                 # 处理日期
                 trade_date = pd.to_datetime(row['交易日期']).date()
                 
-                # 插入数据库（包含Pro版本所有字段）
-                insert_query = text("""
-                    INSERT INTO stock_daily_kline 
-                    (symbol, trade_date, open, high, low, close, volume, amount,
-                     pre_close, float_market_cap, total_market_cap,
-                     net_profit_ttm, cash_flow_ttm, net_assets, total_assets, total_liabilities,
-                     net_profit_quarter, medium_buy, medium_sell, large_buy, large_sell,
-                     retail_buy, retail_sell, institution_buy, institution_sell,
-                     is_hs300, is_sz50, is_zz500, is_zz1000, is_zz2000, is_cyb,
-                     sw_industry_l1, sw_industry_l2, sw_industry_l3,
-                     close_0935, close_0945, close_0955)
-                    VALUES (
-                        :symbol, :trade_date, :open, :high, :low, :close, :volume, :amount,
-                        :pre_close, :float_market_cap, :total_market_cap,
-                        :net_profit_ttm, :cash_flow_ttm, :net_assets, :total_assets, :total_liabilities,
-                        :net_profit_quarter, :medium_buy, :medium_sell, :large_buy, :large_sell,
-                        :retail_buy, :retail_sell, :institution_buy, :institution_sell,
-                        :is_hs300, :is_sz50, :is_zz500, :is_zz1000, :is_zz2000, :is_cyb,
-                        :sw_industry_l1, :sw_industry_l2, :sw_industry_l3,
-                        :close_0935, :close_0945, :close_0955
-                    )
-                    ON CONFLICT (symbol, trade_date) DO UPDATE SET
-                        open = EXCLUDED.open,
-                        high = EXCLUDED.high,
-                        low = EXCLUDED.low,
-                        close = EXCLUDED.close,
-                        volume = EXCLUDED.volume,
-                        amount = EXCLUDED.amount,
-                        pre_close = EXCLUDED.pre_close,
-                        float_market_cap = EXCLUDED.float_market_cap,
-                        total_market_cap = EXCLUDED.total_market_cap,
-                        net_profit_ttm = EXCLUDED.net_profit_ttm,
-                        cash_flow_ttm = EXCLUDED.cash_flow_ttm,
-                        net_assets = EXCLUDED.net_assets,
-                        total_assets = EXCLUDED.total_assets,
-                        total_liabilities = EXCLUDED.total_liabilities,
-                        net_profit_quarter = EXCLUDED.net_profit_quarter,
-                        medium_buy = EXCLUDED.medium_buy,
-                        medium_sell = EXCLUDED.medium_sell,
-                        large_buy = EXCLUDED.large_buy,
-                        large_sell = EXCLUDED.large_sell,
-                        retail_buy = EXCLUDED.retail_buy,
-                        retail_sell = EXCLUDED.retail_sell,
-                        institution_buy = EXCLUDED.institution_buy,
-                        institution_sell = EXCLUDED.institution_sell,
-                        is_hs300 = EXCLUDED.is_hs300,
-                        is_sz50 = EXCLUDED.is_sz50,
-                        is_zz500 = EXCLUDED.is_zz500,
-                        is_zz1000 = EXCLUDED.is_zz1000,
-                        is_zz2000 = EXCLUDED.is_zz2000,
-                        is_cyb = EXCLUDED.is_cyb,
-                        sw_industry_l1 = EXCLUDED.sw_industry_l1,
-                        sw_industry_l2 = EXCLUDED.sw_industry_l2,
-                        sw_industry_l3 = EXCLUDED.sw_industry_l3,
-                        close_0935 = EXCLUDED.close_0935,
-                        close_0945 = EXCLUDED.close_0945,
-                        close_0955 = EXCLUDED.close_0955,
-                        updated_at = NOW()
-                """)
-                
-                # 准备数据
-                data = {
+                records.append({
                     "symbol": symbol,
                     "trade_date": trade_date,
-                    "open": float(row['开盘价']) if pd.notna(row.get('开盘价')) else None,
-                    "high": float(row['最高价']) if pd.notna(row.get('最高价')) else None,
-                    "low": float(row['最低价']) if pd.notna(row.get('最低价')) else None,
-                    "close": float(row['收盘价']) if pd.notna(row.get('收盘价')) else None,
-                    "volume": int(row['成交量']) if pd.notna(row.get('成交量')) else None,
-                    "amount": float(row['成交额']) if pd.notna(row.get('成交额')) else None,
-                    # Pro版本额外字段
-                    "pre_close": float(row['前收盘价']) if pd.notna(row.get('前收盘价')) else None,
-                    "float_market_cap": float(row['流通市值']) if pd.notna(row.get('流通市值')) else None,
-                    "total_market_cap": float(row['总市值']) if pd.notna(row.get('总市值')) else None,
-                    "net_profit_ttm": float(row['净利润TTM']) if pd.notna(row.get('净利润TTM')) else None,
-                    "cash_flow_ttm": float(row['现金流TTM']) if pd.notna(row.get('现金流TTM')) else None,
-                    "net_assets": float(row['净资产']) if pd.notna(row.get('净资产')) else None,
-                    "total_assets": float(row['总资产']) if pd.notna(row.get('总资产')) else None,
-                    "total_liabilities": float(row['总负债']) if pd.notna(row.get('总负债')) else None,
-                    "net_profit_quarter": float(row['净利润(当季)']) if pd.notna(row.get('净利润(当季)')) else None,
-                    "medium_buy": float(row['中户资金买入额']) if pd.notna(row.get('中户资金买入额')) else None,
-                    "medium_sell": float(row['中户资金卖出额']) if pd.notna(row.get('中户资金卖出额')) else None,
-                    "large_buy": float(row['大户资金买入额']) if pd.notna(row.get('大户资金买入额')) else None,
-                    "large_sell": float(row['大户资金卖出额']) if pd.notna(row.get('大户资金卖出额')) else None,
-                    "retail_buy": float(row['散户资金买入额']) if pd.notna(row.get('散户资金买入额')) else None,
-                    "retail_sell": float(row['散户资金卖出额']) if pd.notna(row.get('散户资金卖出额')) else None,
-                    "institution_buy": float(row['机构资金买入额']) if pd.notna(row.get('机构资金买入额')) else None,
-                    "institution_sell": float(row['机构资金卖出额']) if pd.notna(row.get('机构资金卖出额')) else None,
-                    "is_hs300": str(row['沪深300成分股']).strip() if pd.notna(row.get('沪深300成分股')) else None,
-                    "is_sz50": str(row['上证50成分股']).strip() if pd.notna(row.get('上证50成分股')) else None,
-                    "is_zz500": str(row['中证500成分股']).strip() if pd.notna(row.get('中证500成分股')) else None,
-                    "is_zz1000": str(row['中证1000成分股']).strip() if pd.notna(row.get('中证1000成分股')) else None,
-                    "is_zz2000": str(row['中证2000成分股']).strip() if pd.notna(row.get('中证2000成分股')) else None,
-                    "is_cyb": str(row['创业板指成分股']).strip() if pd.notna(row.get('创业板指成分股')) else None,
-                    "sw_industry_l1": str(row['新版申万一级行业名称']).strip() if pd.notna(row.get('新版申万一级行业名称')) else None,
-                    "sw_industry_l2": str(row['新版申万二级行业名称']).strip() if pd.notna(row.get('新版申万二级行业名称')) else None,
-                    "sw_industry_l3": str(row['新版申万三级行业名称']).strip() if pd.notna(row.get('新版申万三级行业名称')) else None,
-                    "close_0935": float(row['09:35收盘价']) if pd.notna(row.get('09:35收盘价')) else None,
-                    "close_0945": float(row['09:45收盘价']) if pd.notna(row.get('09:45收盘价')) else None,
-                    "close_0955": float(row['09:55收盘价']) if pd.notna(row.get('09:55收盘价')) else None,
-                }
-                
-                db_session.execute(insert_query, data)
-                
-                records_imported += 1
-                
-                # 每100条提交一次
-                if records_imported % 100 == 0:
-                    db_session.commit()
-                    logger.info(f"已导入 {records_imported} 条记录")
+                    "open": _safe_float(row.get('开盘价')),
+                    "high": _safe_float(row.get('最高价')),
+                    "low": _safe_float(row.get('最低价')),
+                    "close": _safe_float(row.get('收盘价')),
+                    "volume": _safe_float(row.get('成交量')),
+                    "amount": _safe_float(row.get('成交额')),
+                    "pre_close": _safe_float(row.get('前收盘价')),
+                    "float_market_cap": _safe_float(row.get('流通市值')),
+                    "total_market_cap": _safe_float(row.get('总市值')),
+                    "net_profit_ttm": _safe_float(row.get('净利润TTM')),
+                    "sw_industry_l1": _safe_text(row.get('新版申万一级行业名称')),
+                    "sw_industry_l2": _safe_text(row.get('新版申万二级行业名称')),
+                    "sw_industry_l3": _safe_text(row.get('新版申万三级行业名称')),
+                })
                     
             except Exception as e:
                 errors.append(f"行 {idx}: {str(e)}")
                 continue
         
-        # 最终提交
-        db_session.commit()
+        ingest_result = ingest_raw_daily_rows(source="quantclass", rows=records)
+        if not ingest_result.get("success"):
+            return {
+                'success': False,
+                'error': ingest_result.get("error", "量化课堂 raw 导入失败"),
+                'records_imported': 0,
+                'errors': errors[:10],
+            }
+
+        reconcile_result = reconcile_daily_trade_dates(trade_dates=ingest_result.get("trade_dates") or [])
+        if not reconcile_result.get("success"):
+            return {
+                'success': False,
+                'error': reconcile_result.get("error", "量化课堂发布层对账失败"),
+                'records_imported': int(ingest_result.get("rows") or 0),
+                'errors': errors[:10],
+            }
+
+        records_imported = int(ingest_result.get("rows") or 0)
         
         logger.info(f"导入完成: {records_imported} 条记录")
         
@@ -189,6 +106,32 @@ def import_stock_daily_from_quantclass(db_session, csv_file_path: str) -> dict:
             'error': str(e),
             'records_imported': 0
         }
+
+
+def _normalize_quantclass_symbol(value) -> str:
+    symbol = str(value or "").strip().upper()
+    for prefix in ("SH", "SZ", "BJ"):
+        if symbol.startswith(prefix) and symbol[2:].isdigit():
+            return f"{symbol[2:]}.{prefix}"
+    return symbol
+
+
+def _safe_float(value):
+    if pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_text(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return text
 
 
 # 测试脚本

@@ -526,6 +526,7 @@ class RealtimeApprovalDB(Base):
 
 
 Index("idx_realtime_events_monitor_created", RealtimeEventDB.monitor_id, RealtimeEventDB.created_at)
+Index("idx_realtime_events_user_monitor_created_id", RealtimeEventDB.user_id, RealtimeEventDB.monitor_id, RealtimeEventDB.created_at, RealtimeEventDB.id)
 Index("idx_realtime_approvals_user_status", RealtimeApprovalDB.user_id, RealtimeApprovalDB.status)
 
 

@@ -168,8 +168,9 @@ def reset_realtime_monitor_fuse(
 @router.get("/v1/realtime/monitors/{monitor_id}/events")
 def get_realtime_monitor_events(
     monitor_id: str,
-    limit: int = Query(default=200, ge=1, le=1000),
+    limit: int = Query(default=200, ge=1, le=50000),
     after_id: str | None = Query(default=None),
+    since_started: bool = Query(default=False),
     current_user=Depends(require_api_user),
     strategy_db: Session = Depends(get_strategy_db),
 ):
@@ -181,6 +182,7 @@ def get_realtime_monitor_events(
                 monitor_id,
                 limit=limit,
                 after_id=after_id,
+                since_started=since_started,
             )
         }
     except Exception as exc:
@@ -190,7 +192,8 @@ def get_realtime_monitor_events(
 @router.get("/v1/realtime/monitors/{monitor_id}/stream")
 async def stream_realtime_monitor(
     monitor_id: str,
-    initial_limit: int = Query(default=30, ge=0, le=200),
+    initial_limit: int = Query(default=200, ge=0, le=5000),
+    initial_since_started: bool = Query(default=False),
     current_user=Depends(require_api_user),
     strategy_db: Session = Depends(get_strategy_db),
 ):
@@ -204,6 +207,8 @@ async def stream_realtime_monitor(
 
     async def event_generator():
         last_event_id: str | None = None
+        seen_event_ids: set[str] = set()
+        event_queue = realtime_monitor_service.subscribe_event_queue(current_user.id, monitor_id)
         yield _pack(
             "ready",
             {
@@ -218,41 +223,62 @@ async def stream_realtime_monitor(
                 current_user.id,
                 monitor_id,
                 limit=initial_limit,
+                since_started=initial_since_started,
             )
             for item in initial_items:
                 last_event_id = item.get("id") or last_event_id
+                if item.get("id"):
+                    seen_event_ids.add(str(item["id"]))
                 yield _pack("event", {"initial": True, "item": item})
 
-        while True:
-            try:
-                fresh_items = realtime_monitor_service.list_events(
-                    strategy_db,
-                    current_user.id,
-                    monitor_id,
-                    limit=200,
-                    after_id=last_event_id,
-                )
-                if fresh_items:
+        try:
+            while True:
+                try:
+                    try:
+                        first_item = await asyncio.wait_for(event_queue.get(), timeout=15)
+                        fresh_items = [first_item]
+                        while len(fresh_items) < 200 and not event_queue.empty():
+                            fresh_items.append(event_queue.get_nowait())
+                    except asyncio.TimeoutError:
+                        fresh_items = realtime_monitor_service.list_events(
+                            strategy_db,
+                            current_user.id,
+                            monitor_id,
+                            limit=200,
+                            after_id=last_event_id,
+                        )
+
+                    emitted = False
                     for item in fresh_items:
+                        item_id = str(item.get("id") or "")
+                        if item_id and item_id in seen_event_ids:
+                            continue
+                        if item_id:
+                            seen_event_ids.add(item_id)
+                            if len(seen_event_ids) > 5000:
+                                seen_event_ids = set(list(seen_event_ids)[-2500:])
                         last_event_id = item.get("id") or last_event_id
+                        emitted = True
                         yield _pack("event", {"initial": False, "item": item})
-                    monitor_payload = realtime_monitor_service.get_monitor(strategy_db, current_user.id, monitor_id)
-                    yield _pack("state", {"monitor": monitor_payload})
-                else:
-                    yield ": ping\n\n"
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                yield _pack(
-                    "error",
-                    {
-                        "message": str(exc),
-                        "monitor_id": monitor_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-                await asyncio.sleep(1)
+                    if emitted:
+                        monitor_payload = realtime_monitor_service.get_monitor(strategy_db, current_user.id, monitor_id)
+                        yield _pack("state", {"monitor": monitor_payload})
+                    else:
+                        yield ": ping\n\n"
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    yield _pack(
+                        "error",
+                        {
+                            "message": str(exc),
+                            "monitor_id": monitor_id,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    await asyncio.sleep(1)
+        finally:
+            realtime_monitor_service.unsubscribe_event_queue(current_user.id, monitor_id, event_queue)
 
     return StreamingResponse(
         event_generator(),

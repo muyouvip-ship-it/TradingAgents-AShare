@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { Suspense, lazy, useState } from 'react'
 import { TrendingUp, TrendingDown, Target, Shield, ChevronDown, ChevronUp, Info } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import type { AnalysisReport } from '@/types'
 import { sanitizeReportMarkdown } from '@/utils/reportText'
+
+const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
 
 interface DecisionCardProps {
     symbol: string
@@ -151,9 +151,9 @@ export default function DecisionCard({
                         <div>
                             <span className="text-sm text-slate-500">核心逻辑</span>
                             <div className="mt-1 prose prose-sm dark:prose-invert max-w-none text-slate-700 dark:text-slate-300">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                    {sanitizeReportMarkdown(reasoning)}
-                                </ReactMarkdown>
+                                <Suspense fallback={<div>{sanitizeReportMarkdown(reasoning)}</div>}>
+                                    <MarkdownBlock content={sanitizeReportMarkdown(reasoning)} />
+                                </Suspense>
                             </div>
                         </div>
                     )}

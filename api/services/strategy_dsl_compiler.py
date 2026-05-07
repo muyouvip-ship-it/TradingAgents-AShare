@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from api.services.factor_registry import get_factor_catalog_definition
+from api.services.market_data_pipeline_service import preferred_minute_kline_table
 from api.services.strategy_dsl_schema import StrategyDslSchema
 
 
@@ -243,7 +244,7 @@ def compile_strategy_dsl(dsl: dict[str, Any]) -> CompiledStrategy:
     minute_requirements = {
         "enabled": bool(minute_timeframes),
         "timeframes": sorted(minute_timeframes),
-        "source_table": "stock_minute_kline" if minute_timeframes else None,
+        "source_table": preferred_minute_kline_table() if minute_timeframes else None,
         "fields": sorted([field for field in required_fields if field.startswith("minute_")]),
         "loading_mode": execution_rules["minute_loading"],
     }

@@ -255,97 +255,139 @@ def _safe(tool, payload: dict) -> Any:
         return f"{getattr(tool, 'name', str(tool))} 调用失败：{type(exc).__name__}: {exc}"
 
 
-def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
-    """Fetch all data sources in parallel.
-
-    Always fetches full data including financial statements, regardless of horizon.
-    The horizon only affects the analysis window, not data collection.
-    """
+def _fetch_all(ticker: str, trade_date: str, selected_analysts: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Fetch only the data sources required by the selected analysts."""
     lookback = LONG_DAYS
     end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     # 为了计算指标准确（如 200 SMA），需要比分析窗口更长的历史数据
     fetch_lookback = 365
     start_str = (end_dt - timedelta(days=fetch_lookback)).strftime("%Y-%m-%d")
+    requirements = _resolve_data_requirements(selected_analysts)
 
-    tasks: Dict[str, tuple] = {
-        "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": trade_date}),
-        "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date}),
-        "global_news": (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30}),
-        "fund_flow_board": (get_board_fund_flow, {}),
-        "fund_flow_individual": (get_individual_fund_flow, {"symbol": ticker}),
-        "lhb": (get_lhb_detail, {"symbol": ticker, "date": trade_date}),
-        "insider_transactions": (get_insider_transactions, {"ticker": ticker}),
-        "zt_pool": (get_zt_pool, {"date": trade_date}),
-        "hot_stocks": (get_hot_stocks_xq, {}),
-    }
-
-    # 财务报表类数据始终拉取，Research Manager 根据 horizon 自行判断权重
-    tasks.update({
-        "fundamentals": (get_fundamentals, {"ticker": ticker, "curr_date": trade_date}),
-        "balance_sheet": (get_balance_sheet, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
-        "cashflow": (get_cashflow, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
-        "income_statement": (get_income_statement, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
-    })
+    tasks: Dict[str, tuple] = {}
+    if "stock_data" in requirements:
+        tasks["stock_data"] = (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": trade_date})
+    if "news" in requirements:
+        tasks["news"] = (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date})
+    if "global_news" in requirements:
+        tasks["global_news"] = (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30})
+    if "fund_flow_board" in requirements:
+        tasks["fund_flow_board"] = (get_board_fund_flow, {})
+    if "fund_flow_individual" in requirements:
+        tasks["fund_flow_individual"] = (get_individual_fund_flow, {"symbol": ticker})
+    if "lhb" in requirements:
+        tasks["lhb"] = (get_lhb_detail, {"symbol": ticker, "date": trade_date})
+    if "insider_transactions" in requirements:
+        tasks["insider_transactions"] = (get_insider_transactions, {"ticker": ticker})
+    if "zt_pool" in requirements:
+        tasks["zt_pool"] = (get_zt_pool, {"date": trade_date})
+    if "hot_stocks" in requirements:
+        tasks["hot_stocks"] = (get_hot_stocks_xq, {})
+    if "fundamentals" in requirements:
+        tasks.update({
+            "fundamentals": (get_fundamentals, {"ticker": ticker, "curr_date": trade_date}),
+            "balance_sheet": (get_balance_sheet, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
+            "cashflow": (get_cashflow, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
+            "income_statement": (get_income_statement, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
+        })
 
     results: Dict[str, Any] = {}
     fetch_start = time.time()
     # 减少并发池大小，避免被反爬
-    with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as executor:
-        future_to_key = {executor.submit(_safe, tool, payload): key for key, (tool, payload) in tasks.items()}
-        for future in future_to_key:
-            results[future_to_key[future]] = future.result()
+    if tasks:
+        with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as executor:
+            future_to_key = {executor.submit(_safe, tool, payload): key for key, (tool, payload) in tasks.items()}
+            for future in future_to_key:
+                results[future_to_key[future]] = future.result()
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
 
     # ── 核心加速：本地计算所有技术指标 ──────────────────
-    indicators_res = {}
-    try:
-        if df is not None and "close" in df.columns:
-            ss = wrap(df.copy())
+    if "indicators" in requirements:
+        indicators_res = {}
+        try:
+            if df is not None and "close" in df.columns:
+                ss = wrap(df.copy())
 
-            calc_map = {
-                "close_50_sma": "close_50_sma",
-                "close_200_sma": "close_200_sma",
-                "close_10_ema": "close_10_ema",
-                "rsi": "rsi_14",
-                "macd": "macd",
-                "boll": "close_20_sma",
-                "boll_ub": "boll_ub",
-                "boll_lb": "boll_lb",
-                "atr": "atr",
-                "vwma": "vwma"
-            }
+                calc_map = {
+                    "close_50_sma": "close_50_sma",
+                    "close_200_sma": "close_200_sma",
+                    "close_10_ema": "close_10_ema",
+                    "rsi": "rsi_14",
+                    "macd": "macd",
+                    "boll": "close_20_sma",
+                    "boll_ub": "boll_ub",
+                    "boll_lb": "boll_lb",
+                    "atr": "atr",
+                    "vwma": "vwma"
+                }
 
-            for key, ss_key in calc_map.items():
-                try:
-                    val = ss[ss_key].iloc[-1]
-                    indicators_res[key] = round(float(val), 2) if isinstance(val, (int, float)) else str(val)
-                except Exception:
-                    indicators_res[key] = "N/A"
-        else:
-            print(f"  [Warning] No valid stock_data for indicator calculation.")
-    except Exception as e:
-        print(f"  [Error] Local indicator calculation failed: {e}")
+                for key, ss_key in calc_map.items():
+                    try:
+                        val = ss[ss_key].iloc[-1]
+                        indicators_res[key] = round(float(val), 2) if isinstance(val, (int, float)) else str(val)
+                    except Exception:
+                        indicators_res[key] = "N/A"
+            else:
+                print(f"  [Warning] No valid stock_data for indicator calculation.")
+        except Exception as e:
+            print(f"  [Error] Local indicator calculation failed: {e}")
 
-    for ind in INDICATORS:
-        if ind not in indicators_res:
-            indicators_res[ind] = "无数据"
+        for ind in INDICATORS:
+            if ind not in indicators_res:
+                indicators_res[ind] = "无数据"
 
-    results["indicators"] = indicators_res
+        results["indicators"] = indicators_res
 
     # ── VPA 预计算指标 ──────────────────────────────
-    try:
-        if df is not None:
-            results["vpa_indicators"] = _compute_vpa_indicators(df.copy())
-        else:
-            results["vpa_indicators"] = "VPA 数据不足"
-    except Exception as e:
-        results["vpa_indicators"] = f"VPA 计算失败：{e}"
+    if "vpa_indicators" in requirements:
+        try:
+            if df is not None:
+                results["vpa_indicators"] = _compute_vpa_indicators(df.copy())
+            else:
+                results["vpa_indicators"] = "VPA 数据不足"
+        except Exception as e:
+            results["vpa_indicators"] = f"VPA 计算失败：{e}"
 
     print(f"[Timer] Total Data Collection for {ticker} took {time.time() - fetch_start:.2f}s")
     return results
+
+
+def _resolve_data_requirements(selected_analysts: Optional[List[str]]) -> set[str]:
+    if not selected_analysts:
+        return {
+            "stock_data",
+            "indicators",
+            "vpa_indicators",
+            "news",
+            "global_news",
+            "fund_flow_board",
+            "fund_flow_individual",
+            "lhb",
+            "insider_transactions",
+            "zt_pool",
+            "hot_stocks",
+            "fundamentals",
+        }
+    analysts = {str(item).strip().lower() for item in selected_analysts if str(item).strip()}
+    requirements: set[str] = set()
+    if analysts & {"market", "volume_price", "smart_money"}:
+        requirements.update({"stock_data", "indicators"})
+    if "volume_price" in analysts:
+        requirements.add("vpa_indicators")
+    if "news" in analysts:
+        requirements.update({"news", "global_news"})
+    if "social" in analysts:
+        requirements.update({"news", "zt_pool", "hot_stocks"})
+    if "macro" in analysts:
+        requirements.update({"news", "fund_flow_board"})
+    if "smart_money" in analysts:
+        requirements.update({"fund_flow_individual", "lhb"})
+    if "fundamentals" in analysts:
+        requirements.add("fundamentals")
+    return requirements
 
 
 class DataCollector:
@@ -363,17 +405,24 @@ class DataCollector:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
 
-    def collect(self, ticker: str, trade_date: str, horizons: Optional[List[str]] = None) -> Dict[str, Any]:
+    def collect(
+        self,
+        ticker: str,
+        trade_date: str,
+        horizons: Optional[List[str]] = None,
+        selected_analysts: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Fetch all data and store in cache.
 
         Thread-safe: concurrent calls for the same ticker+date will block
         on a per-key lock, so data is fetched only once.
         """
+        del horizons
         key = make_cache_key(ticker, trade_date)
         key_lock = self._get_key_lock(key)
         with key_lock:
             if key not in self._cache:
-                self._cache[key] = _fetch_all(ticker, trade_date)
+                self._cache[key] = _fetch_all(ticker, trade_date, selected_analysts=selected_analysts)
         return self._cache[key]
 
     def get(self, ticker: str, trade_date: str) -> Optional[Dict[str, Any]]:

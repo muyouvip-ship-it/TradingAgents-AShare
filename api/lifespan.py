@@ -9,13 +9,17 @@ from api.core.strategy_db import strategy_engine
 from api.database import init_db
 from api.job_store import get_job_store
 from api.models.strategy_models import Base
-from api.services import backtest_data_auto_update_service, news_eye_service, qmt_market_sync_service, qmt_sync_scheduler_service, realtime_monitor_service
+from api.services import backtest_data_auto_update_service, daily_review_service, news_eye_service, qmt_market_sync_service, qmt_sync_scheduler_service, realtime_monitor_service
 
 
 def _log(msg: str):
     from api.core.logging import logger
 
     logger.info(msg)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @asynccontextmanager
@@ -29,7 +33,11 @@ async def lifespan(app):
     _log("Strategy management database initialized.")
 
     store = get_job_store()
-    store.clear()
+    if _env_flag("CLEAR_JOB_STORE_ON_STARTUP", "0"):
+        store.clear()
+        _log("Job store cleared on startup.")
+    else:
+        _log("Job store preserved on startup.")
 
     if not os.getenv("TA_APP_SECRET_KEY"):
         _log("=" * 70)
@@ -39,30 +47,66 @@ async def lifespan(app):
         _log("=" * 70)
 
     from tradingagents.dataflows.trade_calendar import _load_cn_trade_dates
-    from api.core.stock_map import load_cn_stock_map
+    from api.core.stock_map import load_cn_stock_map, refresh_cn_stock_map_if_stale
 
     _load_cn_trade_dates()
     _log("Trade calendar pre-loaded.")
-    await asyncio.to_thread(load_cn_stock_map)
-    _log("Stock map pre-loaded on startup.")
-    await qmt_sync_scheduler_service.start_background_worker()
-    _log("QMT sync background worker started.")
-    await qmt_market_sync_service.start_background_worker()
-    _log("QMT market sync worker started.")
-    await backtest_data_auto_update_service.start_background_worker()
-    _log("Backtest data auto update worker started.")
-    await news_eye_service.start_background_worker()
-    _log("News eye background worker started.")
-    await realtime_monitor_service.start_background_worker()
-    _log("Realtime monitor background worker started.")
+    load_cn_stock_map()
+    _log("Stock map pre-loaded from local cache/fallback.")
+    asyncio.create_task(asyncio.to_thread(refresh_cn_stock_map_if_stale), name="stock-map-refresh")
+    qmt_sync_enabled = _env_flag("ENABLE_QMT_SYNC_WORKER", "0")
+    qmt_market_enabled = _env_flag("ENABLE_QMT_MARKET_SYNC_WORKER", "0")
+    backtest_auto_enabled = _env_flag("ENABLE_BACKTEST_AUTO_UPDATE_WORKER", "0")
+    news_eye_enabled = _env_flag("ENABLE_NEWS_EYE_WORKER", "1")
+    realtime_monitor_enabled = _env_flag("ENABLE_REALTIME_MONITOR_WORKER", "0")
+    daily_review_enabled = _env_flag("ENABLE_DAILY_REVIEW_WORKER", "1")
+
+    if qmt_sync_enabled:
+        await qmt_sync_scheduler_service.start_background_worker()
+        _log("QMT sync background worker started.")
+    else:
+        _log("QMT sync background worker skipped.")
+    if qmt_market_enabled:
+        await qmt_market_sync_service.start_background_worker()
+        _log("QMT market sync worker started.")
+    else:
+        _log("QMT market sync worker skipped.")
+    if backtest_auto_enabled:
+        await backtest_data_auto_update_service.start_background_worker()
+        _log("Backtest data auto update worker started.")
+    else:
+        _log("Backtest data auto update worker skipped.")
+    if news_eye_enabled:
+        await news_eye_service.start_background_worker()
+        _log("News eye background worker started.")
+    else:
+        _log("News eye background worker skipped.")
+    if realtime_monitor_enabled:
+        await realtime_monitor_service.start_background_worker()
+        _log("Realtime monitor background worker started.")
+    else:
+        _log("Realtime monitor background worker skipped.")
+    if daily_review_enabled:
+        await daily_review_service.start_background_worker()
+        _log("Daily review background worker started.")
+    else:
+        _log("Daily review background worker skipped.")
     yield
-    await realtime_monitor_service.stop_background_worker()
-    _log("Realtime monitor background worker stopped.")
-    await news_eye_service.stop_background_worker()
-    _log("News eye background worker stopped.")
-    await qmt_market_sync_service.stop_background_worker()
-    _log("QMT market sync worker stopped.")
-    await backtest_data_auto_update_service.stop_background_worker()
-    _log("Backtest data auto update worker stopped.")
-    await qmt_sync_scheduler_service.stop_background_worker()
+    if daily_review_enabled:
+        await daily_review_service.stop_background_worker()
+        _log("Daily review background worker stopped.")
+    if realtime_monitor_enabled:
+        await realtime_monitor_service.stop_background_worker()
+        _log("Realtime monitor background worker stopped.")
+    if news_eye_enabled:
+        await news_eye_service.stop_background_worker()
+        _log("News eye background worker stopped.")
+    if qmt_market_enabled:
+        await qmt_market_sync_service.stop_background_worker()
+        _log("QMT market sync worker stopped.")
+    if backtest_auto_enabled:
+        await backtest_data_auto_update_service.stop_background_worker()
+        _log("Backtest data auto update worker stopped.")
+    if qmt_sync_enabled:
+        await qmt_sync_scheduler_service.stop_background_worker()
     _log("Shutting down: Cleaning up resources...")

@@ -6,11 +6,17 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
-from sqlalchemy import inspect, text
+from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.orm import Session
 
 from api.core.settings import settings
 from api.database import SessionLocal, engine
+from api.services.market_data_pipeline_service import (
+    ingest_raw_minute_rows,
+    preferred_daily_kline_table,
+    preferred_minute_kline_table,
+    publish_minute_trade_date,
+)
 from api.services import qmt_virtual_account_service
 from tradingagents.dataflows.trade_calendar import CN_TZ, _load_cn_trade_dates
 
@@ -67,14 +73,17 @@ def fetch_realtime_quotes(
     symbols: list[str],
     *,
     account_key: str | None = None,
+    timeout_seconds: float | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     normalized = _normalize_symbols(symbols)
     if not normalized:
         return {}
-    config = _resolve_market_config(account_key)
+    config = _resolve_market_config(account_key, db=db, user_id=user_id)
     try:
         if config.bridge_base_url:
-            return _fetch_quotes_via_bridge(config, normalized)
+            return _fetch_quotes_via_bridge(config, normalized, timeout_seconds=timeout_seconds)
         return _fetch_quotes_via_local_xt(normalized)
     except Exception as exc:
         logger.warning("[qmt-market] quote fetch failed symbols=%s error=%s", len(normalized), exc)
@@ -88,31 +97,59 @@ def fetch_intraday_bars(
     period: str = "1m",
     include_latest_quote: bool = False,
     account_key: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
     persist: bool = True,
+    quote_timeout_seconds: float | None = None,
+    force_refresh: bool = False,
+    allow_cache: bool = True,
 ) -> dict[str, Any]:
     normalized = normalize_market_symbol(symbol)
     if not normalized:
         raise ValueError("symbol is required")
     table_name = _minute_table_name(normalized)
-    cached_rows = _load_intraday_rows_from_db(table_name, normalized, trade_date)
-    source_rows = _fetch_intraday_rows_safe(
-        [normalized],
-        trade_date=trade_date,
-        period=period,
-        account_key=account_key,
-    )
+    cached_rows = [] if force_refresh or not allow_cache else _load_intraday_rows_from_db(table_name, normalized, trade_date)
+    source_rows = []
+    if force_refresh or not cached_rows:
+        source_rows = _fetch_intraday_rows_safe(
+            [normalized],
+            trade_date=trade_date,
+            period=period,
+            account_key=account_key,
+            db=db,
+            user_id=user_id,
+        )
     if source_rows and persist:
         _upsert_intraday_rows(table_name, source_rows)
-        cached_rows = _load_intraday_rows_from_db(table_name, normalized, trade_date)
-    items = cached_rows or source_rows
-    latest_quote = fetch_realtime_quotes([normalized], account_key=account_key).get(normalized) if include_latest_quote else None
+        if allow_cache and not force_refresh:
+            cached_rows = _load_intraday_rows_from_db(table_name, normalized, trade_date)
+    items = source_rows if force_refresh or not allow_cache else (cached_rows or source_rows)
+    if cached_rows and source_rows and not force_refresh and allow_cache:
+        source_label = "qmt_intraday+published_cache"
+    elif cached_rows:
+        source_label = "postgresql_cache"
+    elif source_rows:
+        source_label = "qmt_intraday"
+    else:
+        source_label = "empty"
+    latest_quote = (
+        fetch_realtime_quotes(
+            [normalized],
+            account_key=account_key,
+            timeout_seconds=quote_timeout_seconds,
+            db=db,
+            user_id=user_id,
+        ).get(normalized)
+        if include_latest_quote
+        else None
+    )
     return {
         "symbol": normalized,
         "trade_date": trade_date,
         "period": period,
         "items": items,
         "latest_quote": latest_quote,
-        "source": "qmt_intraday+postgresql_cache" if items else "empty",
+        "source": source_label,
     }
 
 
@@ -122,6 +159,8 @@ def capture_intraday_symbols(
     trade_date: str,
     period: str = "1m",
     account_key: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     normalized = _normalize_symbols(symbols)
     if not normalized:
@@ -131,6 +170,8 @@ def capture_intraday_symbols(
         trade_date=trade_date,
         period=period,
         account_key=account_key,
+        db=db,
+        user_id=user_id,
     )
     rows = _normalize_intraday_payload(payload)
     symbol_errors = dict(payload.get("symbol_errors") or {})
@@ -151,6 +192,8 @@ def capture_intraday_symbols(
             trade_date=trade_date,
             period=period,
             account_key=account_key,
+            db=db,
+            user_id=user_id,
         )
         retry_items = _normalize_intraday_payload(retry_payload)
         if retry_items:
@@ -181,10 +224,14 @@ def capture_intraday_symbols(
     }
     missing_symbols = [symbol for symbol in normalized if symbol not in captured_symbols]
     symbol_rows: dict[str, int] = {symbol: 0 for symbol in normalized}
+    symbol_latest_trade_times: dict[str, str] = {}
     for item in rows:
         symbol = normalize_market_symbol(item.get("symbol"))
         if symbol:
             symbol_rows[symbol] = symbol_rows.get(symbol, 0) + 1
+            trade_time = str(item.get("trade_time") or "")
+            if trade_time and trade_time > symbol_latest_trade_times.get(symbol, ""):
+                symbol_latest_trade_times[symbol] = trade_time
 
     if not rows:
         return {
@@ -194,6 +241,7 @@ def capture_intraday_symbols(
             "captured_symbols": [],
             "missing_symbols": normalized,
             "symbol_rows": symbol_rows,
+            "symbol_latest_trade_times": symbol_latest_trade_times,
             "symbol_errors": symbol_errors,
             "trade_date": trade_date,
             "period": period,
@@ -213,6 +261,7 @@ def capture_intraday_symbols(
         "captured_symbols": sorted(captured_symbols),
         "missing_symbols": missing_symbols,
         "symbol_rows": symbol_rows,
+        "symbol_latest_trade_times": symbol_latest_trade_times,
         "symbol_errors": symbol_errors,
         "partial": bool(missing_symbols),
         "trade_date": trade_date,
@@ -281,7 +330,14 @@ def sync_index_minute_history(
     data_source: str | None = None,
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
-    resolved_account_key = str(account_key or os.getenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY") or settings.qmt_minute_history_account_key or "live_real").strip() or "live_real"
+    resolved_account_key = str(
+        account_key
+        or os.getenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY")
+        or os.getenv("QMT_HISTORY_ACCOUNT_KEY")
+        or getattr(settings, "qmt_minute_history_account_key", None)
+        or getattr(settings, "qmt_history_account_key", None)
+        or "paper_sim"
+    ).strip() or "paper_sim"
     normalized_symbols = _normalize_index_symbols(symbols)
     if not normalized_symbols:
         normalized_symbols = [item["symbol"] for item in MAJOR_INDEX_PRESETS]
@@ -384,9 +440,11 @@ def build_market_integrity_report(
     target_date: str | None = None,
 ) -> dict[str, Any]:
     report_date = _parse_trade_date(target_date) if target_date else datetime.now(CN_TZ).date()
+    daily_table = preferred_daily_kline_table()
+    minute_table = preferred_minute_kline_table()
     tables = {
-        "stock_daily_kline": _table_integrity_snapshot(db, "stock_daily_kline", "trade_date", expected_symbols=None, target_date=report_date),
-        "stock_minute_kline": _table_integrity_snapshot(db, "stock_minute_kline", "trade_time", expected_symbols=None, target_date=report_date),
+        daily_table: _table_integrity_snapshot(db, daily_table, "trade_date", expected_symbols=None, target_date=report_date),
+        minute_table: _table_integrity_snapshot(db, minute_table, "trade_time", expected_symbols=None, target_date=report_date),
         "index_daily_kline": _table_integrity_snapshot(
             db,
             "index_daily_kline",
@@ -409,9 +467,14 @@ def build_market_integrity_report(
     }
 
 
-def _resolve_market_config(account_key: str | None) -> qmt_virtual_account_service.QmtRuntimeConfig:
+def _resolve_market_config(
+    account_key: str | None,
+    *,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> qmt_virtual_account_service.QmtRuntimeConfig:
     preferred_key = str(account_key or settings.qmt_history_account_key or "").strip() or None
-    return qmt_virtual_account_service._resolve_runtime_config(preferred_key)
+    return qmt_virtual_account_service._resolve_runtime_config(preferred_key, db=db, user_id=user_id)
 
 
 def _sync_index_minute_history_via_akshare(
@@ -519,8 +582,10 @@ def _fetch_intraday_payload_safe(
     trade_date: str,
     period: str,
     account_key: str | None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
-    config = _resolve_market_config(account_key)
+    config = _resolve_market_config(account_key, db=db, user_id=user_id)
     try:
         if config.bridge_base_url:
             payload = _bridge_post(
@@ -633,9 +698,11 @@ def _resolve_trade_dates(start: date, end: date) -> list[date]:
 def _fetch_quotes_via_bridge(
     config: qmt_virtual_account_service.QmtRuntimeConfig,
     symbols: list[str],
+    *,
+    timeout_seconds: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     try:
-        payload = _bridge_post(config, "/market/quotes", {"symbols": symbols})
+        payload = _bridge_post(config, "/market/quotes", {"symbols": symbols}, timeout_seconds=timeout_seconds)
         return _normalize_quote_payload(payload)
     except requests.HTTPError as exc:
         response = getattr(exc, "response", None)
@@ -665,12 +732,16 @@ def _fetch_intraday_rows_safe(
     trade_date: str,
     period: str,
     account_key: str | None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     payload = _fetch_intraday_payload_safe(
         symbols,
         trade_date=trade_date,
         period=period,
         account_key=account_key,
+        db=db,
+        user_id=user_id,
     )
     return _normalize_intraday_payload(payload)
 
@@ -774,6 +845,8 @@ def _bridge_post(
     config: qmt_virtual_account_service.QmtRuntimeConfig,
     path: str,
     body: dict[str, Any],
+    *,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     base_url = str(config.bridge_base_url or "").rstrip("/")
     if not base_url:
@@ -781,7 +854,12 @@ def _bridge_post(
     headers = {"Content-Type": "application/json"}
     if config.bridge_token:
         headers["Authorization"] = f"Bearer {config.bridge_token}"
-    response = requests.post(f"{base_url}{path}", json=body, headers=headers, timeout=30)
+    response = requests.post(
+        f"{base_url}{path}",
+        json=body,
+        headers=headers,
+        timeout=timeout_seconds or 30,
+    )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -977,29 +1055,32 @@ def _extract_history_items(symbol: str, payload: Any) -> list[dict[str, Any]]:
 
 
 def _minute_table_name(symbol: str) -> str:
-    return "index_minute_kline" if is_index_symbol(symbol) else "stock_minute_kline"
+    return "index_minute_kline" if is_index_symbol(symbol) else preferred_minute_kline_table()
 
 
 def _load_intraday_rows_from_db(table_name: str, symbol: str, trade_date: str) -> list[dict[str, Any]]:
     if not _has_table(table_name):
         return []
+    symbols = _symbol_query_variants(symbol)
     with SessionLocal() as db:
         rows = db.execute(
             text(
                 f"""
                 SELECT symbol, trade_time, open, high, low, close, volume, amount
                 FROM {table_name}
-                WHERE symbol = :symbol
+                WHERE symbol IN :symbols
                   AND DATE(trade_time) = :trade_date
                 ORDER BY trade_time ASC
                 """
-            ),
-            {"symbol": symbol, "trade_date": trade_date},
+            ).bindparams(bindparam("symbols", expanding=True)),
+            {"symbols": symbols, "trade_date": trade_date},
         ).mappings().all()
-    return [
-        {
-            "symbol": str(row["symbol"]),
-            "trade_time": _normalize_timestamp(row["trade_time"]),
+    deduped: dict[Any, dict[str, Any]] = {}
+    for row in rows:
+        trade_time = _normalize_timestamp(row["trade_time"])
+        record = {
+            "symbol": normalize_market_symbol(row["symbol"]),
+            "trade_time": trade_time,
             "open": _safe_float(row["open"]),
             "high": _safe_float(row["high"]),
             "low": _safe_float(row["low"]),
@@ -1007,8 +1088,21 @@ def _load_intraday_rows_from_db(table_name: str, symbol: str, trade_date: str) -
             "volume": int(row["volume"] or 0),
             "amount": _safe_float(row["amount"]) or 0.0,
         }
-        for row in rows
+        previous = deduped.get(trade_time)
+        if previous is None or record["symbol"] == normalize_market_symbol(symbol):
+            deduped[trade_time] = record
+    return [
+        deduped[key]
+        for key in sorted(deduped)
     ]
+
+
+def _symbol_query_variants(symbol: str) -> list[str]:
+    normalized = normalize_market_symbol(symbol)
+    variants = {normalized}
+    if "." in normalized:
+        variants.add(normalized.split(".", 1)[0])
+    return sorted(item for item in variants if item)
 
 
 def _load_daily_rows_from_db(symbol: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
@@ -1079,6 +1173,21 @@ def _upsert_intraday_rows(table_name: str, rows: list[dict[str, Any]]) -> int:
         payload.append(row)
     if not payload:
         return 0
+    stock_minute_target = table_name in {"stock_minute_kline", "pub_stock_minute_kline", "market_stock_minute_kline"}
+    if stock_minute_target and os.getenv("MARKET_DATA_WRITE_LEGACY_TABLES", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        try:
+            result = ingest_raw_minute_rows(source="qmt", rows=payload)
+            for trade_day in result.get("trade_dates") or []:
+                affected_symbols = sorted({str(item["symbol"]) for item in payload if item.get("symbol")})
+                publish_minute_trade_date(
+                    trade_date=trade_day,
+                    symbols=affected_symbols or None,
+                    minimum_coverage_ratio=0.0,
+                )
+        except Exception as exc:
+            logger.warning("[qmt-market] raw/published minute pipeline update failed rows=%s error=%s", len(payload), exc)
+            return 0
+        return len(payload)
     insert_columns = ["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"]
     if has_created_at:
         insert_columns.append("created_at")
@@ -1106,6 +1215,18 @@ def _upsert_intraday_rows(table_name: str, rows: list[dict[str, Any]]) -> int:
             ),
             payload,
         )
+    if table_name == "stock_minute_kline":
+        try:
+            result = ingest_raw_minute_rows(source="qmt", rows=payload)
+            for trade_day in result.get("trade_dates") or []:
+                affected_symbols = sorted({str(item["symbol"]) for item in payload if item.get("symbol")})
+                publish_minute_trade_date(
+                    trade_date=trade_day,
+                    symbols=affected_symbols or None,
+                    minimum_coverage_ratio=0.0,
+                )
+        except Exception as exc:
+            logger.warning("[qmt-market] raw/published minute pipeline update failed rows=%s error=%s", len(payload), exc)
     return len(payload)
 
 

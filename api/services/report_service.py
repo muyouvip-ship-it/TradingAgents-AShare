@@ -225,6 +225,19 @@ def get_reports_by_user(
     return query.order_by(ReportDB.created_at.desc()).offset(skip).limit(limit).all()
 
 
+def count_reports_by_user(
+    db: Session,
+    user_id: Optional[str] = None,
+    symbol: Optional[str] = None,
+) -> int:
+    query = db.query(ReportDB)
+    if user_id:
+        query = query.filter(ReportDB.user_id == user_id)
+    if symbol:
+        query = query.filter(ReportDB.symbol == symbol)
+    return int(query.count())
+
+
 def get_latest_reports_by_symbols(
     db: Session,
     symbols: List[str],

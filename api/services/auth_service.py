@@ -35,7 +35,7 @@ def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
     return value.astimezone(timezone.utc)
 
 
-_DEFAULT_SECRET = "tradingagents-ashare-dev-secret"
+_DEFAULT_SECRET = "tradingagents-ashare-dev-secret-local-2026"
 
 
 def _secret_key() -> str:
@@ -215,10 +215,10 @@ def send_login_code(email: str, code: str) -> Optional[str]:
     smtp_ssl_tls = smtp_ssl_tls_str in ("1", "true", "on", "yes")
 
     msg = EmailMessage()
-    msg["Subject"] = "TradingAgents 登录验证码"
+    msg["Subject"] = "量化之神登录验证码"
     msg["From"] = smtp_from
     msg["To"] = email
-    msg.set_content(f"你的 TradingAgents 登录验证码是：{code}\n\n10 分钟内有效。")
+    msg.set_content(f"你的量化之神登录验证码是：{code}\n\n10 分钟内有效。")
 
     try:
         print(f"[auth] connecting to {smtp_host}:{smtp_port} (SSL: {smtp_ssl_tls}, STARTTLS: {smtp_starttls})")
@@ -338,11 +338,16 @@ def upsert_user_llm_config(
     backend_url: Optional[str] = None,
     quick_think_llm: Optional[str] = None,
     deep_think_llm: Optional[str] = None,
+    news_llm_provider: Optional[str] = None,
+    news_backend_url: Optional[str] = None,
+    news_analysis_llm: Optional[str] = None,
     max_debate_rounds: Optional[int] = None,
     max_risk_discuss_rounds: Optional[int] = None,
     api_key: Optional[str] = None,
+    news_api_key: Optional[str] = None,
     wecom_webhook_url: Optional[str] = None,
     clear_api_key: bool = False,
+    clear_news_api_key: bool = False,
     clear_wecom_webhook: bool = False,
     default_analysts: Optional[list] = None,
     qmt_paper_account_config: Optional[dict[str, Any]] = None,
@@ -362,6 +367,12 @@ def upsert_user_llm_config(
         row.quick_think_llm = quick_think_llm
     if deep_think_llm is not None:
         row.deep_think_llm = deep_think_llm
+    if news_llm_provider is not None:
+        row.news_llm_provider = news_llm_provider
+    if news_backend_url is not None:
+        row.news_backend_url = news_backend_url
+    if news_analysis_llm is not None:
+        row.news_analysis_llm = news_analysis_llm
     if max_debate_rounds is not None:
         row.max_debate_rounds = max_debate_rounds
     if max_risk_discuss_rounds is not None:
@@ -371,6 +382,11 @@ def upsert_user_llm_config(
         row.api_key_encrypted = None
     elif api_key:
         row.api_key_encrypted = encrypt_secret(api_key)
+
+    if clear_news_api_key:
+        row.news_api_key_encrypted = None
+    elif news_api_key:
+        row.news_api_key_encrypted = encrypt_secret(news_api_key)
 
     if clear_wecom_webhook:
         row.wecom_webhook_encrypted = None

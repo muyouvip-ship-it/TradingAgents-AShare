@@ -50,6 +50,10 @@ class UserTokenResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_serializer("last_used_at", "created_at", when_used="json")
+    def serialize_token_datetimes(self, value):
+        return serialize_datetime_utc(value)
+
 
 class UserTokenListItem(BaseModel):
     id: str
@@ -59,3 +63,7 @@ class UserTokenListItem(BaseModel):
     created_at: object
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("last_used_at", "created_at", when_used="json")
+    def serialize_token_list_datetimes(self, value):
+        return serialize_datetime_utc(value)

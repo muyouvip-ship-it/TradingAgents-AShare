@@ -61,11 +61,16 @@ def update_runtime_config(
         deep_think_llm=updates.deep_think_llm,
         quick_think_llm=updates.quick_think_llm,
         backend_url=updates.backend_url,
+        news_llm_provider=updates.news_llm_provider,
+        news_backend_url=updates.news_backend_url,
+        news_analysis_llm=updates.news_analysis_llm,
         max_debate_rounds=updates.max_debate_rounds,
         max_risk_discuss_rounds=updates.max_risk_discuss_rounds,
         api_key=updates.api_key,
+        news_api_key=updates.news_api_key,
         wecom_webhook_url=normalized_wecom_webhook,
         clear_api_key=updates.clear_api_key,
+        clear_news_api_key=updates.clear_news_api_key,
         clear_wecom_webhook=updates.clear_wecom_webhook,
         default_analysts=updates.default_analysts,
         qmt_paper_account_config=updates.qmt_paper_account.model_dump() if updates.qmt_paper_account else None,
@@ -87,14 +92,15 @@ def update_runtime_config(
         key: value
         for key, value in updates.model_dump().items()
         if value is not None
-        and key not in {"api_key", "wecom_webhook_url", "warmup", "force_warmup"}
-        and not (key in {"clear_api_key", "clear_wecom_webhook"} and not value)
+        and key not in {"api_key", "news_api_key", "wecom_webhook_url", "warmup", "force_warmup"}
+        and not (key in {"clear_api_key", "clear_news_api_key", "clear_wecom_webhook"} and not value)
     }
     return {
         "message": "用户配置已更新",
         "applied": applied,
         "current": current_cfg,
         "has_api_key": bool(row.api_key_encrypted),
+        "has_news_api_key": bool(getattr(row, "news_api_key_encrypted", None)),
         "warmup": {
             "requested": bool(updates.warmup or updates.force_warmup),
             "triggered": bool(should_warmup),

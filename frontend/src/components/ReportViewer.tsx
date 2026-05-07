@@ -1,10 +1,10 @@
 import { FileText, Download, ChevronDown, ChevronRight, Loader2, MousePointerClick } from 'lucide-react'
-import { useState, useEffect } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { Suspense, lazy, useState, useEffect } from 'react'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import type { ReportDetail } from '@/types'
 import { sanitizeReportMarkdown } from '@/utils/reportText'
+
+const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
 
 const REPORT_SECTIONS = [
     { key: 'market_report', title: '市场分析报告', team: '分析团队' },
@@ -149,7 +149,9 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
                                 {isExpanded && (
                                     <div className="p-5 bg-white dark:bg-slate-800/30">
                                         <div className="prose dark:prose-invert prose-sm md:prose-base max-w-none">
-                                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>{content}</ReactMarkdown>
+                                            <Suspense fallback={<div>{content}</div>}>
+                                                <MarkdownBlock content={content} components={MD_COMPONENTS} />
+                                            </Suspense>
                                         </div>
                                     </div>
                                 )}
@@ -157,7 +159,9 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
                         )
                     })}
                     <div className="rounded-2xl border border-amber-200/80 bg-amber-50/80 px-4 py-3 text-xs leading-6 text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{REPORT_DISCLAIMER}</ReactMarkdown>
+                        <Suspense fallback={<div>{REPORT_DISCLAIMER}</div>}>
+                            <MarkdownBlock content={REPORT_DISCLAIMER} />
+                        </Suspense>
                     </div>
                 </div>
             </div>
@@ -224,9 +228,9 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
                             <div className="p-5 bg-white dark:bg-slate-800/30">
                                 {activeContent ? (
                                     <div className="prose dark:prose-invert prose-sm md:prose-base max-w-none">
-                                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                                            {activeContent}
-                                        </ReactMarkdown>
+                                        <Suspense fallback={<div>{activeContent}</div>}>
+                                            <MarkdownBlock content={activeContent} components={MD_COMPONENTS} />
+                                        </Suspense>
                                         {activeStreaming && (
                                             <span className="inline-block w-2 h-4 bg-blue-500 animate-pulse ml-1" />
                                         )}
@@ -242,7 +246,9 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
 
                         {activeContent && (
                             <div className="rounded-2xl border border-amber-200/80 bg-amber-50/80 px-4 py-3 text-xs leading-6 text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>{REPORT_DISCLAIMER}</ReactMarkdown>
+                                <Suspense fallback={<div>{REPORT_DISCLAIMER}</div>}>
+                                    <MarkdownBlock content={REPORT_DISCLAIMER} />
+                                </Suspense>
                             </div>
                         )}
                     </div>

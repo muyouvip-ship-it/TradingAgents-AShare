@@ -12,6 +12,8 @@ from api.routes.auth import router as auth_router
 from api.routes.chat import router as chat_router
 from api.routes.config import router as config_router
 from api.routes.data_download import router as data_download_router
+from api.routes.feedback import router as feedback_router
+from api.routes.daily_reviews import router as daily_reviews_router
 from api.routes.debug import router as debug_router
 from api.routes.health import router as health_router
 from api.routes.jobs import router as jobs_router
@@ -24,6 +26,7 @@ from api.routes.scheduled import router as scheduled_router
 from api.routes.backtest_v2 import router as backtest_v2_router
 from api.routes.strategies_v2 import router as strategies_v2_router
 from api.routes.strategy_platform import router as strategy_platform_router
+from api.routes.tokens import router as tokens_router
 from api.routes.virtual_warehouse import router as virtual_warehouse_router
 from api.routes.watchlist import router as watchlist_router
 from api.backtest_data_api import router as backtest_data_router
@@ -33,7 +36,7 @@ _is_prod = settings.env.lower() == "prod"
 APP_VERSION = get_version()
 
 app = FastAPI(
-    title="TradingAgents-AShare API",
+    title="量化之神 API",
     version=APP_VERSION,
     lifespan=lifespan,
     docs_url=None if _is_prod else "/docs",
@@ -50,13 +53,16 @@ app.add_middleware(
 )
 app.include_router(health_router)
 app.include_router(auth_router)
+app.include_router(tokens_router)
 app.include_router(config_router)
+app.include_router(daily_reviews_router)
 app.include_router(market_router)
 app.include_router(news_eye_router)
 app.include_router(data_download_router)
 app.include_router(debug_router)
 app.include_router(backtest_data_router)
 app.include_router(reports_router)
+app.include_router(feedback_router)
 app.include_router(analysis_router)
 app.include_router(jobs_router)
 app.include_router(chat_router)

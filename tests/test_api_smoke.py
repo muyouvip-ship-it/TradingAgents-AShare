@@ -215,6 +215,18 @@ class TestAnalyzeEndpoint:
         assert "持仓导入" in (user_context.get("user_notes") or "")
 
 
+class TestSystemMarketDataStatusEndpoint:
+    def test_market_data_status_endpoint_returns_shape(self):
+        client = _get_client()
+        response = client.get("/v1/system/market-data-status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "daily" in payload
+        assert "minute" in payload
+        assert "tables" in payload
+        assert "updated_at" in payload
+
+
 class TestChatCompletionsEndpoint:
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -539,7 +551,7 @@ class TestWecomRuntimeConfig:
         assert body["sent"] is True
         assert "成功" in body["message"]
         assert mock_send.call_count == 1
-        assert "TradingAgents Webhook Warmup" in mock_send.call_args.args[0]
+        assert "量化之神 Webhook 预热" in mock_send.call_args.args[0]
         assert mock_send.call_args.args[1] == self.WEBHOOK_URL
 
     def test_inline_wecom_warmup_does_not_persist_unsaved_webhook(self):
@@ -822,6 +834,13 @@ class TestScheduledBatchEndpoints:
         assert body["status"] == "pending"
         assert run_once.call_count == 1
 
+        reports = self.client.get("/v1/reports", headers=self.headers)
+        report_rows = [row for row in reports.json()["reports"] if row["id"] == body["job_id"]]
+        assert len(report_rows) == 1
+        assert report_rows[0]["status"] == "pending"
+        assert report_rows[0]["symbol"] == "300750.SZ"
+        assert report_rows[0]["trade_date"] == "2026-03-31"
+
         args, kwargs = run_once.call_args
         assert args[0]["id"] == item["id"]
         assert args[0]["symbol"] == "300750.SZ"
@@ -881,6 +900,14 @@ class TestScheduledBatchEndpoints:
         assert body["jobs"][1]["current_position"] == pytest.approx(300.0)
         assert body["jobs"][1]["average_cost"] == pytest.approx(1680.5)
         assert run_once.call_count == 2
+
+        reports = self.client.get("/v1/reports", headers=self.headers)
+        report_rows_by_id = {row["id"]: row for row in reports.json()["reports"]}
+        for job in body["jobs"]:
+            report_row = report_rows_by_id[job["job_id"]]
+            assert report_row["status"] == "pending"
+            assert report_row["symbol"] == job["symbol"]
+            assert report_row["trade_date"] == "2026-03-31"
 
         first_args, first_kwargs = run_once.call_args_list[0]
         second_args, second_kwargs = run_once.call_args_list[1]

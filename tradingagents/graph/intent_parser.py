@@ -16,6 +16,16 @@ _HORIZON_LABELS = {
     "medium": "中线（1-3月，基本面主导）",
 }
 
+_DEFAULT_HORIZONS = ["short", "medium"]
+
+
+def _weight_hint_for_agent(horizon: str, agent_type: Optional[str]) -> str:
+    normalized_horizon = str(horizon or "").strip().lower()
+    normalized_agent = str(agent_type or "").strip().lower()
+    if normalized_horizon == "short" and normalized_agent == "fundamentals":
+        return "基本面在短线判断里属于次要依据，若与量价或事件信号冲突，请以下降权重的方式引用。"
+    return ""
+
 
 def parse_intent(
     query: str,
@@ -46,10 +56,12 @@ def parse_intent(
         
         parsed = json.loads(raw) or {}
         parsed_user_context = normalize_user_context(parsed.get("user_context") or {})
+        parsed_horizons = parsed.get("horizons")
+        horizons = [str(item).strip() for item in parsed_horizons if str(item).strip()] if isinstance(parsed_horizons, list) else []
         return {
             "raw_query": query,
             "ticker": parsed.get("ticker") or fallback_ticker or "",
-            "horizons": ["short"],  # 固定单次运行，每个分析师用自己的自然时间窗口
+            "horizons": horizons or list(_DEFAULT_HORIZONS),
             "focus_areas": parsed.get("focus_areas") if isinstance(parsed.get("focus_areas"), list) else [],
             "specific_questions": parsed.get("specific_questions") if isinstance(parsed.get("specific_questions"), list) else [],
             "user_context": _merge_inferred_user_context(parsed_user_context, fallback_user_context),
@@ -58,7 +70,7 @@ def parse_intent(
         return {
             "raw_query": query,
             "ticker": fallback_ticker or "",
-            "horizons": ["short"],
+            "horizons": list(_DEFAULT_HORIZONS),
             "focus_areas": [],
             "specific_questions": [],
             "user_context": fallback_user_context,
@@ -83,7 +95,7 @@ def build_horizon_context(
         horizon_label=horizon_label,
         focus_areas_str=focus_str,
         specific_questions_str=questions_str,
-        weight_hint="",
+        weight_hint=_weight_hint_for_agent(horizon, agent_type),
     )
 
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from typing import Any, Dict, List
 
 from api.core.datetime_utils import utcnow_iso
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryJobStore:
@@ -48,8 +52,36 @@ class InMemoryJobStore:
                 yield {"event": "ping", "data": {"job_id": job_id, "timestamp": ping_time}, "timestamp": ping_time}
 
 
-_job_store = InMemoryJobStore()
+_memory_job_store = InMemoryJobStore()
+_job_store: Any | None = None
+_job_store_signature: tuple[str, str, str] | None = None
 
 
-def get_job_store() -> InMemoryJobStore:
+def get_job_store() -> Any:
+    global _job_store, _job_store_signature
+    backend = os.getenv("JOB_STORE_BACKEND", "").strip().lower()
+    redis_url = os.getenv("JOB_STORE_REDIS_URL") or os.getenv("REDIS_URL") or ""
+    prefix = os.getenv("JOB_STORE_REDIS_PREFIX", "ta:")
+    if not backend:
+        backend = "redis" if redis_url else "memory"
+
+    signature = (backend, redis_url, prefix)
+    if _job_store is not None and _job_store_signature == signature:
+        return _job_store
+
+    if backend == "redis":
+        if not redis_url:
+            logger.warning("JOB_STORE_BACKEND=redis but no REDIS_URL/JOB_STORE_REDIS_URL is configured; using memory store")
+        else:
+            try:
+                from api.job_store_redis import RedisJobStore
+
+                _job_store = RedisJobStore(redis_url, prefix=prefix)
+                _job_store_signature = signature
+                return _job_store
+            except Exception:
+                logger.warning("Redis job store unavailable; falling back to in-memory store", exc_info=True)
+
+    _job_store = _memory_job_store
+    _job_store_signature = ("memory", "", "")
     return _job_store

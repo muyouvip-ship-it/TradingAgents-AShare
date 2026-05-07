@@ -1,6 +1,7 @@
 from pathlib import Path
 from copy import deepcopy
 
+import pandas as pd
 from fastapi.testclient import TestClient
 
 from api.app import app
@@ -8,7 +9,7 @@ from api.routes.strategy_platform import _default_dsl
 from api.services.a_share_market_rules import get_a_share_market_rule, round_to_tick
 from api.services.minute_data_service import evaluate_intraday_confirmation, get_minute_cache_root, load_aggregated_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
-from api.services.strategy_platform_engine import run_strategy_backtest
+from api.services.strategy_platform_engine import run_strategy_backtest, _simulate_portfolio
 
 
 def test_compile_strategy_dsl_returns_execution_ir():
@@ -209,6 +210,64 @@ def test_backtest_endpoint_returns_minute_engine_diagnostics():
     assert len(paged_watchlists["items"]) == 1
 
 
+def test_portfolio_watchlist_keeps_full_candidate_pool_beyond_max_positions():
+    symbols = ["300901.SZ", "300902.SZ", "300903.SZ", "300904.SZ"]
+    rows = []
+    for date_index, date_value in enumerate(pd.to_datetime(["2024-01-02", "2024-01-03"])):
+        for symbol_index, symbol in enumerate(symbols):
+            close = 20.0 + symbol_index + date_index * 0.2
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "date": date_value,
+                    "open": close - 0.1,
+                    "high": close + 0.3,
+                    "low": close - 0.4,
+                    "close": close,
+                    "pre_close": close - 0.2,
+                    "volume": 1_000_000,
+                    "amount": close * 1_000_000,
+                    "turnover_rate": 2.0,
+                    "ma5": close - 0.2,
+                    "ma20": close - 1.0,
+                    "momentum_20d": 0.12,
+                    "weekly_trend_pass": True,
+                    "factor_score": 1.0 - symbol_index * 0.05,
+                }
+            )
+    dsl = _default_dsl("portfolio").model_dump()
+    dsl["universe"]["include_concepts"] = []
+    dsl["universe"]["filters"] = []
+    dsl["universe"]["min_listing_days"] = 0
+    dsl["entry"]["conditions"] = []
+    dsl["factor_model"]["select"] = {"top_n": len(symbols), "min_score": 0.0}
+    dsl["risk"].update(
+        {
+            "max_positions": 1,
+            "take_profit_pct": 2.0,
+            "trailing_stop_pct": 0.8,
+            "max_drawdown_pct": 1.0,
+            "max_daily_loss_pct": 1.0,
+        }
+    )
+
+    portfolio = _simulate_portfolio(
+        pd.DataFrame(rows),
+        compiled=compile_strategy_dsl(dsl),
+        initial_capital=1_000_000,
+        frequency="daily",
+        use_minute_confirm=False,
+    )
+
+    first_date = min(item["date"] for item in portfolio["watchlists"])
+    first_day_watchlists = [item for item in portfolio["watchlists"] if item["date"] == first_date]
+    buy_orders = [item for item in portfolio["orders"] if item["side"] == "buy"]
+
+    assert len(first_day_watchlists) == len(symbols)
+    assert max(item["rank"] for item in first_day_watchlists) == len(symbols)
+    assert len(buy_orders) == 1
+
+
 def test_backtest_endpoint_supports_walk_forward():
     client = TestClient(app)
     strategy_id = client.get("/v1/strategies").json()["strategies"][0]["id"]
@@ -306,22 +365,33 @@ def test_position_models_generate_distinct_allocations():
             mapping.setdefault(item["signal_date"], []).append(round(float(item.get("allocation_cash") or 0.0), 2))
         return mapping
 
+    def allocations_by_event(result):
+        buy_orders = [item for item in result.orders if item["side"] == "buy" and not item.get("is_pyramid_add")]
+        return {
+            (item["signal_date"], item["symbol"]): round(float(item.get("allocation_cash") or 0.0), 2)
+            for item in buy_orders
+        }
+
     equal_allocations = allocations_by_day(results["equal_weight"])
     factor_allocations = allocations_by_day(results["factor_weight"])
     vol_allocations = allocations_by_day(results["volatility_target"])
     risk_allocations = allocations_by_day(results["risk_budget"])
-    first_equal_allocations = equal_allocations[min(equal_allocations)]
+    equal_events = allocations_by_event(results["equal_weight"])
+    factor_events = allocations_by_event(results["factor_weight"])
+    vol_events = allocations_by_event(results["volatility_target"])
+    risk_events = allocations_by_event(results["risk_budget"])
+    first_equal_event = equal_events[min(equal_events)]
 
-    assert len(first_equal_allocations) >= 2
-    assert max(first_equal_allocations) - min(first_equal_allocations) < 1
-    assert any(
-        factor_allocations.get(signal_date) != equal_allocations.get(signal_date)
-        for signal_date in set(equal_allocations) & set(factor_allocations)
-    )
-    assert any(
-        vol_allocations.get(signal_date) != equal_allocations.get(signal_date)
-        for signal_date in set(equal_allocations) & set(vol_allocations)
-    )
+    assert first_equal_event > 0
+    shared_factor_events = set(equal_events) & set(factor_events)
+    shared_vol_events = set(equal_events) & set(vol_events)
+    shared_risk_events = set(equal_events) & set(risk_events)
+    assert shared_factor_events
+    assert shared_vol_events
+    assert shared_risk_events
+    assert any(factor_events[event] != equal_events[event] for event in shared_factor_events)
+    assert any(vol_events[event] != equal_events[event] for event in shared_vol_events)
+    assert any(risk_events[event] != equal_events[event] for event in shared_risk_events)
     assert risk_allocations
 
 

@@ -50,6 +50,8 @@ class BacktestDataConfigCreate(BaseModel):
     schedule_time: Optional[str] = Field("18:30", description="每日调度时间，格式 HH:MM")
     timezone: Optional[str] = Field("Asia/Shanghai", description="调度时区")
     only_trading_day: bool = Field(True, description="仅交易日执行")
+    daily_kline_policy: Optional[Dict[str, Any]] = Field(None, description="日线多源策略")
+    minute_kline_policy: Optional[Dict[str, Any]] = Field(None, description="分钟线多源策略")
 
 
 class BacktestDataConfig(BaseModel):
@@ -66,6 +68,8 @@ class BacktestDataConfig(BaseModel):
     schedule_time: Optional[str]
     timezone: Optional[str]
     only_trading_day: bool
+    daily_kline_policy: Optional[Dict[str, Any]] = None
+    minute_kline_policy: Optional[Dict[str, Any]] = None
     last_run_at: Optional[datetime]
     last_success_at: Optional[datetime]
     last_updated_at: Optional[datetime]

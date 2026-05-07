@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
-import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign, AlertCircle, CheckCircle, Radio, Play, Clock3, ChevronLeft, ChevronRight, X } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Calendar, Download, BarChart3, LineChart, TrendingUp, FileText, DollarSign, AlertCircle, CheckCircle, Radio, Play, Clock3, ChevronLeft, ChevronRight, X, RefreshCw } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
+import { usePolling } from '@/hooks/usePolling'
 import { useAuthStore } from '@/stores/authStore'
-import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus } from '@/types'
+import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyReviewConfig, SystemDataSourceRegistryResponse } from '@/types'
 
 type ProviderPreset = {
     id: string
@@ -12,12 +13,15 @@ type ProviderPreset = {
     baseUrl: string
     protocol: string
     editableBaseUrl?: boolean
+    local?: boolean
 }
 
 const PROVIDER_PRESETS: ProviderPreset[] = [
     { id: 'openai', label: 'OpenAI', provider: 'openai', baseUrl: 'https://api.openai.com/v1', protocol: 'OpenAI' },
     { id: 'anthropic', label: 'Anthropic', provider: 'anthropic', baseUrl: '', protocol: 'Anthropic' },
     { id: 'google', label: 'Google Gemini', provider: 'google', baseUrl: '', protocol: 'Google' },
+    { id: 'ollama', label: '本地 Ollama', provider: 'ollama', baseUrl: 'http://127.0.0.1:11434/v1', protocol: 'OpenAI 兼容', editableBaseUrl: true, local: true },
+    { id: 'local-openai', label: '本地 OpenAI 兼容（LM Studio / vLLM）', provider: 'openai', baseUrl: 'http://127.0.0.1:1234/v1', protocol: 'OpenAI 兼容', editableBaseUrl: true, local: true },
     { id: 'dashscope', label: '阿里云百炼（DashScope）', provider: 'openai', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', protocol: 'OpenAI 兼容' },
     { id: 'deepseek', label: 'DeepSeek', provider: 'openai', baseUrl: 'https://api.deepseek.com/v1', protocol: 'OpenAI 兼容' },
     { id: 'moonshot', label: 'Moonshot AI（Kimi）', provider: 'openai', baseUrl: 'https://api.moonshot.cn/v1', protocol: 'OpenAI 兼容' },
@@ -26,9 +30,15 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     { id: 'custom-openai', label: '自定义 OpenAI 兼容', provider: 'openai', baseUrl: '', protocol: 'OpenAI 兼容', editableBaseUrl: true },
 ]
 
+function isLocalBaseUrl(url: string): boolean {
+    return /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:\d+)?(\/.*)?$/i.test((url || '').trim())
+}
+
 function inferPreset(llmProvider: string, backendUrl: string): string {
     const normalizedProvider = (llmProvider || '').toLowerCase()
     const normalizedUrl = (backendUrl || '').replace(/\/$/, '')
+    if (normalizedProvider === 'ollama') return 'ollama'
+    if (normalizedProvider === 'openai' && isLocalBaseUrl(normalizedUrl)) return 'local-openai'
     const matched = PROVIDER_PRESETS.find((preset) => {
         if (preset.provider !== normalizedProvider) return false
         if (!preset.baseUrl && preset.id !== 'custom-openai') return true
@@ -109,6 +119,8 @@ export default function Settings() {
     const [customPrompt, setCustomPrompt] = useState('')
     const [llmApiKey, setLlmApiKey] = useState('')
     const [hasStoredApiKey, setHasStoredApiKey] = useState(false)
+    const [newsLlmApiKey, setNewsLlmApiKey] = useState('')
+    const [hasStoredNewsApiKey, setHasStoredNewsApiKey] = useState(false)
     const [wecomWebhook, setWecomWebhook] = useState('')
     const [hasStoredWebhook, setHasStoredWebhook] = useState(false)
     const [storedWebhookDisplay, setStoredWebhookDisplay] = useState('')
@@ -117,11 +129,20 @@ export default function Settings() {
     const [customBaseUrl, setCustomBaseUrl] = useState('')
     const [deepThinkLlm, setDeepThinkLlm] = useState('')
     const [quickThinkLlm, setQuickThinkLlm] = useState('')
+    const [newsProviderPreset, setNewsProviderPreset] = useState('ollama')
+    const [newsCustomBaseUrl, setNewsCustomBaseUrl] = useState('http://127.0.0.1:11434/v1')
+    const [newsAnalysisLlm, setNewsAnalysisLlm] = useState('')
     const [maxDebateRounds, setMaxDebateRounds] = useState(1)
     const [maxRiskRounds, setMaxRiskRounds] = useState(1)
     const [serverFallbackEnabled, setServerFallbackEnabled] = useState(true)
     const [emailReportEnabled, setEmailReportEnabled] = useState(true)
     const [wecomReportEnabled, setWecomReportEnabled] = useState(true)
+    const [dailyReviewEnabled, setDailyReviewEnabled] = useState(false)
+    const [dailyReviewTriggerTime, setDailyReviewTriggerTime] = useState('21:10')
+    const [dailyReviewPushEnabled, setDailyReviewPushEnabled] = useState(true)
+    const [dailyReviewLastRunDate, setDailyReviewLastRunDate] = useState<string | null>(null)
+    const [dailyReviewLastRunStatus, setDailyReviewLastRunStatus] = useState<string | null>(null)
+    const [dailyReviewLastError, setDailyReviewLastError] = useState<string | null>(null)
     const [configLoading, setConfigLoading] = useState(false)
     const [saving, setSaving] = useState(false)
     const [saveAllSaving, setSaveAllSaving] = useState(false)
@@ -176,19 +197,30 @@ export default function Settings() {
     const [qmtOverview, setQmtOverview] = useState<VirtualWarehouseOverviewResponse | null>(null)
     const [qmtDiagnostics, setQmtDiagnostics] = useState<VirtualWarehouseDiagnosticsResponse | null>(null)
     const [qmtStatusLoading, setQmtStatusLoading] = useState(false)
+    const [systemDataSources, setSystemDataSources] = useState<SystemDataSourceRegistryResponse | null>(null)
+    const [systemDataSourcesLoading, setSystemDataSourcesLoading] = useState(false)
+    const [systemDataSourcesError, setSystemDataSourcesError] = useState<string | null>(null)
     const [paperQmtForm, setPaperQmtForm] = useState<RuntimeQmtAccountConfig>(createDefaultQmtForm('paper'))
     const [liveQmtForm, setLiveQmtForm] = useState<RuntimeQmtAccountConfig>(createDefaultQmtForm('live'))
     const [activeDownloadTaskIds, setActiveDownloadTaskIds] = useState<number[]>([])
     const [subscriptionTaskIds, setSubscriptionTaskIds] = useState<number[]>([])
-    const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)  // 轮询定时器（使用ref避免重新渲染）
+    const taskPollingRef = useRef<{ taskIds: number[]; mode: 'download' | 'subscription' } | null>(null)
+    const [taskPollingEnabled, setTaskPollingEnabled] = useState(false)
+    const [backtestInfoLoaded, setBacktestInfoLoaded] = useState(false)
 
     const selectedPreset = useMemo(
         () => PROVIDER_PRESETS.find((item) => item.id === providerPreset) || PROVIDER_PRESETS[0],
         [providerPreset],
     )
+    const selectedNewsPreset = useMemo(
+        () => PROVIDER_PRESETS.find((item) => item.id === newsProviderPreset) || PROVIDER_PRESETS[0],
+        [newsProviderPreset],
+    )
 
     const effectiveProvider = selectedPreset.provider
     const effectiveBaseUrl = selectedPreset.editableBaseUrl ? customBaseUrl.trim() : selectedPreset.baseUrl
+    const effectiveNewsProvider = selectedNewsPreset.provider
+    const effectiveNewsBaseUrl = selectedNewsPreset.editableBaseUrl ? newsCustomBaseUrl.trim() : selectedNewsPreset.baseUrl
     useEffect(() => {
         setWarmupResults([])
         setWarmupError(null)
@@ -198,6 +230,8 @@ export default function Settings() {
         setWecomWarmupMessage(null)
         setWecomWarmupError(null)
     }, [wecomWebhook])
+
+    const shouldLoadQmtStatus = activeSettingsSection === 'qmt'
 
     useEffect(() => {
         try {
@@ -221,9 +255,13 @@ export default function Settings() {
         setCustomBaseUrl(cfg.backend_url || '')
         setDeepThinkLlm(cfg.deep_think_llm)
         setQuickThinkLlm(cfg.quick_think_llm)
+        setNewsProviderPreset(inferPreset(cfg.news_llm_provider, cfg.news_backend_url))
+        setNewsCustomBaseUrl(cfg.news_backend_url || 'http://127.0.0.1:11434/v1')
+        setNewsAnalysisLlm(cfg.news_analysis_llm || '')
         setMaxDebateRounds(cfg.max_debate_rounds)
         setMaxRiskRounds(cfg.max_risk_discuss_rounds)
         setHasStoredApiKey(!!cfg.has_api_key)
+        setHasStoredNewsApiKey(!!cfg.has_news_api_key)
         setHasStoredWebhook(!!cfg.has_wecom_webhook)
         setStoredWebhookDisplay(cfg.wecom_webhook_display || '')
         setServerFallbackEnabled(!!cfg.server_fallback_enabled)
@@ -234,6 +272,15 @@ export default function Settings() {
         }
         setPaperQmtForm(cfg.qmt_paper_account || createDefaultQmtForm('paper'))
         setLiveQmtForm(cfg.qmt_live_account || createDefaultQmtForm('live'))
+    }
+
+    const applyDailyReviewConfig = (cfg: DailyReviewConfig) => {
+        setDailyReviewEnabled(!!cfg.enabled)
+        setDailyReviewTriggerTime(cfg.trigger_time || '21:10')
+        setDailyReviewPushEnabled(cfg.push_enabled !== false)
+        setDailyReviewLastRunDate(cfg.last_run_date || null)
+        setDailyReviewLastRunStatus(cfg.last_run_status || null)
+        setDailyReviewLastError(cfg.last_error || null)
     }
 
     useEffect(() => {
@@ -248,20 +295,24 @@ export default function Settings() {
             })
             .finally(() => setConfigLoading(false))
 
+        api.getDailyReviewConfig()
+            .then(cfg => {
+                applyDailyReviewConfig(cfg)
+            })
+            .catch(err => {
+                console.error('加载每日复盘配置失败:', err)
+            })
+
         // Fetch tokens
         fetchTokens()
         
-        // 加载回测数据统计和配置
-        loadBacktestDataInfo()
-        loadQmtStatus()
-        
-        // 清理函数：组件卸载时停止轮询
-        return () => {
-            if (pollingIntervalRef.current) {
-                clearInterval(pollingIntervalRef.current)
-            }
-        }
     }, [])
+
+    useEffect(() => {
+        if (activeSettingsSection !== 'backtest') return
+        if (backtestInfoLoaded || loadingStats) return
+        void loadBacktestDataInfo().finally(() => setBacktestInfoLoaded(true))
+    }, [activeSettingsSection, backtestInfoLoaded, loadingStats])
 
     const fetchTokens = async () => {
         setTokensLoading(true)
@@ -275,12 +326,12 @@ export default function Settings() {
         }
     }
 
-    const loadQmtStatus = async () => {
+    const loadQmtStatus = useCallback(async (runConnectTest = false) => {
         setQmtStatusLoading(true)
         try {
             const [overview, diagnostics] = await Promise.all([
-                api.getQmtVirtualWarehouseOverview(),
-                api.getQmtVirtualWarehouseDiagnostics(undefined, true),
+                api.getQmtVirtualWarehouseOverview(undefined, undefined, true),
+                api.getQmtVirtualWarehouseDiagnostics(undefined, runConnectTest),
             ])
             setQmtOverview(overview)
             setQmtDiagnostics(diagnostics)
@@ -291,7 +342,34 @@ export default function Settings() {
         } finally {
             setQmtStatusLoading(false)
         }
-    }
+    }, [])
+
+    const loadSystemDataSources = useCallback(async () => {
+        setSystemDataSourcesLoading(true)
+        setSystemDataSourcesError(null)
+        try {
+            const response = await api.getSystemDataSources()
+            setSystemDataSources(response)
+        } catch (err) {
+            setSystemDataSourcesError(err instanceof Error ? err.message : '加载数据源总表失败')
+        } finally {
+            setSystemDataSourcesLoading(false)
+        }
+    }, [])
+
+    useEffect(() => {
+        if (!shouldLoadQmtStatus) return
+        if (qmtStatusLoading) return
+        if (qmtOverview && qmtDiagnostics) return
+        void loadQmtStatus(false)
+    }, [loadQmtStatus, qmtDiagnostics, qmtOverview, qmtStatusLoading, shouldLoadQmtStatus])
+
+    useEffect(() => {
+        if (activeSettingsSection !== 'system') return
+        if (systemDataSourcesLoading) return
+        if (systemDataSources) return
+        void loadSystemDataSources()
+    }, [activeSettingsSection, loadSystemDataSources, systemDataSources, systemDataSourcesLoading])
 
     const loadBacktestConfigSnapshot = async (options?: { syncForm?: boolean }) => {
         const syncForm = options?.syncForm !== false
@@ -342,7 +420,7 @@ export default function Settings() {
         if (activeTasks.length === 0) {
             return
         }
-        if (pollingIntervalRef.current) {
+        if (taskPollingRef.current) {
             return
         }
         const activeIds = activeTasks.map(task => Number(task.id)).filter(Number.isFinite)
@@ -598,72 +676,81 @@ export default function Settings() {
 
     // 启动任务状态轮询
     const startTaskPolling = (taskIds: number[] = [], mode: 'download' | 'subscription' = 'download') => {
-        // 清除已有的定时器
-        if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current)
-        }
-        
+        taskPollingRef.current = { taskIds, mode }
+        setTaskPollingEnabled(true)
+
         // 立即执行一次轻量刷新
         Promise.all([
             loadBacktestConfigSnapshot({ syncForm: false }),
             loadBacktestTaskList(),
         ])
-        
-        // 每2秒轮询一次任务状态
-        const interval = setInterval(async () => {
+    }
+
+    usePolling(
+        async () => {
+            const currentPolling = taskPollingRef.current
+            if (!currentPolling) {
+                setTaskPollingEnabled(false)
+                return
+            }
+
             try {
                 const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
-                // 处理API返回的数据格式
-                const tasksData = tasksResponse && Array.isArray(tasksResponse.tasks) 
-                    ? tasksResponse.tasks 
-                    : Array.isArray(tasksResponse) 
-                        ? tasksResponse 
+                const tasksData = tasksResponse && Array.isArray(tasksResponse.tasks)
+                    ? tasksResponse.tasks
+                    : Array.isArray(tasksResponse)
+                        ? tasksResponse
                         : []
-                
-                if (tasksData.length > 0) {
-                    setDataTasks(tasksData)
 
-                    const scopedTasks = taskIds.length > 0
-                        ? tasksData.filter(task => taskIds.includes(task.id))
-                        : tasksData
-
-                    const runningTasks = scopedTasks.filter(task => task.status === 'running' || task.status === 'pending')
-                    if (runningTasks.length > 0) {
-                        const avgProgress = runningTasks.reduce((sum, task) => sum + (task.progress || 0), 0) / runningTasks.length
-                        setDownloadProgress(Math.round(avgProgress))
-                    }
-                    
-                    // 检查是否所有任务都已完成
-                    const allCompleted = scopedTasks.length > 0 && scopedTasks.every(task => 
-                        task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
-                    )
-                    
-                    if (allCompleted) {
-                        // 所有任务完成，停止轮询并刷新统计数据
-                        clearInterval(interval)
-                        pollingIntervalRef.current = null
-                        if (mode === 'download') {
-                            setActiveDownloadTaskIds([])
-                        } else {
-                            const completedSummary = scopedTasks
-                                .map(task => `#${task.id} ${getDataTypeName(task.task_type)} ${getTaskStatusLabel(task.status)}，${task.downloaded_records || task.total_records || 0} 条`)
-                                .join('；')
-                            setSubscriptionActionMessage(`订阅执行完成：${completedSummary}`)
-                        }
-                        Promise.all([
-                            loadBacktestConfigSnapshot({ syncForm: false }),
-                            loadBacktestTaskList(),
-                            mode === 'subscription' ? loadBacktestStats() : Promise.resolve([]),
-                        ])
-                    }
+                if (tasksData.length === 0) {
+                    return
                 }
+
+                setDataTasks(tasksData)
+
+                const scopedTasks = currentPolling.taskIds.length > 0
+                    ? tasksData.filter(task => currentPolling.taskIds.includes(task.id))
+                    : tasksData
+
+                const runningTasks = scopedTasks.filter(task => task.status === 'running' || task.status === 'pending')
+                if (runningTasks.length > 0) {
+                    const avgProgress = runningTasks.reduce((sum, task) => sum + (task.progress || 0), 0) / runningTasks.length
+                    setDownloadProgress(Math.round(avgProgress))
+                }
+
+                const allCompleted = scopedTasks.length > 0 && scopedTasks.every(task =>
+                    task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'
+                )
+
+                if (!allCompleted) {
+                    return
+                }
+
+                taskPollingRef.current = null
+                setTaskPollingEnabled(false)
+                if (currentPolling.mode === 'download') {
+                    setActiveDownloadTaskIds([])
+                } else {
+                    const completedSummary = scopedTasks
+                        .map(task => `#${task.id} ${getDataTypeName(task.task_type)} ${getTaskStatusLabel(task.status)}，${task.downloaded_records || task.total_records || 0} 条`)
+                        .join('；')
+                    setSubscriptionActionMessage(`订阅执行完成：${completedSummary}`)
+                }
+                await Promise.all([
+                    loadBacktestConfigSnapshot({ syncForm: false }),
+                    loadBacktestTaskList(),
+                    currentPolling.mode === 'subscription' ? loadBacktestStats() : Promise.resolve([]),
+                ])
             } catch (err) {
                 console.error('轮询任务状态失败:', err)
             }
-        }, 2000)
-        
-        pollingIntervalRef.current = interval
-    }
+        },
+        {
+            enabled: taskPollingEnabled,
+            intervalMs: 2000,
+            runImmediately: false,
+        },
+    )
 
     // 切换数据类型选择
     // 数据源兼容性映射
@@ -738,6 +825,24 @@ export default function Settings() {
         () => Object.fromEntries((qmtDiagnostics?.items || []).map(item => [item.account_key, item])),
         [qmtDiagnostics],
     )
+    const dataSourceRegistryItems = systemDataSources?.sources || []
+    const dataSourceSurfaceItems = systemDataSources?.surfaces || []
+    const dataSourceCategoryCount = useMemo(
+        () => new Set(dataSourceRegistryItems.map(item => item.category)).size,
+        [dataSourceRegistryItems],
+    )
+    const dataSourceHighRiskCount = useMemo(
+        () => dataSourceRegistryItems.filter(item => item.reliability === 'low' || item.kind === 'synthetic' || item.kind === 'fallback' || item.kind === 'unknown').length,
+        [dataSourceRegistryItems],
+    )
+    const dataSourceLiveCount = useMemo(
+        () => dataSourceRegistryItems.filter(item => item.kind === 'live').length,
+        [dataSourceRegistryItems],
+    )
+    const dataSourceSurfaceCount = useMemo(
+        () => dataSourceSurfaceItems.length,
+        [dataSourceSurfaceItems],
+    )
     const paperQmtAccount = qmtAccounts.find(account => account.role === 'paper') || null
     const liveQmtAccount = qmtAccounts.find(account => account.role === 'live') || null
     const visibleRunningTasks = (activeDownloadTaskIds.length > 0
@@ -767,6 +872,38 @@ export default function Settings() {
             minimumFractionDigits: 2,
             maximumFractionDigits: 2,
         })
+    }
+
+    const dataSourceKindLabel = (kind?: string) => {
+        const mapping: Record<string, string> = {
+            live: '实时',
+            cache: '缓存',
+            database: '数据库',
+            external: '外部',
+            fallback: '回退',
+            synthetic: '合成',
+            engine: '引擎',
+            stream: '事件流',
+            unknown: '未登记',
+        }
+        return mapping[kind || ''] || kind || '--'
+    }
+
+    const dataSourceReliabilityLabel = (reliability?: string) => {
+        const mapping: Record<string, string> = {
+            high: '高可信',
+            medium: '中可信',
+            low: '低可信',
+            unknown: '待登记',
+        }
+        return mapping[reliability || ''] || reliability || '--'
+    }
+
+    const dataSourceReliabilityClass = (reliability?: string) => {
+        if (reliability === 'high') return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
+        if (reliability === 'medium') return 'bg-blue-50 text-blue-700 dark:bg-blue-500/10 dark:text-blue-300'
+        if (reliability === 'low') return 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300'
+        return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
     }
 
     const renderQmtAccountConfigCard = (
@@ -916,9 +1053,25 @@ export default function Settings() {
         setIsCreatingToken(true)
         try {
             const created = await api.createToken({ name: newTokenName.trim() })
+            const createdName = newTokenName.trim()
             setNewTokenName('')
             setNewlyCreatedToken(created.token || null)
-            await fetchTokens()
+            setTokens(current => {
+                const next = current.filter(item => item.id !== created.id)
+                return [
+                    {
+                        id: created.id,
+                        name: created.name || createdName,
+                        token_hint: created.token_hint,
+                        last_used_at: created.last_used_at,
+                        created_at: created.created_at,
+                    },
+                    ...next,
+                ]
+            })
+            void fetchTokens().catch(err => {
+                console.error('Failed to refresh tokens after creation:', err)
+            })
         } catch (err) {
             alert(err instanceof Error ? err.message : '创建 Token 失败')
         } finally {
@@ -976,9 +1129,13 @@ export default function Settings() {
         backend_url: effectiveBaseUrl || undefined,
         deep_think_llm: deepThinkLlm,
         quick_think_llm: quickThinkLlm,
+        news_llm_provider: effectiveNewsProvider,
+        news_backend_url: effectiveNewsBaseUrl || undefined,
+        news_analysis_llm: newsAnalysisLlm,
         max_debate_rounds: maxDebateRounds,
         max_risk_discuss_rounds: maxRiskRounds,
         api_key: llmApiKey || undefined,
+        news_api_key: newsLlmApiKey || undefined,
         ...(options?.includeWecom ? {
             wecom_webhook_url: wecomWebhook.trim() || undefined,
             wecom_report_enabled: wecomReportEnabled,
@@ -995,6 +1152,12 @@ export default function Settings() {
         setTimeout(() => setSaved(false), 2000)
     }
 
+    const buildDailyReviewPayload = (): Partial<DailyReviewConfig> => ({
+        enabled: dailyReviewEnabled,
+        trigger_time: dailyReviewTriggerTime,
+        push_enabled: dailyReviewPushEnabled,
+    })
+
     const submitConfig = async (options?: { forceWarmup?: boolean; successMessage?: string; includeEmail?: boolean; includeWecom?: boolean }) => {
         persistLocalSettings()
         const { forceWarmup = false, successMessage = '设置已保存', includeEmail = true, includeWecom = false } = options || {}
@@ -1004,12 +1167,14 @@ export default function Settings() {
             force_warmup: forceWarmup,
         })
         setHasStoredApiKey(!!response.has_api_key)
+        setHasStoredNewsApiKey(!!response.current.has_news_api_key)
         setHasStoredWebhook(!!response.current.has_wecom_webhook)
         setStoredWebhookDisplay(response.current.wecom_webhook_display || '')
         setWecomReportEnabled(response.current.wecom_report_enabled !== false)
         setPaperQmtForm(response.current.qmt_paper_account || createDefaultQmtForm('paper'))
         setLiveQmtForm(response.current.qmt_live_account || createDefaultQmtForm('live'))
         setLlmApiKey('')
+        setNewsLlmApiKey('')
         setWecomWebhook('')
         showSavedMessage(response.warmup?.message || successMessage)
         return response
@@ -1037,27 +1202,11 @@ export default function Settings() {
     const handleSaveAll = async () => {
         setSaveAllSaving(true)
         try {
-            // 保存基础配置
-            await submitConfig({ includeEmail: true, includeWecom: true, successMessage: '全部设置已保存' })
-            
-            // 保存回测数据配置
-            await api.request<void>('/v1/backtest-data/configs', {
-                method: 'POST',
-                body: JSON.stringify({
-                    data_types: selectedDataTypes,
-                    date_range_start: dateRange.start,
-                    date_range_end: dateRange.end,
-                    data_source: dataSource,
-                    auto_update: autoUpdate,
-                    update_frequency: updateFrequency,
-                    schedule_time: scheduleTime,
-                    timezone: subscriptionTimezone,
-                    only_trading_day: onlyTradingDay,
-                })
-            })
-            await loadBacktestDataInfo()
-            
-            showSavedMessage('全部设置已保存（包含回测数据配置）')
+            await Promise.all([
+                submitConfig({ includeEmail: true, includeWecom: true, successMessage: '全部设置已保存' }),
+                api.updateDailyReviewConfig(buildDailyReviewPayload()).then(cfg => applyDailyReviewConfig(cfg)),
+            ])
+            showSavedMessage('全部设置已保存')
         } catch (err) {
             alert(err instanceof Error ? err.message : '保存全部设置失败')
         } finally {
@@ -1092,6 +1241,22 @@ export default function Settings() {
             setTimeout(() => setSaved(false), 2000)
         } catch (err) {
             alert(err instanceof Error ? err.message : '清除密钥失败')
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    const handleClearNewsApiKey = async () => {
+        if (!hasStoredNewsApiKey) return
+        setSaving(true)
+        try {
+            const response = await api.updateConfig({ clear_news_api_key: true })
+            setHasStoredNewsApiKey(!!response.current.has_news_api_key)
+            setNewsLlmApiKey('')
+            setSaved(true)
+            setTimeout(() => setSaved(false), 2000)
+        } catch (err) {
+            alert(err instanceof Error ? err.message : '清除资讯模型密钥失败')
         } finally {
             setSaving(false)
         }
@@ -1230,9 +1395,13 @@ export default function Settings() {
                                 placeholder="https://your-openai-compatible-endpoint/v1"
                             />
                             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                {selectedPreset.editableBaseUrl
-                                    ? '自定义 OpenAI 兼容服务需要自行填写 Base URL。'
-                                    : '该厂商默认通过预设的 OpenAI 兼容地址接入，通常只需填写模型名和 API Key。'}
+                                {selectedPreset.id === 'ollama'
+                                    ? '默认使用本机 Ollama，通常不需要填写 API Key；模型名示例：qwen2.5:7b、deepseek-r1:8b。'
+                                    : selectedPreset.id === 'local-openai'
+                                        ? '适用于 LM Studio、vLLM 等本地 OpenAI 兼容服务；若本地服务不校验密钥，可以留空。'
+                                        : selectedPreset.editableBaseUrl
+                                            ? '自定义 OpenAI 兼容服务需要自行填写 Base URL。'
+                                            : '该厂商默认通过预设的 OpenAI 兼容地址接入，通常只需填写模型名和 API Key。'}
                             </p>
                         </div>
                     )}
@@ -1242,14 +1411,14 @@ export default function Settings() {
                             常规模型
                             <span className="ml-1 text-xs text-slate-400 font-normal">用于意图识别、JSON 提取等轻量任务</span>
                         </label>
-                        <input
-                            type="text"
-                            value={quickThinkLlm}
-                            onChange={e => setQuickThinkLlm(e.target.value)}
-                            className="input w-full"
-                            placeholder="例如：gpt-4.1-mini / deepseek-chat / moonshot-v1-8k"
-                            disabled={configLoading}
-                        />
+                            <input
+                                type="text"
+                                value={quickThinkLlm}
+                                onChange={e => setQuickThinkLlm(e.target.value)}
+                                className="input w-full"
+                                placeholder={selectedPreset.local ? '例如：qwen2.5:7b / llama3.1:8b / local-model' : '例如：gpt-4.1-mini / deepseek-chat / moonshot-v1-8k'}
+                                disabled={configLoading}
+                            />
                     </div>
 
                     <div>
@@ -1257,14 +1426,14 @@ export default function Settings() {
                             推理模型
                             <span className="ml-1 text-xs text-slate-400 font-normal">用于深度分析、辩论等复杂任务</span>
                         </label>
-                        <input
-                            type="text"
-                            value={deepThinkLlm}
-                            onChange={e => setDeepThinkLlm(e.target.value)}
-                            className="input w-full"
-                            placeholder="例如：gpt-4.1 / deepseek-reasoner / kimi-k2-0905-preview"
-                            disabled={configLoading}
-                        />
+                            <input
+                                type="text"
+                                value={deepThinkLlm}
+                                onChange={e => setDeepThinkLlm(e.target.value)}
+                                className="input w-full"
+                                placeholder={selectedPreset.local ? '例如：deepseek-r1:8b / qwen3:14b / local-reasoner' : '例如：gpt-4.1 / deepseek-reasoner / kimi-k2-0905-preview'}
+                                disabled={configLoading}
+                            />
                     </div>
 
                     <div className="md:col-span-2">
@@ -1278,7 +1447,7 @@ export default function Settings() {
                                 value={llmApiKey}
                                 onChange={e => setLlmApiKey(e.target.value)}
                                 className="input w-full pl-10"
-                                placeholder={hasStoredApiKey ? '已保存，留空则保持不变' : '输入你的模型 API Key'}
+                                placeholder={hasStoredApiKey ? '已保存，留空则保持不变' : selectedPreset.local ? '本地服务一般可留空，如有鉴权再填写' : '输入你的模型 API Key'}
                                 disabled={configLoading}
                             />
                         </div>
@@ -1301,7 +1470,7 @@ export default function Settings() {
                             )}
                         </div>
                         <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                            保存模型配置后，系统会在后台自动测试连通性；也可以直接点击下方按钮，发送\u201c你好\u201d来验证模型是否正常响应。
+                            保存模型配置后，系统会在后台自动测试连通性；也可以直接点击下方按钮，发送“你好”来验证模型是否正常响应。
                         </p>
                     </div>
 
@@ -1348,6 +1517,118 @@ export default function Settings() {
                                 ))}
                             </div>
                         )}
+                    </div>
+                </div>
+            </div>
+            )}
+
+            {activeSettingsSection === 'analysis' && (
+            <div className="card space-y-4">
+                <div className="flex items-center gap-2">
+                    <FileText className="w-5 h-5 text-sky-500" />
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">资讯 LLM</h2>
+                </div>
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                    这套配置只用于资讯之眼里的“LLM 解读”，和上面的智能分析模型分开保存。
+                </p>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            资讯模型厂商
+                        </label>
+                        <select
+                            value={newsProviderPreset}
+                            onChange={e => setNewsProviderPreset(e.target.value)}
+                            className="input w-full"
+                            disabled={configLoading}
+                        >
+                            {PROVIDER_PRESETS.map((preset) => (
+                                <option key={`news-${preset.id}`} value={preset.id}>{preset.label}</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            接入协议
+                        </label>
+                        <div className="input w-full flex items-center gap-2 bg-slate-50 dark:bg-slate-900/70 text-slate-600 dark:text-slate-300">
+                            <Link2 className="w-4 h-4 text-slate-400" />
+                            <span>{selectedNewsPreset.protocol}</span>
+                        </div>
+                    </div>
+
+                    {(selectedNewsPreset.baseUrl || selectedNewsPreset.editableBaseUrl) && (
+                        <div className="md:col-span-2">
+                            <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                                Base URL
+                            </label>
+                            <input
+                                type="text"
+                                value={selectedNewsPreset.editableBaseUrl ? newsCustomBaseUrl : selectedNewsPreset.baseUrl}
+                                onChange={e => setNewsCustomBaseUrl(e.target.value)}
+                                className="input w-full"
+                                disabled={configLoading || !selectedNewsPreset.editableBaseUrl}
+                                placeholder="http://127.0.0.1:11434/v1"
+                            />
+                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                {selectedNewsPreset.id === 'ollama'
+                                    ? '推荐直接接本机 Ollama，适合把资讯解读放到本地模型上跑。'
+                                    : selectedNewsPreset.id === 'local-openai'
+                                        ? '适用于 LM Studio、vLLM 等本地 OpenAI 兼容服务。'
+                                        : selectedNewsPreset.editableBaseUrl
+                                            ? '可填写自定义资讯模型服务地址。'
+                                            : '使用该厂商的默认接入地址。'}
+                            </p>
+                        </div>
+                    )}
+
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            资讯解读模型
+                        </label>
+                        <input
+                            type="text"
+                            value={newsAnalysisLlm}
+                            onChange={e => setNewsAnalysisLlm(e.target.value)}
+                            className="input w-full"
+                            placeholder={selectedNewsPreset.local ? '例如：qwen2.5:7b / llama3.1:8b / deepseek-r1:8b' : '例如：gpt-4.1-mini / deepseek-chat'}
+                            disabled={configLoading}
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
+                            资讯模型 Key
+                        </label>
+                        <div className="relative">
+                            <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                            <input
+                                type="password"
+                                value={newsLlmApiKey}
+                                onChange={e => setNewsLlmApiKey(e.target.value)}
+                                className="input w-full pl-10"
+                                placeholder={hasStoredNewsApiKey ? '已保存，留空则保持不变' : selectedNewsPreset.local ? '本地服务一般可留空，如有鉴权再填写' : '输入资讯模型 API Key'}
+                                disabled={configLoading}
+                            />
+                        </div>
+                        <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+                            <div className="text-xs text-slate-500 dark:text-slate-400">
+                                资讯之眼的 LLM 解读优先使用这里的配置；留空时会回退到上面的智能分析模型。
+                            </div>
+                            {hasStoredNewsApiKey && (
+                                <button
+                                    type="button"
+                                    onClick={handleClearNewsApiKey}
+                                    disabled={saving || saveAllSaving}
+                                    className="inline-flex items-center gap-1 text-xs text-rose-500 hover:text-rose-600 disabled:opacity-50"
+                                >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    清除资讯密钥
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1434,6 +1715,142 @@ export default function Settings() {
                         className="input w-full min-h-[80px] resize-y"
                         placeholder="例如：更关注估值安全边际、政策催化与机构资金行为。"
                     />
+                </div>
+            </div>
+            )}
+
+            {activeSettingsSection === 'system' && (
+            <div className="card space-y-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                        <div className="flex items-center gap-2">
+                            <Database className="w-5 h-5 text-blue-500" />
+                            <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">数据源治理中心</h2>
+                            {systemDataSourcesLoading && <Loader2 className="w-4 h-4 animate-spin text-slate-400" />}
+                        </div>
+                        <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                            统一查看系统内已登记的数据源、可信度和回退风险，避免页面口径各说各话。
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => void loadSystemDataSources()}
+                        disabled={systemDataSourcesLoading}
+                        className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-800 dark:text-slate-200 dark:hover:bg-slate-900/60"
+                    >
+                        <RefreshCw className={`w-4 h-4 ${systemDataSourcesLoading ? 'animate-spin' : ''}`} />
+                        刷新总表
+                    </button>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-4">
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">已登记来源</div>
+                        <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">{dataSourceRegistryItems.length}</div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">分类数</div>
+                        <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">{dataSourceCategoryCount}</div>
+                    </div>
+                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 px-4 py-3 dark:border-emerald-900/40 dark:bg-emerald-500/10">
+                        <div className="text-xs text-emerald-600 dark:text-emerald-300">实时链路</div>
+                        <div className="mt-1 text-2xl font-semibold text-emerald-700 dark:text-emerald-200">{dataSourceLiveCount}</div>
+                    </div>
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 dark:border-amber-900/40 dark:bg-amber-500/10">
+                        <div className="text-xs text-amber-600 dark:text-amber-300">高风险来源</div>
+                        <div className="mt-1 text-2xl font-semibold text-amber-700 dark:text-amber-200">{dataSourceHighRiskCount}</div>
+                    </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">已映射页面</div>
+                        <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">{dataSourceSurfaceCount}</div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">覆盖治理域</div>
+                        <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">
+                            {new Set(dataSourceSurfaceItems.flatMap(item => item.domains || [])).size}
+                        </div>
+                    </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>最近更新：{formatDateTime(systemDataSources?.updated_at)}</span>
+                    <span>说明：高风险来源包含 `fallback`、`synthetic`、`unknown` 和低可信链路。</span>
+                </div>
+
+                {systemDataSourcesError ? (
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
+                        {systemDataSourcesError}
+                    </div>
+                ) : null}
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    {dataSourceRegistryItems.map((source) => (
+                        <div key={source.key} className="rounded-2xl border border-slate-200 bg-white px-4 py-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/30">
+                            <div className="flex flex-wrap items-start justify-between gap-2">
+                                <div>
+                                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{source.label}</div>
+                                    <div className="mt-1 text-[11px] uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">{source.key}</div>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${dataSourceReliabilityClass(source.reliability)}`}>
+                                        {dataSourceReliabilityLabel(source.reliability)}
+                                    </span>
+                                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                                        {dataSourceKindLabel(source.kind)}
+                                    </span>
+                                </div>
+                            </div>
+                            <div className="mt-3 text-sm text-slate-600 dark:text-slate-300">{source.description}</div>
+                            <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">分类：{source.category}</div>
+                            {source.caveat ? (
+                                <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300">
+                                    风险提示：{source.caveat}
+                                </div>
+                            ) : null}
+                        </div>
+                    ))}
+                </div>
+
+                <div className="pt-2">
+                    <div className="flex items-center gap-2">
+                        <Link2 className="w-4 h-4 text-slate-500" />
+                        <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">页面与数据源映射</h3>
+                    </div>
+                    <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                        这里直接说明每个关键页面当前依赖哪些数据源，排查“这个页面为什么这样显示”会更快。
+                    </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    {dataSourceSurfaceItems.map((surface) => (
+                        <div key={surface.id} className="rounded-2xl border border-slate-200 bg-white px-4 py-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/30">
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{surface.name}</div>
+                                    <div className="mt-1 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">{surface.route}</div>
+                                </div>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                                    {surface.sources.length} 个来源
+                                </span>
+                            </div>
+                            <div className="mt-3 text-sm text-slate-600 dark:text-slate-300">{surface.description}</div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                                {surface.sources.map((source) => (
+                                    <span key={`${surface.id}-${source.key}`} className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${dataSourceReliabilityClass(source.reliability)}`}>
+                                        {source.label}
+                                    </span>
+                                ))}
+                            </div>
+                            <div className="mt-3 space-y-1 text-xs text-slate-500 dark:text-slate-400">
+                                {surface.notes.map((note) => (
+                                    <div key={note}>{note}</div>
+                                ))}
+                            </div>
+                        </div>
+                    ))}
                 </div>
             </div>
             )}
@@ -1625,6 +2042,71 @@ export default function Settings() {
             </div>
             )}
 
+            {activeSettingsSection === 'analysis' && (
+            <div className="card space-y-4">
+                <div className="flex items-center gap-2">
+                    <Calendar className="w-5 h-5 text-amber-500" />
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">每日复盘任务</h2>
+                </div>
+
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 px-4 py-3 space-y-4 dark:border-slate-700/80 dark:bg-slate-900/40">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">开启每日复盘定时生成</div>
+                            <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">每天最多生成一份正式复盘，同一交易日会更新已有记录。</div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setDailyReviewEnabled(!dailyReviewEnabled)}
+                            disabled={configLoading}
+                            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                dailyReviewEnabled ? 'bg-blue-500' : 'bg-slate-300 dark:bg-slate-600'
+                            }`}
+                        >
+                            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${dailyReviewEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                        </button>
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">触发时间</label>
+                            <input
+                                type="time"
+                                value={dailyReviewTriggerTime}
+                                onChange={e => setDailyReviewTriggerTime(e.target.value)}
+                                className="input w-full"
+                            />
+                            <p className="mt-1 text-xs text-slate-400">建议设置在收盘后、晚间资讯相对完整的时间段。</p>
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-200/80 bg-white px-4 py-3 dark:border-slate-700/80 dark:bg-slate-950/40">
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <div className="text-sm font-medium text-slate-700 dark:text-slate-200">生成后自动推送</div>
+                                    <div className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">企业微信优先；邮件仍遵守现有总开关。</div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => setDailyReviewPushEnabled(!dailyReviewPushEnabled)}
+                                    disabled={configLoading}
+                                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                                        dailyReviewPushEnabled ? 'bg-blue-500' : 'bg-slate-300 dark:bg-slate-600'
+                                    }`}
+                                >
+                                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${dailyReviewPushEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+                            <div className="mt-3 space-y-1 text-xs text-slate-400">
+                                <div>上次执行日期：{dailyReviewLastRunDate || '--'}</div>
+                                <div>上次状态：{dailyReviewLastRunStatus || '--'}</div>
+                                {dailyReviewLastError && <div className="text-rose-500 dark:text-rose-300">错误：{dailyReviewLastError}</div>}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            )}
+
             {/* 回测数据配置 */}
             {activeSettingsSection === 'backtest' && (
             <div className="card space-y-4">
@@ -1736,7 +2218,7 @@ export default function Settings() {
                                 </div>
                                 <button
                                     type="button"
-                                    onClick={loadQmtStatus}
+                                    onClick={() => void loadQmtStatus(false)}
                                     className="btn-secondary inline-flex items-center gap-2 whitespace-nowrap"
                                 >
                                     <Radio className="w-4 h-4" />
@@ -2309,11 +2791,19 @@ export default function Settings() {
                             </button>
                             <button
                                 type="button"
-                                onClick={loadQmtStatus}
+                                onClick={() => void loadQmtStatus(false)}
                                 disabled={qmtStatusLoading}
                                 className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                             >
                                 刷新配置状态
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => void loadQmtStatus(true)}
+                                disabled={qmtStatusLoading}
+                                className="rounded-lg border border-amber-200 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-60 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-950/40"
+                            >
+                                执行连接诊断
                             </button>
                         </div>
 
@@ -2498,13 +2988,15 @@ export default function Settings() {
                 </div>
             )}
 
-            <div className="flex items-center gap-4">
-                <button onClick={handleSaveAll} disabled={saveAllSaving} className="btn-primary inline-flex items-center gap-2">
-                    {saveAllSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    保存全部
-                </button>
-                {saved && <span className="text-sm text-green-600 dark:text-green-400">✓ {saveMessage}</span>}
-            </div>
+            {activeSettingsSection === 'analysis' && (
+                <div className="flex items-center gap-4">
+                    <button onClick={handleSaveAll} disabled={saveAllSaving} className="btn-primary inline-flex items-center gap-2">
+                        {saveAllSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                        保存全部
+                    </button>
+                    {saved && <span className="text-sm text-green-600 dark:text-green-400">✓ {saveMessage}</span>}
+                </div>
+            )}
         </div>
     )
 }

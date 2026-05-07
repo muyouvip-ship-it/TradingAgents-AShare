@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from copy import deepcopy
 from datetime import datetime
@@ -43,6 +44,7 @@ from api.services.config_service import (
 DEFAULT_CONFIG = deepcopy(_BASE_DEFAULT_CONFIG)
 _cn_stock_map = _core_cn_stock_map
 _cn_stock_reverse_map = _core_cn_stock_reverse_map
+logger = logging.getLogger(__name__)
 
 
 def _build_runtime_config(*args, **kwargs):
@@ -125,7 +127,7 @@ def _get_reverse_stock_map():
     global _cn_stock_reverse_map
     if _cn_stock_map is None:
         _load_cn_stock_map()
-    if _cn_stock_reverse_map is None and _cn_stock_map is not None:
+    if _cn_stock_map is not None:
         _cn_stock_reverse_map = {code: name for name, code in _cn_stock_map.items()}
     return dict(_cn_stock_reverse_map or {})
 
@@ -134,8 +136,7 @@ def _get_reverse_stock_map_cached_only():
     global _cn_stock_reverse_map
     if _cn_stock_map is None:
         return {}
-    if _cn_stock_reverse_map is None:
-        _cn_stock_reverse_map = {code: name for name, code in _cn_stock_map.items()}
+    _cn_stock_reverse_map = {code: name for name, code in _cn_stock_map.items()}
     return dict(_cn_stock_reverse_map or {})
 
 
@@ -162,9 +163,15 @@ def cn_today_str() -> str:
 
 def _resolve_scheduled_trade_date(trade_date: str) -> str:
     try:
-        from tradingagents.dataflows.trade_calendar import is_cn_trading_day, previous_cn_trading_day
+        from tradingagents.dataflows.trade_calendar import cn_market_phase, is_cn_trading_day, now_cn, previous_cn_trading_day
 
-        return trade_date if is_cn_trading_day(trade_date) else previous_cn_trading_day(trade_date)
+        if not is_cn_trading_day(trade_date):
+            return previous_cn_trading_day(trade_date)
+
+        local_now = now_cn()
+        if trade_date == local_now.date().strftime("%Y-%m-%d") and cn_market_phase(local_now) in {"pre_open", "in_session", "lunch_break"}:
+            return previous_cn_trading_day(trade_date)
+        return trade_date
     except Exception:
         return trade_date
 
@@ -287,7 +294,7 @@ async def _run_scheduled_analysis_once(
     *,
     mark_schedule_run: bool,
 ) -> None:
-    from api.services import scheduled_service
+    from api.services import report_service, scheduled_service
 
     task_id = task["id"]
     user_id = task["user_id"]
@@ -315,8 +322,10 @@ async def _run_scheduled_analysis_once(
                 scheduled_service.mark_run_success(db, task_id, requested_trade_date, job_id)
             else:
                 scheduled_service.record_manual_test_result(db, task_id, "success", report_id=job_id)
-    except Exception:
+    except Exception as exc:
+        logger.exception("Scheduled analysis failed task=%s symbol=%s job=%s: %s", task_id, symbol, job_id, exc)
         with get_db_ctx() as db:
+            report_service.update_report_partial(db, job_id, status="failed", error=f"智能分析失败：{exc}")
             if mark_schedule_run:
                 scheduled_service.mark_run_failed(db, task_id, requested_trade_date)
             else:

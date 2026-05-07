@@ -1,6 +1,7 @@
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { Suspense, lazy } from 'react'
 import type { DebateMessage } from '@/types'
+
+const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
 
 // Agent metadata for debate participants
 const DEBATE_AGENT_META: Record<string, { emoji: string; label: string; dotCls: string; borderCls: string; bgCls: string; textCls: string }> = {
@@ -83,9 +84,9 @@ export default function DebateTimeline({ messages, debate }: DebateTimelineProps
                                             )}
                                         </div>
                                         <div className="prose dark:prose-invert prose-sm max-w-none text-sm leading-relaxed">
-                                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                                {msg.content}
-                                            </ReactMarkdown>
+                                            <Suspense fallback={<div>{msg.content}</div>}>
+                                                <MarkdownBlock content={msg.content} />
+                                            </Suspense>
                                         </div>
                                     </div>
                                 </div>
@@ -113,9 +114,9 @@ export default function DebateTimeline({ messages, debate }: DebateTimelineProps
                             </span>
                         </div>
                         <div className="prose dark:prose-invert prose-sm max-w-none text-sm leading-relaxed">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                {verdict.content}
-                            </ReactMarkdown>
+                            <Suspense fallback={<div>{verdict.content}</div>}>
+                                <MarkdownBlock content={verdict.content} />
+                            </Suspense>
                         </div>
                     </div>
                 </div>

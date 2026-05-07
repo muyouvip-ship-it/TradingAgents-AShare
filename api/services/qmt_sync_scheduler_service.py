@@ -181,7 +181,7 @@ def _maybe_send_disconnect_alert(db: Session, row: QmtSyncProfileDB, now: dateti
     if not webhook_url:
         return
     message = (
-        "TradingAgents QMT 自动同步告警\n"
+        "量化之神 QMT 自动同步告警\n"
         f"账户 Key：{row.account_key}\n"
         f"用户：{getattr(user, 'email', row.user_id)}\n"
         f"错误：{error_text[:300]}"

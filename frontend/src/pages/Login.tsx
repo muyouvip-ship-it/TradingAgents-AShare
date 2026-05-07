@@ -90,7 +90,7 @@ export default function Login() {
                     <div className="relative">
                         <div className="inline-flex items-center gap-2 rounded-full border border-slate-200/80 bg-white/85 px-3 py-1.5 text-xs tracking-[0.22em] text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900/80 dark:text-slate-400">
                             <Radar className="h-3.5 w-3.5 text-cyan-500" />
-                            A 股多智能体研究系统
+                            量化之神
                         </div>
 
                         <div className="mt-10 max-w-3xl">
@@ -256,14 +256,7 @@ export default function Login() {
 
             <footer className="mx-auto max-w-7xl pb-4 pt-2 text-center text-xs text-slate-400 dark:text-slate-500">
                 <p>
-                    &copy; {new Date().getFullYear()} KylinMountain &middot; 仅限非商业用途（PolyForm NC 1.0） &middot;{' '}
-                    <a href="https://github.com/KylinMountain/TradingAgents-AShare" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-slate-600 dark:hover:text-slate-300">
-                        GitHub
-                    </a>
-                    {' '}&middot;{' '}
-                    <a href="https://app.510168.xyz" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-slate-600 dark:hover:text-slate-300">
-                        官网
-                    </a>
+                    &copy; {new Date().getFullYear()} 量化之神 &middot; 多智能体量化研究平台
                 </p>
             </footer>
         </div>
