@@ -46,6 +46,8 @@ def create_risk_manager(llm, memory):
         investment_debate_state = state.get("investment_debate_state", {})
         bull_history = investment_debate_state.get("bull_history", "")
         bear_history = investment_debate_state.get("bear_history", "")
+        investment_plan = state.get("investment_plan", "")
+        trader_plan = state.get("trader_investment_plan", "")
         
         # 获取用户意图
         user_intent = state.get("user_intent") or {}
@@ -92,6 +94,12 @@ def create_risk_manager(llm, memory):
 【空头观点】
 {bear_history[:1000] if bear_history else "无"}
 
+━━━ 研究总监方案 ━━━
+{investment_plan[:1500] if investment_plan else "无"}
+
+━━━ 交易员方案 ━━━
+{trader_plan[:1500] if trader_plan else "无"}
+
 ━━━ 用户风险偏好 ━━━
 风险偏好: {user_context.get('risk_profile', '未知')}
 投资周期: {user_context.get('investment_horizon', '未知')}
@@ -99,9 +107,13 @@ def create_risk_manager(llm, memory):
 
 请基于以上信息，提供：
 1. 综合风险评估（低/中/高/极高）
-2. 建议仓位比例（0-100%）
-3. 止损价位和止盈价位
-4. 主要风险点和应对策略
+2. 对交易员方向的审核结论：原则上继承交易员方向；只有发现上游遗漏的重大风险时，才允许改方向，并必须明确说明遗漏点
+3. 建议仓位比例（0-100%）
+4. 止损价位和止盈价位
+5. 主要风险点和应对策略
+6. 最后一行必须写成：最终交易建议：买入 / 卖出 / 观望
+7. 末尾追加机读摘要：<!-- VERDICT: {{"direction": "看多", "reason": "不超过20字的一句话核心结论"}} -->
+direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空。若前置研究和交易员均偏空，不得输出看多/偏多/买入，除非正文明确给出足以翻转方向的新增证据。
 """
         
         messages = [

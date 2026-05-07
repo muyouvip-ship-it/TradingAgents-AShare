@@ -557,8 +557,17 @@ def _build_deep_result_payload(
     final_state: dict[str, Any],
 ) -> tuple[dict, list[dict], list[dict], str]:
     final_trade_decision = str(final_state.get("final_trade_decision") or "")
-    decision = str(graph.process_signal(final_trade_decision) or "HOLD")
-    direction = _derive_direction(final_trade_decision, decision, list(final_state.get("analyst_traces") or []))
+    trader_investment_plan = str(final_state.get("trader_investment_plan") or "")
+    investment_plan = str(final_state.get("investment_plan") or "")
+    analyst_traces = list(final_state.get("analyst_traces") or [])
+    decision = _resolve_deep_decision(
+        graph=graph,
+        final_trade_decision=final_trade_decision,
+        trader_investment_plan=trader_investment_plan,
+        investment_plan=investment_plan,
+        analyst_traces=analyst_traces,
+    )
+    direction = _derive_direction(final_trade_decision, decision, analyst_traces)
     resolved_fields = report_service.resolve_report_fields(final_state)
 
     result_payload = {
@@ -576,10 +585,10 @@ def _build_deep_result_payload(
         "macro_report": final_state.get("macro_report") or "",
         "smart_money_report": final_state.get("smart_money_report") or "",
         "volume_price_report": final_state.get("volume_price_report") or "",
-        "investment_plan": final_state.get("investment_plan") or "",
-        "trader_investment_plan": final_state.get("trader_investment_plan") or "",
+        "investment_plan": investment_plan,
+        "trader_investment_plan": trader_investment_plan,
         "final_trade_decision": final_trade_decision,
-        "analyst_traces": list(final_state.get("analyst_traces") or []),
+        "analyst_traces": analyst_traces,
         "investment_debate_state": final_state.get("investment_debate_state") or {},
         "risk_debate_state": final_state.get("risk_debate_state") or {},
         "risk_feedback_state": final_state.get("risk_feedback_state") or {},
@@ -718,23 +727,134 @@ def _merge_user_contexts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[
     return merged
 
 
-def _derive_direction(final_trade_decision: str, decision: str, analyst_traces: list[dict[str, Any]]) -> str:
-    text = f"{final_trade_decision}\n{decision}".upper()
-    if any(keyword in text for keyword in ("BUY", "增持", "买入", "BULLISH", "看多")):
-        return "偏多"
-    if any(keyword in text for keyword in ("SELL", "减持", "卖出", "BEARISH", "看空")):
-        return "偏空"
+_VALID_TRADE_DECISIONS = {"BUY", "SELL", "HOLD"}
+
+
+def _normalize_trade_decision(value: Any) -> str | None:
+    decision = str(value or "").strip().upper()
+    return decision if decision in _VALID_TRADE_DECISIONS else None
+
+
+def _has_explicit_decision_marker(text_value: str) -> bool:
+    text_value = str(text_value or "")
+    return any(
+        marker in text_value
+        for marker in (
+            "FINAL TRANSACTION PROPOSAL",
+            "最终交易建议",
+            "建议动作",
+            "执行动作",
+            "最终裁决",
+            "最终建议",
+            "<!-- VERDICT:",
+        )
+    )
+
+
+def _resolve_deep_decision(
+    *,
+    graph,
+    final_trade_decision: str,
+    trader_investment_plan: str,
+    investment_plan: str,
+    analyst_traces: list[dict[str, Any]],
+) -> str:
+    from tradingagents.graph.signal_processing import _extract_decision_keyword
+
+    candidates: list[str] = []
+    if _has_explicit_decision_marker(final_trade_decision):
+        candidates.append(final_trade_decision)
+    candidates.extend([trader_investment_plan, investment_plan])
+    if final_trade_decision not in candidates:
+        candidates.append(final_trade_decision)
+
+    for candidate in candidates:
+        decision = _normalize_trade_decision(_extract_decision_keyword(candidate))
+        if decision:
+            return _align_decision_with_trace_consensus(decision, analyst_traces)
+
+    for candidate in (trader_investment_plan, investment_plan, final_trade_decision):
+        try:
+            decision = _normalize_trade_decision(graph.process_signal(candidate))
+        except Exception:
+            logger.exception("Failed to extract trade decision from candidate report")
+            decision = None
+        if decision:
+            return _align_decision_with_trace_consensus(decision, analyst_traces)
+
+    consensus_decision, _ = _trace_consensus_decision(analyst_traces)
+    return consensus_decision or "HOLD"
+
+
+def _align_decision_with_trace_consensus(decision: str, analyst_traces: list[dict[str, Any]]) -> str:
+    consensus_decision, confidence = _trace_consensus_decision(analyst_traces)
+    if not consensus_decision or consensus_decision == "HOLD" or confidence < 0.7:
+        return decision
+    if decision == "BUY" and consensus_decision == "SELL":
+        logger.warning("Final BUY conflicts with bearish analyst consensus; using SELL")
+        return "SELL"
+    if decision == "SELL" and consensus_decision == "BUY":
+        logger.warning("Final SELL conflicts with bullish analyst consensus; using BUY")
+        return "BUY"
+    return decision
+
+
+def _trace_consensus_decision(analyst_traces: list[dict[str, Any]]) -> tuple[str | None, float]:
     bullish = 0
     bearish = 0
+    neutral = 0
     for trace in analyst_traces:
         verdict = str(trace.get("verdict") or "").upper()
         if any(keyword in verdict for keyword in ("BULL", "看多", "偏多", "BUY")):
             bullish += 1
         elif any(keyword in verdict for keyword in ("BEAR", "看空", "偏空", "SELL")):
             bearish += 1
+        elif any(keyword in verdict for keyword in ("NEUTRAL", "中性", "HOLD", "观望")):
+            neutral += 1
+    directional_total = bullish + bearish
+    if directional_total == 0:
+        return None, 0.0
+    confidence = max(bullish, bearish) / max(directional_total + neutral, directional_total)
     if bullish > bearish:
-        return "偏多"
+        return "BUY", confidence
     if bearish > bullish:
+        return "SELL", confidence
+    return "HOLD", confidence
+
+
+def _extract_verdict_direction_label(text_value: str) -> str | None:
+    marker = "<!-- VERDICT:"
+    if marker not in str(text_value or ""):
+        return None
+    try:
+        start = text_value.index(marker) + len(marker)
+        end = text_value.index("-->", start)
+        payload = json.loads(text_value[start:end].strip())
+    except Exception:
+        return None
+    direction = str(payload.get("direction") or "").strip().upper()
+    if direction in {"看多", "偏多", "BULLISH", "LEAN_BULLISH", "BUY"}:
+        return "偏多"
+    if direction in {"看空", "偏空", "BEARISH", "LEAN_BEARISH", "SELL"}:
+        return "偏空"
+    if direction in {"中性", "NEUTRAL", "HOLD"}:
+        return "中性"
+    return None
+
+
+def _derive_direction(final_trade_decision: str, decision: str, analyst_traces: list[dict[str, Any]]) -> str:
+    explicit_direction = _extract_verdict_direction_label(final_trade_decision)
+    if explicit_direction:
+        return explicit_direction
+    normalized_decision = _normalize_trade_decision(decision)
+    if normalized_decision == "BUY":
+        return "偏多"
+    if normalized_decision == "SELL":
+        return "偏空"
+    consensus_decision, confidence = _trace_consensus_decision(analyst_traces)
+    if consensus_decision == "BUY" and confidence >= 0.5:
+        return "偏多"
+    if consensus_decision == "SELL" and confidence >= 0.5:
         return "偏空"
     return "中性"
 

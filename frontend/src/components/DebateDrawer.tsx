@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { X } from 'lucide-react'
 import { useAnalysisStore } from '@/stores/analysisStore'
+import type { AnalysisReport, DebateMessage, DebateState } from '@/types'
 import DebateTimeline from './DebateTimeline'
 
 const DEBATE_TITLES: Record<string, { title: string; emoji: string }> = {
@@ -22,6 +23,40 @@ const DEBATE_PARTICIPANTS: Record<string, { emoji: string; label: string; cls: s
     ],
 }
 
+function cleanDebateText(value?: string): string {
+    return String(value || '').trim()
+}
+
+function buildFallbackMessages(debate: 'research' | 'risk', report: AnalysisReport | null): DebateMessage[] {
+    if (!report) return []
+    const messages: DebateMessage[] = []
+    const pushSpeech = (agent: string, content?: string) => {
+        const text = cleanDebateText(content)
+        if (!text) return
+        messages.push({ debate, agent, round: 1, content: text })
+    }
+    const pushVerdict = (agent: string, content?: string) => {
+        const text = cleanDebateText(content)
+        if (!text) return
+        messages.push({ debate, agent, round: -1, content: text, isVerdict: true })
+    }
+
+    if (debate === 'research') {
+        const state = (report.investment_debate_state || {}) as DebateState
+        pushSpeech('Bull Researcher', state.bull_history)
+        pushSpeech('Bear Researcher', state.bear_history)
+        pushVerdict('Research Manager', state.judge_decision || report.investment_plan)
+    } else {
+        const state = (report.risk_debate_state || {}) as DebateState
+        pushSpeech('Aggressive Analyst', state.aggressive_history)
+        pushSpeech('Conservative Analyst', state.conservative_history)
+        pushSpeech('Neutral Analyst', state.neutral_history)
+        pushVerdict('Portfolio Manager', state.judge_decision || report.final_trade_decision)
+    }
+
+    return messages
+}
+
 interface DebateDrawerProps {
     debate: 'research' | 'risk' | null
     onClose: () => void
@@ -30,9 +65,11 @@ interface DebateDrawerProps {
 export default function DebateDrawer({ debate, onClose }: DebateDrawerProps) {
     const debateMessages = useAnalysisStore(s => s.debateMessages)
     const scrollTick = useAnalysisStore(s => s.debateScrollTick)
+    const report = useAnalysisStore(s => s.report)
     const scrollRef = useRef<HTMLDivElement>(null)
     const userScrolledUp = useRef(false)
-    const messages = debate ? (debateMessages[debate] || []) : []
+    const liveMessages = debate ? (debateMessages[debate] || []) : []
+    const messages = debate ? (liveMessages.length ? liveMessages : buildFallbackMessages(debate, report)) : []
     const meta = debate ? DEBATE_TITLES[debate] : null
     const participants = debate ? DEBATE_PARTICIPANTS[debate] : []
 

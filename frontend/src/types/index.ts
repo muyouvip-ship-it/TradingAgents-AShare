@@ -261,8 +261,20 @@ export interface AnalysisReport {
     game_theory_signals?: GameTheorySignals
     investment_plan?: string
     trader_investment_plan?: string
+    investment_debate_state?: DebateState
+    risk_debate_state?: DebateState
     risk_feedback_state?: RiskFeedbackState
     final_trade_decision?: string
+}
+
+export interface DebateState {
+    history?: string
+    bull_history?: string
+    bear_history?: string
+    aggressive_history?: string
+    conservative_history?: string
+    neutral_history?: string
+    judge_decision?: string
 }
 
 // UI Types

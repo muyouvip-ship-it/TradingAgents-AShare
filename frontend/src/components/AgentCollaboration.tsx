@@ -293,11 +293,14 @@ export default function AgentCollaboration({ onSelectSection, onOpenDebate, sele
         const streamState = meta.section ? streamingSections[meta.section] : undefined
         const stored = meta.section ? (report?.[meta.section as keyof typeof report] as string | undefined) : undefined
         const src = streamState?.displayed || stored || ''
+        const hasContent = src.trim().length > 0
+        const status = (agent?.status ?? 'pending') as AgentStatus
+        const displayStatus = !isAnalyzing && status === 'pending' && hasContent ? 'completed' : status
         const isParticipating = isAnalyzing ? (agent ? agent.status !== 'skipped' : false) : true
 
         return {
             meta,
-            status: (agent?.status ?? 'pending') as AgentStatus,
+            status: displayStatus as AgentStatus,
             isStreaming: !!streamState?.isTyping,
             verdict: extractVerdict(src),
             isParticipating,

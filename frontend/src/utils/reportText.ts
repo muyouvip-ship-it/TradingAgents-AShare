@@ -1,12 +1,14 @@
 export function detectDecisionLabel(text?: string | null): string | null {
     if (!text) return null
     const normalized = text.toLowerCase()
-    if (normalized.includes('增持')) return '增持'
-    if (normalized.includes('减持')) return '减持'
-    if (normalized.includes('buy') || normalized.includes('买入')) return '买入'
+    const negatedBuy = /不(?:建议|宜|应|可|能)?\s*(?:追涨|买入|增持|建仓|做多)|暂(?:不|缓)\s*(?:买入|增持|建仓|做多)|(?:避免|禁止|切勿|不要|无需)\s*(?:追涨|买入|增持|建仓|做多)|不构成\s*(?:买入|增持|建仓|做多)|等待[^。\n；;]{0,12}(?:买入|建仓)机会/.test(text)
     if (normalized.includes('sell') || normalized.includes('卖出')) return '卖出'
-    if (normalized.includes('watch') || normalized.includes('观望')) return '观望'
+    if (normalized.includes('reduce') || normalized.includes('减持')) return '减持'
+    if (normalized.includes('watch') || normalized.includes('观望') || normalized.includes('回避')) return '观望'
     if (normalized.includes('hold') || normalized.includes('持有')) return '持有'
+    if (negatedBuy) return '观望'
+    if (normalized.includes('add') || normalized.includes('增持')) return '增持'
+    if (normalized.includes('buy') || normalized.includes('买入')) return '买入'
     return null
 }
 
@@ -32,8 +34,8 @@ export function buildAgentSummary(text?: string | null): string {
         .trim()
     const decision = detectDecisionLabel(cleaned)
     if (decision) return decision
-    if (/偏多|看多|上涨|突破/.test(cleaned)) return '偏多'
     if (/偏空|看空|下跌|回撤/.test(cleaned)) return '偏空'
+    if (/偏多|看多|上涨|突破/.test(cleaned)) return '偏多'
     if (/中性|震荡/.test(cleaned)) return '中性'
     if (cleaned.includes('风险')) return '风控结论'
     if (cleaned.includes('计划')) return '计划已生成'

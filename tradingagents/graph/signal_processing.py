@@ -29,7 +29,7 @@ class SignalProcessor:
             return "HOLD"
 
         decision = _extract_decision_keyword(full_signal)
-        if decision:
+        if decision in {"BUY", "SELL", "HOLD"}:
             return decision
 
         messages = [
@@ -48,7 +48,8 @@ class SignalProcessor:
 
 def _extract_decision_keyword(text: str) -> str | None:
     """Rule-based decision extraction to keep UI consistent with final decision text."""
-    upper = text.upper()
+    raw = text or ""
+    upper = raw.upper()
 
     def parse_verdict_direction(raw_text: str) -> str | None:
         match = re.search(r"<!--\s*VERDICT:\s*(\{.*?\})\s*-->", raw_text, re.IGNORECASE | re.DOTALL)
@@ -76,43 +77,62 @@ def _extract_decision_keyword(text: str) -> str | None:
         }
         return direction_map.get(direction)
 
-    def classify(snippet: str) -> str | None:
+    def classify(snippet: str, *, broad: bool = False) -> str | None:
+        snippet = snippet.strip()
         snippet_upper = snippet.upper()
-        sell_keywords = [
-            "SELL",
-            "卖出",
-            "减持",
-            "清仓",
-            "空仓",
-            "回避",
-            "看空",
-            "偏空",
+        if not snippet:
+            return None
+
+        sell_patterns = [
+            r"\bSELL\b",
+            r"卖出",
+            r"减持",
+            r"清仓",
+            r"空仓",
+            r"回避",
+            r"看空",
+            r"偏空",
+            r"破位",
         ]
-        buy_keywords = [
-            "BUY",
-            "买入",
-            "增持",
-            "做多",
-            "看多",
-            "偏多",
-            "谨慎看多",
-            "有条件建仓",
-            "条件建仓",
-            "建仓",
+        buy_patterns = [
+            r"\bBUY\b",
+            r"买入",
+            r"增持",
+            r"做多",
+            r"看多",
+            r"偏多",
+            r"有条件建仓",
+            r"条件建仓",
+            r"建仓",
         ]
-        hold_keywords = [
-            "HOLD",
-            "观望",
-            "持有",
-            "中性",
+        hold_patterns = [
+            r"\bHOLD\b",
+            r"观望",
+            r"持有",
+            r"中性",
+            r"等待",
+        ]
+        negated_buy_patterns = [
+            r"不(?:建议|宜|应|可|能)?\s*(?:追涨|买入|增持|建仓|做多)",
+            r"暂(?:不|缓)\s*(?:买入|增持|建仓|做多)",
+            r"(?:避免|禁止|切勿|不要|无需)\s*(?:追涨|买入|增持|建仓|做多)",
+            r"不构成\s*(?:买入|增持|建仓|做多)",
+            r"等待[^。\n；;]{0,12}(?:买入|建仓)机会",
         ]
 
-        if any(k in snippet_upper for k in buy_keywords):
-            return "BUY"
-        if any(k in snippet_upper for k in sell_keywords):
+        has_sell = any(re.search(pattern, snippet_upper, re.IGNORECASE) for pattern in sell_patterns)
+        has_negated_buy = any(re.search(pattern, snippet, re.IGNORECASE) for pattern in negated_buy_patterns)
+        has_buy = any(re.search(pattern, snippet_upper, re.IGNORECASE) for pattern in buy_patterns) and not has_negated_buy
+        has_hold = any(re.search(pattern, snippet_upper, re.IGNORECASE) for pattern in hold_patterns)
+
+        if has_sell:
             return "SELL"
-        if any(k in snippet_upper for k in hold_keywords):
+        if has_buy:
+            return "BUY"
+        if has_hold or has_negated_buy:
             return "HOLD"
+        if broad:
+            return None
         return None
 
     verdict_decision = parse_verdict_direction(text)
@@ -120,6 +140,11 @@ def _extract_decision_keyword(text: str) -> str | None:
         return verdict_decision
 
     explicit_patterns = [
+        r"FINAL\s+TRANSACTION\s+PROPOSAL[:：]\s*\**\s*(BUY|SELL|HOLD)\s*\**",
+        r"最终交易建议[:：]\s*([^\n*]+)",
+        r"建议动作[:：]\s*([^\n*]+)",
+        r"执行动作[:：]\s*([^\n*]+)",
+        r"动作[:：]\s*([^\n*]+)",
         r"最终裁决[:：]\s*([^\n*]+)",
         r"风控委员会最终裁决[:：]\s*([^\n*]+)",
         r"最终建议[:：]\s*([^\n*]+)",
@@ -138,8 +163,8 @@ def _extract_decision_keyword(text: str) -> str | None:
     if decision:
         return decision
 
-    decision = classify(upper)
+    decision = classify(raw, broad=True)
     if decision:
         return decision
 
-    return "UNKNOWN"
+    return None

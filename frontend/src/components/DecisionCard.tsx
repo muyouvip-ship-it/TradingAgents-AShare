@@ -48,10 +48,12 @@ export default function DecisionCard({
     const parseDecision = (text?: string): 'buy' | 'sell' | 'hold' | 'add' | 'reduce' | 'watch' | undefined => {
         if (!text) return propDecision
         const lower = text.toLowerCase()
+        const negatedBuy = /不(?:建议|宜|应|可|能)?\s*(?:追涨|买入|增持|建仓|做多)|暂(?:不|缓)\s*(?:买入|增持|建仓|做多)|(?:避免|禁止|切勿|不要|无需)\s*(?:追涨|买入|增持|建仓|做多)|不构成\s*(?:买入|增持|建仓|做多)|等待[^。\n；;]{0,12}(?:买入|建仓)机会/.test(text)
         if (lower.includes('sell') || lower.includes('卖出')) return 'sell'
         if (lower.includes('reduce') || lower.includes('减持')) return 'reduce'
-        if (lower.includes('watch') || lower.includes('观望')) return 'watch'
+        if (lower.includes('watch') || lower.includes('观望') || lower.includes('回避')) return 'watch'
         if (lower.includes('hold') || lower.includes('持有')) return 'hold'
+        if (negatedBuy) return 'watch'
         if (lower.includes('add') || lower.includes('增持')) return 'add'
         if (lower.includes('buy') || lower.includes('买入')) return 'buy'
         return undefined
