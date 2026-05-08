@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 import calendar as month_calendar
 from datetime import date, datetime, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 import asyncio
 import json
 import logging
@@ -22,7 +22,7 @@ from api.quantclass_importer import import_stock_daily_from_quantclass
 from api.data_quality_manager import DataQualityManager
 from api.data_source_monitor import get_data_source_monitor
 from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats, write_daily_kline_parquet_cache
-from api.services.market_data_pipeline_service import preferred_daily_kline_table
+from api.services.market_data_pipeline_service import DAILY_RAW_TABLES, preferred_daily_kline_table
 from api.services.qmt_market_data_service import sync_index_minute_history
 from .backtest_data_models import (
     BacktestDataTaskCreate, BacktestDataTask,
@@ -938,11 +938,12 @@ def get_daily_kline_coverage_calendar(
     """返回股票日K线按年的月度覆盖视图。"""
     try:
         del current_user
-        coverage = db.execute(text("""
+        table_name = preferred_daily_kline_table()
+        coverage = db.execute(text(f"""
             SELECT
                 MIN(trade_date) AS min_date,
                 MAX(trade_date) AS max_date
-            FROM stock_daily_kline
+            FROM {table_name}
         """)).fetchone()
         min_date = coverage.min_date if coverage else None
         max_date = coverage.max_date if coverage else None
@@ -963,7 +964,7 @@ def get_daily_kline_coverage_calendar(
                 trade_date::date AS trade_date,
                 COUNT(*) AS row_count,
                 COUNT(DISTINCT {normalized_symbol_expr}) AS symbol_count
-            FROM stock_daily_kline
+            FROM {table_name}
             WHERE trade_date >= :start_date
               AND trade_date < :end_date
             GROUP BY trade_date::date
@@ -1098,6 +1099,254 @@ def sync_daily_kline_parquet_cache(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"同步日线 Parquet 缓存失败: {str(e)}")
+
+
+@router.get("/daily-kline/governance-summary")
+def get_daily_kline_governance_summary(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回股票日 K 多源增量治理摘要，用于设置页解释 raw/norm/pub/market 口径。"""
+    try:
+        del current_user
+        preferred_table = preferred_daily_kline_table()
+        legacy = _daily_governance_table_stats(db, "stock_daily_kline")
+        published = _daily_governance_table_stats(db, "pub_stock_daily_kline")
+        norm = _daily_governance_table_stats(db, "norm_stock_daily_kline")
+        unified_stats = _collect_daily_kline_stats(db, table_name="stock_daily_kline", date_column="trade_date")
+        unified = _serialize_governance_stats(
+            {
+                **(unified_stats or {}),
+                "table_name": preferred_table,
+                "layer": "market_view",
+                "description": "历史主表 + 发布层增量",
+            }
+        ) if unified_stats else {
+            "table_name": preferred_table,
+            "layer": "market_view",
+            "description": "历史主表 + 发布层增量",
+            "exists": _relation_exists(db, preferred_table),
+            "total_records": 0,
+        }
+        latest_date = unified.get("date_range_end")
+        if latest_date:
+            unified["latest_date_row_count"] = _count_rows_on_date(
+                db,
+                table_name=preferred_table,
+                date_column="trade_date",
+                trade_date=_parse_optional_date(latest_date),
+            )
+
+        raw_layers = []
+        for source, table_name in DAILY_RAW_TABLES.items():
+            payload = _daily_governance_table_stats(db, table_name)
+            payload["source"] = source
+            payload["layer"] = "raw"
+            raw_layers.append(payload)
+
+        latest_runs = _daily_reconciliation_runs(db)
+        latest_run_id = str(latest_runs[0]["run_id"]) if latest_runs else None
+        return {
+            "success": True,
+            "updated_at": datetime.utcnow().isoformat(),
+            "preferred_table": preferred_table,
+            "read_policy": "业务侧通过 market_stock_daily_kline 统一读取历史主表与发布层增量。",
+            "unified": unified,
+            "legacy": legacy,
+            "published": published,
+            "norm": norm,
+            "raw_layers": raw_layers,
+            "source_summary": _daily_publish_source_summary(db),
+            "latest_reconciliation_runs": latest_runs,
+            "latest_reconciliation_item_summary": _daily_reconciliation_item_summary(db, latest_run_id),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取日K多源治理摘要失败: {exc}") from exc
+
+
+def _serialize_governance_stats(payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    for key in ["date_range_start", "date_range_end", "last_table_updated_at", "updated_at"]:
+        value = result.get(key)
+        if hasattr(value, "isoformat"):
+            result[key] = value.isoformat()
+    result["exists"] = bool(result.get("exists", True))
+    result["total_records"] = int(result.get("total_records") or 0)
+    result["symbol_count"] = int(result.get("symbol_count") or 0)
+    result["trading_days"] = int(result.get("trading_days") or 0)
+    return result
+
+
+def _daily_governance_table_stats(db: Session, table_name: str) -> dict[str, Any]:
+    exists = _relation_exists(db, table_name)
+    if not exists:
+        return {
+            "table_name": table_name,
+            "exists": False,
+            "total_records": 0,
+            "symbol_count": 0,
+            "trading_days": 0,
+            "date_range_start": None,
+            "date_range_end": None,
+            "latest_date_row_count": 0,
+        }
+    stats = _aggregate_table_stats(db, table_name=table_name, date_column="trade_date") or {}
+    latest_date = stats.get("date_range_end")
+    payload = _serialize_governance_stats({
+        "table_name": table_name,
+        "exists": True,
+        **stats,
+        **_latest_daily_status_fields(db, table_name=table_name, latest_date=latest_date),
+    })
+    payload["latest_date_row_count"] = _count_rows_on_date(
+        db,
+        table_name=table_name,
+        date_column="trade_date",
+        trade_date=latest_date,
+    ) if latest_date else 0
+    return payload
+
+
+def _latest_daily_status_fields(db: Session, *, table_name: str, latest_date: date | None) -> dict[str, Any]:
+    if latest_date is None:
+        return {}
+    columns = {
+        row.column_name
+        for row in db.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = :table_name
+              AND column_name IN ('source', 'quality_status', 'publish_status')
+        """), {"table_name": table_name}).fetchall()
+    }
+    if not {"source", "quality_status", "publish_status"}.issubset(columns):
+        return {}
+    row = db.execute(text(f"""
+        SELECT
+            source,
+            quality_status,
+            publish_status,
+            COUNT(*) AS row_count
+        FROM {table_name}
+        WHERE trade_date = :latest_date
+        GROUP BY source, quality_status, publish_status
+        ORDER BY row_count DESC
+        LIMIT 1
+    """), {"latest_date": latest_date}).mappings().first()
+    if not row:
+        return {}
+    return {
+        "source": str(row.get("source") or ""),
+        "quality_status": str(row.get("quality_status") or ""),
+        "publish_status": str(row.get("publish_status") or ""),
+    }
+
+
+def _count_rows_on_date(db: Session, *, table_name: str, date_column: str, trade_date: date | None) -> int:
+    if trade_date is None or not _relation_exists(db, table_name):
+        return 0
+    return int(db.execute(text(f"""
+        SELECT COUNT(*)
+        FROM {table_name}
+        WHERE {date_column} = :trade_date
+    """), {"trade_date": trade_date}).scalar() or 0)
+
+
+def _daily_publish_source_summary(db: Session) -> list[dict[str, Any]]:
+    if not _relation_exists(db, "pub_stock_daily_kline"):
+        return []
+    rows = db.execute(text("""
+        WITH latest AS (
+            SELECT MAX(trade_date) AS latest_date
+            FROM pub_stock_daily_kline
+        )
+        SELECT
+            source,
+            quality_status,
+            publish_status,
+            COUNT(*) AS total_records,
+            MIN(trade_date) AS date_range_start,
+            MAX(trade_date) AS date_range_end,
+            COUNT(*) FILTER (WHERE trade_date = (SELECT latest_date FROM latest)) AS latest_date_row_count,
+            MAX(updated_at) AS updated_at
+        FROM pub_stock_daily_kline
+        GROUP BY source, quality_status, publish_status
+        ORDER BY date_range_end DESC, total_records DESC
+    """)).mappings().all()
+    return [
+        _serialize_governance_stats({
+            "source": str(row.get("source") or ""),
+            "quality_status": str(row.get("quality_status") or ""),
+            "publish_status": str(row.get("publish_status") or ""),
+            "total_records": int(row.get("total_records") or 0),
+            "date_range_start": row.get("date_range_start"),
+            "date_range_end": row.get("date_range_end"),
+            "latest_date_row_count": int(row.get("latest_date_row_count") or 0),
+            "updated_at": row.get("updated_at"),
+        })
+        for row in rows
+    ]
+
+
+def _daily_reconciliation_runs(db: Session) -> list[dict[str, Any]]:
+    if not _relation_exists(db, "daily_kline_reconciliation_runs"):
+        return []
+    rows = db.execute(text("""
+        SELECT run_id, trade_date, published_count, warning_count, missing_count, created_at, updated_at
+        FROM daily_kline_reconciliation_runs
+        ORDER BY trade_date DESC, created_at DESC, id DESC
+        LIMIT 5
+    """)).mappings().all()
+    return [
+        {
+            "run_id": str(row.get("run_id") or ""),
+            "trade_date": row.get("trade_date").isoformat() if hasattr(row.get("trade_date"), "isoformat") else row.get("trade_date"),
+            "published_count": int(row.get("published_count") or 0),
+            "warning_count": int(row.get("warning_count") or 0),
+            "missing_count": int(row.get("missing_count") or 0),
+            "created_at": row.get("created_at").isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at"),
+            "updated_at": row.get("updated_at").isoformat() if hasattr(row.get("updated_at"), "isoformat") else row.get("updated_at"),
+        }
+        for row in rows
+    ]
+
+
+def _daily_reconciliation_item_summary(db: Session, run_id: str | None) -> list[dict[str, Any]]:
+    if not run_id or not _relation_exists(db, "daily_kline_reconciliation_items"):
+        return []
+    rows = db.execute(text("""
+        SELECT
+            chosen_source,
+            publish_status,
+            quality_status,
+            COUNT(*) AS item_count,
+            AVG(coverage_ratio) AS avg_coverage_ratio,
+            COUNT(*) FILTER (
+                WHERE BTRIM(COALESCE(issues, '')) NOT IN ('', '[]', '{}', 'null')
+            ) AS issue_count,
+            COUNT(*) FILTER (WHERE COALESCE(issues, '') ILIKE '%source_conflict%') AS conflict_count,
+            COUNT(*) FILTER (WHERE publish_status = 'published_with_warning') AS warning_count,
+            COUNT(*) FILTER (WHERE publish_status = 'missing_or_conflicted') AS missing_count
+        FROM daily_kline_reconciliation_items
+        WHERE run_id = :run_id
+        GROUP BY chosen_source, publish_status, quality_status
+        ORDER BY item_count DESC
+    """), {"run_id": run_id}).mappings().all()
+    return [
+        {
+            "chosen_source": str(row.get("chosen_source") or ""),
+            "publish_status": str(row.get("publish_status") or ""),
+            "quality_status": str(row.get("quality_status") or ""),
+            "item_count": int(row.get("item_count") or 0),
+            "avg_coverage_ratio": float(row.get("avg_coverage_ratio") or 0),
+            "issue_count": int(row.get("issue_count") or 0),
+            "conflict_count": int(row.get("conflict_count") or 0),
+            "warning_count": int(row.get("warning_count") or 0),
+            "missing_count": int(row.get("missing_count") or 0),
+        }
+        for row in rows
+    ]
 
 
 # ========== 批量下载API ==========
@@ -1726,7 +1975,6 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                     })
 
                     subscription_config_id = getattr(task, "subscription_config_id", None)
-                    trigger_mode = str(getattr(task, "trigger_mode", None) or "").strip().lower()
                     if subscription_config_id:
                         scope_key = "all"
                         task_symbols = list(task.symbols or [])
@@ -1779,7 +2027,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 VALUES (:user_id, :config_id, :data_type, :data_source, :scope_key, :last_run_started_at, :last_data_date, :last_success_at, :last_status, :last_error, NOW(), NOW())
                             """), watermark_payload)
 
-                        if final_status == "completed" and trigger_mode == "scheduled":
+                        if final_status == "completed":
                             db.execute(text("""
                                 UPDATE backtest_data_configs
                                 SET last_success_at = NOW(),

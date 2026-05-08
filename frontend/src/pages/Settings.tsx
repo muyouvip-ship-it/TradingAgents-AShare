@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
 import { usePolling } from '@/hooks/usePolling'
 import { useAuthStore } from '@/stores/authStore'
-import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyReviewConfig, SystemDataSourceRegistryResponse } from '@/types'
+import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyReviewConfig, DailyKlineGovernanceSummaryResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ProviderPreset = {
     id: string
@@ -193,6 +193,7 @@ export default function Settings() {
     const [subscriptionActionMessage, setSubscriptionActionMessage] = useState<string | null>(null)
     const [backtestConfig, setBacktestConfig] = useState<BacktestDataConfigItem | null>(null)
     const [subscriptionStatus, setSubscriptionStatus] = useState<BacktestDataSubscriptionStatus | null>(null)
+    const [dailyKlineGovernance, setDailyKlineGovernance] = useState<DailyKlineGovernanceSummaryResponse | null>(null)
     const [subscriptionRunning, setSubscriptionRunning] = useState(false)
     const [qmtOverview, setQmtOverview] = useState<VirtualWarehouseOverviewResponse | null>(null)
     const [qmtDiagnostics, setQmtDiagnostics] = useState<VirtualWarehouseDiagnosticsResponse | null>(null)
@@ -357,6 +358,18 @@ export default function Settings() {
         }
     }, [])
 
+    const loadDailyKlineGovernanceSummary = useCallback(async () => {
+        try {
+            const response = await api.getDailyKlineGovernanceSummary()
+            setDailyKlineGovernance(response)
+            return response
+        } catch (err) {
+            console.error('加载日K多源治理摘要失败:', err)
+            setDailyKlineGovernance(null)
+            return null
+        }
+    }, [])
+
     useEffect(() => {
         if (!shouldLoadQmtStatus) return
         if (qmtStatusLoading) return
@@ -457,12 +470,14 @@ export default function Settings() {
                 loadBacktestConfigSnapshot({ syncForm: true }),
                 loadBacktestStats(),
                 loadBacktestTaskList(),
+                loadDailyKlineGovernanceSummary(),
             ])
             ensureTaskPollingForActiveTasks(tasks)
         } catch (err) {
             console.error('加载回测数据信息失败:', err)
             setDataStats([])
             setDataTasks([])
+            setDailyKlineGovernance(null)
         } finally {
             setLoadingStats(false)
         }
@@ -543,6 +558,7 @@ export default function Settings() {
                 loadBacktestConfigSnapshot({ syncForm: false }),
                 loadBacktestStats(),
                 loadBacktestTaskList(),
+                loadDailyKlineGovernanceSummary(),
             ])
             const range = result.sync_range?.start_date && result.sync_range?.end_date
                 ? `\n同步区间：${result.sync_range.start_date} ~ ${result.sync_range.end_date}`
@@ -601,6 +617,7 @@ export default function Settings() {
             await Promise.all([
                 loadBacktestConfigSnapshot({ syncForm: false }),
                 loadBacktestTaskList(),
+                loadDailyKlineGovernanceSummary(),
             ])
             const detail = Array.isArray(result.task_ids) && result.task_ids.length > 0
                 ? `已创建 ${result.task_ids.length} 个增量任务（${result.task_ids.join(', ')}）`
@@ -660,6 +677,7 @@ export default function Settings() {
             Promise.all([
                 loadBacktestConfigSnapshot({ syncForm: false }),
                 loadBacktestTaskList(),
+                loadDailyKlineGovernanceSummary(),
             ])
             
             // 启动任务状态轮询
@@ -740,6 +758,7 @@ export default function Settings() {
                     loadBacktestConfigSnapshot({ syncForm: false }),
                     loadBacktestTaskList(),
                     currentPolling.mode === 'subscription' ? loadBacktestStats() : Promise.resolve([]),
+                    loadDailyKlineGovernanceSummary(),
                 ])
             } catch (err) {
                 console.error('轮询任务状态失败:', err)
@@ -817,6 +836,8 @@ export default function Settings() {
         return status || '--'
     }
 
+    const formatCount = (value?: number | null) => Number(value || 0).toLocaleString('zh-CN')
+
     const showQmtHint = selectedDataTypes.includes('minute_kline') || dataSource === 'qmt'
     const qmtConnection = qmtOverview?.connection
     const qmtConnected = Boolean(qmtConnection?.connected)
@@ -852,6 +873,20 @@ export default function Settings() {
     const visibleSubscriptionTasks = subscriptionTaskIds.length > 0
         ? dataTasks.filter(task => subscriptionTaskIds.includes(task.id))
         : (subscriptionStatus?.latest_task ? [subscriptionStatus.latest_task] : [])
+    const subscriptionConfigEnabled = subscriptionStatus?.config_enabled ?? subscriptionStatus?.auto_download ?? false
+    const subscriptionWorkerEnabled = Boolean(subscriptionStatus?.worker_enabled)
+    const subscriptionWorkerRunning = Boolean(subscriptionStatus?.worker_running)
+    const subscriptionEffectiveStatus = subscriptionStatus?.effective_status || (subscriptionConfigEnabled ? 'config_only' : 'disabled')
+    const subscriptionStatusClass =
+        subscriptionEffectiveStatus === 'active'
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-300'
+            : subscriptionEffectiveStatus === 'config_only'
+                ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300'
+                : 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300'
+    const latestDailyReconciliation = dailyKlineGovernance?.latest_reconciliation_runs?.[0] || null
+    const dailyKlinePublishedSources = dailyKlineGovernance?.source_summary || []
+    const dailyKlineRawLayers = dailyKlineGovernance?.raw_layers || []
+    const dailyKlineReconciliationItems = dailyKlineGovernance?.latest_reconciliation_item_summary || []
 
     // 获取数据类型图标
     const getDataTypeIcon = (type: string) => {
@@ -2309,6 +2344,30 @@ export default function Settings() {
                         {onlyTradingDay ? '，仅交易日执行。' : '，自然日执行。'}
                     </div>
 
+                    <div className={`rounded-2xl border px-4 py-3 text-sm ${subscriptionStatusClass}`}>
+                        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                            <div>
+                                <div className="font-semibold">
+                                    {subscriptionStatus?.status_message || '尚未获取订阅运行状态，保存配置或刷新后会显示。'}
+                                </div>
+                                <div className="mt-1 text-xs opacity-80">
+                                    配置开关和后台执行器分开判断；只有两者同时有效，才会按计划自动补齐最新行情。
+                                </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-xs">
+                                <span className="rounded-full bg-white/70 px-2.5 py-1 font-medium dark:bg-slate-950/40">
+                                    订阅规则：{subscriptionConfigEnabled ? '已启用' : '未启用'}
+                                </span>
+                                <span className="rounded-full bg-white/70 px-2.5 py-1 font-medium dark:bg-slate-950/40">
+                                    Worker 配置：{subscriptionWorkerEnabled ? '已开启' : '未开启'}
+                                </span>
+                                <span className="rounded-full bg-white/70 px-2.5 py-1 font-medium dark:bg-slate-950/40">
+                                    当前进程：{subscriptionWorkerRunning ? '运行中' : '未运行'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
                     <div className="grid gap-3 md:grid-cols-4">
                         <div className="rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
                             <div className="text-xs text-slate-500 dark:text-slate-400">上次执行</div>
@@ -2456,6 +2515,126 @@ export default function Settings() {
                                         {subscriptionStatus.intraday_capture.last_error}
                                     </div>
                                 )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4 dark:border-slate-700 dark:bg-slate-950/40">
+                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                            <div>
+                                <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-slate-100">
+                                    <Link2 className="h-4 w-4 text-blue-500" />
+                                    多源增量治理
+                                    {loadingStats && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {dailyKlineGovernance?.read_policy || '当前页面读取历史主表与发布层增量的统一视图。'}
+                                </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
+                                    统一视图：{dailyKlineGovernance?.unified?.table_name || 'market_stock_daily_kline'}
+                                </span>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
+                                    发布层：{dailyKlineGovernance?.published?.table_name || 'pub_stock_daily_kline'}
+                                </span>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
+                                    标准层：{dailyKlineGovernance?.norm?.table_name || 'norm_stock_daily_kline'}
+                                </span>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
+                                    Raw 源：{dailyKlineRawLayers.filter((item) => item.exists).length}/{dailyKlineRawLayers.length || 5}
+                                </span>
+                                <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
+                                    历史主表：{dailyKlineGovernance?.legacy?.table_name || 'stock_daily_kline'}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">统一视图最新日期</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {dailyKlineGovernance?.unified?.date_range_end || '--'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {formatCount(dailyKlineGovernance?.unified?.latest_date_row_count)} 行 / {formatCount(dailyKlineGovernance?.unified?.total_records)} 总行
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">发布层最新日期</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {dailyKlineGovernance?.published?.date_range_end || '--'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {formatCount(dailyKlineGovernance?.published?.latest_date_row_count)} 行 · {dailyKlineGovernance?.published?.source || '--'} / {dailyKlineGovernance?.published?.quality_status || '--'} / {dailyKlineGovernance?.published?.publish_status || '--'}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">历史主表覆盖</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {dailyKlineGovernance?.legacy?.date_range_end || '--'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    {formatCount(dailyKlineGovernance?.legacy?.total_records)} 行 · {dailyKlineGovernance?.legacy?.symbol_count || 0} 只标的
+                                </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
+                                <div className="text-xs text-slate-500 dark:text-slate-400">最新对账</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                    {latestDailyReconciliation?.trade_date || '--'}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    发布 {formatCount(latestDailyReconciliation?.published_count)} · 告警 {formatCount(latestDailyReconciliation?.warning_count)} · 缺失 {formatCount(latestDailyReconciliation?.missing_count)}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="mt-4 grid gap-3 xl:grid-cols-2">
+                            <div className="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-slate-900/40">
+                                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">发布层来源概览</div>
+                                <div className="mt-2 space-y-2">
+                                    {dailyKlinePublishedSources.slice(0, 4).map((source) => (
+                                        <div key={`${source.source}-${source.quality_status}-${source.publish_status}`} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-800 dark:bg-slate-950">
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                <div className="font-medium text-slate-700 dark:text-slate-200">
+                                                    {source.source || '--'} · {source.quality_status || '--'} · {source.publish_status || '--'}
+                                                </div>
+                                                <div className="text-slate-500 dark:text-slate-400">
+                                                    {formatCount(source.latest_date_row_count)} 行
+                                                </div>
+                                            </div>
+                                            <div className="mt-1 text-slate-500 dark:text-slate-400">
+                                                区间：{source.date_range_start || '--'} ~ {source.date_range_end || '--'} ｜ 最近更新：{formatDateTime(source.updated_at)}
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {dailyKlinePublishedSources.length === 0 && (
+                                        <div className="text-xs text-slate-500 dark:text-slate-400">暂无发布层来源摘要，先执行一次日 K 同步或补数。</div>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-slate-900/40">
+                                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">最新对账摘要</div>
+                                <div className="mt-2 space-y-2">
+                                    {dailyKlineReconciliationItems.slice(0, 4).map((item) => (
+                                        <div key={`${item.chosen_source}-${item.publish_status}-${item.quality_status}`} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-800 dark:bg-slate-950">
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                <div className="font-medium text-slate-700 dark:text-slate-200">
+                                                    来源 {item.chosen_source || '--'} · {item.quality_status || '--'}
+                                                </div>
+                                                <div className="text-slate-500 dark:text-slate-400">
+                                                    样本 {formatCount(item.item_count)}
+                                                </div>
+                                            </div>
+                                            <div className="mt-1 text-slate-500 dark:text-slate-400">
+                                                覆盖率 {((Number(item.avg_coverage_ratio || 0) * 100).toFixed(1))}% ｜ 告警 {formatCount(item.warning_count)} ｜ 缺失 {formatCount(item.missing_count)} ｜ 冲突 {formatCount(item.conflict_count)}
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {dailyKlineReconciliationItems.length === 0 && (
+                                        <div className="text-xs text-slate-500 dark:text-slate-400">暂无最新对账摘要，当前可能还没有新的发布运行。</div>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>

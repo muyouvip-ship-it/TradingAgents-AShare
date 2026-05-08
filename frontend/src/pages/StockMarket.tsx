@@ -202,15 +202,14 @@ export default function StockMarket() {
   usePolling(refreshOverview, { intervalMs: 20000, runImmediately: false })
 
   const selectedName = useMemo(() => {
-    const indices = overview?.indices || []
-    const topGainers = overview?.top_gainers || []
-    const topLosers = overview?.top_losers || []
-    const inIndex = indices.find(item => item.symbol === selectedSymbol)?.name
-    if (inIndex) return inIndex
-    const inLists = [...topGainers, ...topLosers].find(item => item.symbol === selectedSymbol)?.name
-    if (inLists) return inLists
     const inSearch = searchResults.find(item => item.symbol === selectedSymbol)?.name
-    return inSearch || selectedSymbol
+    if (inSearch) return inSearch
+    const inMarket = [
+      ...(overview?.indices || []),
+      ...(overview?.top_gainers || []),
+      ...(overview?.top_losers || []),
+    ].find(item => item.symbol === selectedSymbol)?.name
+    return inMarket || selectedSymbol
   }, [overview?.indices, overview?.top_gainers, overview?.top_losers, searchResults, selectedSymbol])
 
   const selectedSearchResult = useMemo(
@@ -218,8 +217,12 @@ export default function StockMarket() {
     [searchResults, selectedSymbol],
   )
   const selectedMarketItem = useMemo(
-    () => [...(overview?.top_gainers || []), ...(overview?.top_losers || [])].find(item => item.symbol === selectedSymbol) || null,
-    [overview?.top_gainers, overview?.top_losers, selectedSymbol],
+    () => [
+      ...(overview?.indices || []),
+      ...(overview?.top_gainers || []),
+      ...(overview?.top_losers || []),
+    ].find(item => item.symbol === selectedSymbol) || null,
+    [overview?.indices, overview?.top_gainers, overview?.top_losers, selectedSymbol],
   )
   const backendGovernance = overview?.data_governance || null
   const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
@@ -377,7 +380,7 @@ export default function StockMarket() {
             <div className="card">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="text-sm font-medium text-slate-500 dark:text-slate-400">当前选中股票</div>
+                  <div className="text-sm font-medium text-slate-500 dark:text-slate-400">当前选中标的</div>
                   <div className="mt-2 text-2xl font-bold text-slate-900 dark:text-slate-100">{selectedName}</div>
                   <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{selectedSymbol}</div>
                 </div>

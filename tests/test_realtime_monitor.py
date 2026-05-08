@@ -8,7 +8,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from api.main import app
 from api.core.strategy_db import get_strategy_db_ctx
-from api.models.strategy_models import RealtimeApprovalDB, RealtimeMonitorDB
+from api.models.strategy_models import RealtimeApprovalDB, RealtimeMonitorDB, RealtimeSignalExecutionDB
 from api.routes.strategy_platform import _default_dsl
 from api.services import qmt_minute_subscription_service, qmt_virtual_account_service, realtime_monitor_service
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
@@ -339,6 +339,122 @@ def test_run_monitor_once_generates_signal_and_order_events(monkeypatch):
     assert "cycle_started" in event_types
     assert "signal_generated" in event_types
     assert "order_submitted" in event_types
+
+
+def test_run_monitor_once_deduplicates_same_bar_signal(monkeypatch):
+    client = _client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    strategy_id = _create_strategy(client, f"同K线去重策略-{uuid4().hex[:6]}")
+    _mock_common(monkeypatch, account_key="paper_sim", role="paper")
+    monkeypatch.setattr("api.services.realtime_monitor_service._is_monitor_trading_window", lambda value: True)
+
+    submit_count = {"value": 0}
+
+    def submit_order(db, user_id, **kwargs):
+        submit_count["value"] += 1
+        return {
+            "message": "QMT 委托已提交",
+            "account_key": kwargs.get("account_key"),
+            "request_id": f"request-{submit_count['value']}",
+            "order_result": {
+                "success": True,
+                "order_id": f"dedupe-{submit_count['value']}-{kwargs['symbol']}",
+            },
+            "overview": {"orders": [], "trades": []},
+        }
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service.submit_qmt_order",
+        submit_order,
+    )
+
+    created = client.post(
+        "/v1/realtime/monitors",
+        headers=headers,
+        json={
+            "name": "同K线信号只执行一次",
+            "strategy_id": strategy_id,
+            "account_key": "paper_sim",
+            "execution_mode": "auto",
+            "monitor_pool": {"symbols": ["000001.SZ"]},
+            "config": {"poll_interval_seconds": 20, "max_signals_per_cycle": 1},
+        },
+    )
+    assert created.status_code == 200
+    monitor_id = created.json()["id"]
+
+    first_run = client.post(f"/v1/realtime/monitors/{monitor_id}/run-once", headers=headers)
+    second_run = client.post(f"/v1/realtime/monitors/{monitor_id}/run-once", headers=headers)
+
+    assert first_run.status_code == 200
+    assert second_run.status_code == 200
+    assert submit_count["value"] == 1
+    second_event_types = [item["event_type"] for item in second_run.json()["events"]]
+    assert "signal_deduplicated" in second_event_types
+    assert second_event_types.count("order_submitted") == 1
+
+    with get_strategy_db_ctx() as db:
+        rows = db.query(RealtimeSignalExecutionDB).filter(RealtimeSignalExecutionDB.monitor_id == monitor_id).all()
+        assert len(rows) == 1
+        assert rows[0].status == "submitted"
+
+
+def test_max_signals_does_not_reserve_deferred_same_bar_signals(monkeypatch):
+    client = _client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    strategy_id = _create_strategy(client, f"同K线延迟信号策略-{uuid4().hex[:6]}")
+    _mock_common(monkeypatch, account_key="paper_sim", role="paper")
+    monkeypatch.setattr("api.services.realtime_monitor_service._is_monitor_trading_window", lambda value: True)
+
+    submit_count = {"value": 0}
+
+    def submit_order(db, user_id, **kwargs):
+        submit_count["value"] += 1
+        return {
+            "message": "QMT 委托已提交",
+            "account_key": kwargs.get("account_key"),
+            "request_id": f"request-{submit_count['value']}",
+            "order_result": {
+                "success": True,
+                "order_id": f"deferred-{submit_count['value']}-{kwargs['symbol']}",
+            },
+            "overview": {"orders": [], "trades": []},
+        }
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service.submit_qmt_order",
+        submit_order,
+    )
+
+    created = client.post(
+        "/v1/realtime/monitors",
+        headers=headers,
+        json={
+            "name": "每轮最多信号不污染账本",
+            "strategy_id": strategy_id,
+            "account_key": "paper_sim",
+            "execution_mode": "auto",
+            "monitor_pool": {"symbols": ["000001.SZ", "000002.SZ"]},
+            "config": {"poll_interval_seconds": 20, "max_signals_per_cycle": 1},
+        },
+    )
+    assert created.status_code == 200
+    monitor_id = created.json()["id"]
+
+    first_run = client.post(f"/v1/realtime/monitors/{monitor_id}/run-once", headers=headers)
+    assert first_run.status_code == 200
+    assert submit_count["value"] == 1
+    with get_strategy_db_ctx() as db:
+        assert db.query(RealtimeSignalExecutionDB).filter(RealtimeSignalExecutionDB.monitor_id == monitor_id).count() == 1
+
+    second_run = client.post(f"/v1/realtime/monitors/{monitor_id}/run-once", headers=headers)
+    assert second_run.status_code == 200
+    assert submit_count["value"] == 2
+    with get_strategy_db_ctx() as db:
+        rows = db.query(RealtimeSignalExecutionDB).filter(RealtimeSignalExecutionDB.monitor_id == monitor_id).order_by(RealtimeSignalExecutionDB.symbol).all()
+        assert [row.symbol for row in rows] == ["000001.SZ", "000002.SZ"]
 
 
 def test_run_monitor_once_blocks_unsellable_sell_signal_without_rejection(monkeypatch):
@@ -985,16 +1101,16 @@ def test_run_monitor_once_replays_positions_and_auto_replaces_stale_order(monkey
     )
     second_run = client.post(f"/v1/realtime/monitors/{monitor_id}/run-once", headers=headers)
     assert second_run.status_code == 200
-    assert submit_count["value"] == 3
+    assert submit_count["value"] == 2
 
     event_types = [item["event_type"] for item in second_run.json()["events"]]
     assert "order_cancel_requested" in event_types
     assert "order_cancelled" in event_types
     assert "order_replace_requested" in event_types
-    assert "signal_generated" in event_types
+    assert "signal_deduplicated" in event_types
     assert "position_changed" in event_types
     summary = second_run.json()["monitor"]["state"]["execution_tracker_summary"]
-    assert summary["pending_orders"] == 2
+    assert summary["pending_orders"] == 1
 
 
 def test_first_day_band_single_symbol_reentry_buy_uses_last_exit_quantity(monkeypatch):
@@ -1068,6 +1184,31 @@ def test_monitor_due_handles_naive_local_heartbeat():
     )
 
     assert realtime_monitor_service._monitor_due(monitor) is True
+
+
+def test_repetitive_status_event_guard_suppresses_until_cooldown():
+    monitor = SimpleNamespace(state_json={})
+    now = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+
+    assert realtime_monitor_service._mark_repetitive_status_event_allowed(
+        monitor,
+        "cycle_skipped",
+        "outside_trading_session",
+        now,
+    ) is True
+    assert realtime_monitor_service._mark_repetitive_status_event_allowed(
+        monitor,
+        "cycle_skipped",
+        "outside_trading_session",
+        now + timedelta(seconds=20),
+    ) is False
+    assert monitor.state_json["event_guard"]["cycle_skipped:outside_trading_session"]["suppressed_count"] == 1
+    assert realtime_monitor_service._mark_repetitive_status_event_allowed(
+        monitor,
+        "cycle_skipped",
+        "outside_trading_session",
+        now + timedelta(seconds=301),
+    ) is True
 
 
 def test_build_position_items_skips_broken_row(monkeypatch):

@@ -81,6 +81,11 @@ class BacktestDataConfig(BaseModel):
 class BacktestDataSubscriptionStatus(BaseModel):
     config_id: int
     auto_download: bool
+    config_enabled: Optional[bool] = None
+    worker_enabled: Optional[bool] = None
+    worker_running: Optional[bool] = None
+    effective_status: Optional[str] = None
+    status_message: Optional[str] = None
     next_run_at: Optional[datetime]
     now: datetime
     running_task_count: int

@@ -1,11 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 from types import SimpleNamespace
 from uuid import uuid4
 
-from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, get_db_ctx
+from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, get_db_ctx
 from api.data_downloader import DataDownloader
+from api.services import auth_service
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
 
 
@@ -20,6 +21,35 @@ def _auth(client: TestClient) -> str:
     code = response.json()["dev_code"]
     verified = client.post("/v1/auth/verify-code", json={"email": "virtual-warehouse@test.com", "code": code})
     return verified.json()["access_token"]
+
+
+def test_default_qmt_account_configs_do_not_import_env_accounts(monkeypatch):
+    fake_settings = SimpleNamespace(
+        qmt_host="192.168.10.1",
+        qmt_port=58610,
+        qmt_account_id="39027628",
+        qmt_account_type="STOCK",
+        qmt_account_name="Env QMT Account",
+        qmt_userdata_path="D:/env/userdata_mini",
+        qmt_bridge_base_url="http://192.168.10.1:8710",
+        qmt_accounts=lambda: [
+            {
+                "key": "paper_sim",
+                "enabled": True,
+                "role": "paper",
+                "account_id": "39027628",
+                "bridge_base_url": "http://192.168.10.1:8710",
+            }
+        ],
+    )
+    monkeypatch.setattr(auth_service, "settings", fake_settings)
+
+    configs = auth_service.default_qmt_account_configs()
+
+    assert configs["paper"]["key"] == "paper_sim"
+    assert configs["paper"]["enabled"] is False
+    assert configs["paper"]["account_id"] == ""
+    assert configs["paper"]["bridge_base_url"] == ""
 
 
 def test_qmt_virtual_warehouse_overview(monkeypatch):
@@ -587,8 +617,82 @@ def test_qmt_overview_falls_back_to_cached_snapshot(monkeypatch):
     assert second_payload["data_source"] == "cache"
     assert second_payload["is_stale"] is True
     assert second_payload["connection"]["connected"] is True
+    assert second_payload["connection"]["health_status"] == "snapshot_available"
+    assert second_payload["connection"]["health_label"] == "快照可用"
     assert second_payload["positions"][0]["name"] == "平安银行"
     assert "最近快照" in second_payload["connection"]["message"]
+
+
+def test_qmt_overview_uses_sync_profile_for_background_health(monkeypatch):
+    client = _get_client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    user_id = auth_service.decode_access_token(token)["sub"]
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_health",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="39027628",
+                account_type="STOCK",
+                account_name="QMT 模拟仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._query_qmt_snapshot_via_bridge",
+        lambda config: {
+            "fund": {"assetBalance": 100000.0, "marketValue": 20000.0, "enableBalance": 80000.0},
+            "positions": [],
+            "orders": [],
+            "trades": [],
+            "asset": {"cash": 80000.0},
+        },
+    )
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._fetch_live_quotes", lambda symbols, **kwargs: {})
+
+    first_response = client.get("/v1/virtual-warehouse/qmt/overview?account_key=paper_health", headers=headers)
+    assert first_response.status_code == 200
+    with get_db_ctx() as db:
+        db.add(
+            QmtSyncProfileDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                account_key="paper_health",
+                is_active=True,
+                sync_interval_seconds=30,
+                sync_tracking_board=False,
+                alert_on_disconnect=True,
+                last_synced_at=datetime.now(timezone.utc),
+                last_status="success",
+                consecutive_failures=0,
+            )
+        )
+        db.commit()
+
+    def fail_query(config):
+        raise RuntimeError("bridge disconnected")
+
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._query_qmt_snapshot_via_bridge", fail_query)
+
+    second_response = client.get("/v1/virtual-warehouse/qmt/overview?account_key=paper_health", headers=headers)
+    assert second_response.status_code == 200
+    payload = second_response.json()
+    assert payload["data_source"] == "cache"
+    assert payload["is_stale"] is True
+    assert payload["sync_profile"]["last_status"] == "success"
+    assert payload["connection"]["health_status"] == "background_live"
+    assert payload["connection"]["health_label"] == "后台在线"
+    assert payload["connection"]["effective_connected"] is True
 
 
 def test_qmt_overview_uses_cached_summary_for_inactive_account(monkeypatch):
@@ -916,6 +1020,7 @@ def test_qmt_cancel_order_rejects_live_account(monkeypatch):
 
 
 def test_qmt_history_bridge_uses_paper_account_key(monkeypatch):
+    monkeypatch.delenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY", raising=False)
     monkeypatch.delenv("QMT_HISTORY_BRIDGE_BASE_URL", raising=False)
     monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "paper_sim")
     fake_settings = SimpleNamespace(
@@ -955,6 +1060,7 @@ def test_qmt_history_bridge_uses_paper_account_key(monkeypatch):
 
 
 def test_qmt_history_bridge_rejects_live_history_key(monkeypatch):
+    monkeypatch.delenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY", raising=False)
     monkeypatch.delenv("QMT_HISTORY_BRIDGE_BASE_URL", raising=False)
     monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "live_real")
     fake_settings = SimpleNamespace(
@@ -981,6 +1087,7 @@ def test_qmt_history_bridge_rejects_live_history_key(monkeypatch):
 
 
 def test_qmt_history_bridge_rejects_explicit_live_port(monkeypatch):
+    monkeypatch.delenv("QMT_MINUTE_HISTORY_ACCOUNT_KEY", raising=False)
     monkeypatch.setenv("QMT_HISTORY_BRIDGE_BASE_URL", "http://192.168.10.1:8711")
     monkeypatch.setenv("QMT_HISTORY_ACCOUNT_KEY", "paper_sim")
 

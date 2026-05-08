@@ -14,8 +14,27 @@ import type {
 } from '@/types'
 
 type ControlAction = 'start' | 'pause' | 'stop' | 'resume' | 'fuse-reset'
+type EventFlowTab = 'trading' | 'diagnostics'
 const REALTIME_EVENT_LIMIT = 1000
 const REALTIME_INITIAL_EVENT_LIMIT = 500
+const DIAGNOSTIC_EVENT_TYPES = new Set([
+  'cycle_started',
+  'cycle_skipped',
+  'execution_tracker_initialized',
+  'fuse_reset',
+  'manual_cycle_requested',
+  'market_snapshot',
+  'minute_capture',
+  'minute_features',
+  'monitor_fused',
+  'monitor_paused',
+  'monitor_resumed',
+  'monitor_started',
+  'monitor_stopped',
+  'no_signal',
+  'signal_deduplicated',
+  'signal_evaluation_skipped',
+])
 
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
@@ -422,9 +441,20 @@ function isTradingFlowEvent(item: RealtimeEvent) {
   return false
 }
 
+function isDiagnosticFlowEvent(item: RealtimeEvent) {
+  if (DIAGNOSTIC_EVENT_TYPES.has(item.event_type)) return true
+  return item.event_type === 'position_changed'
+}
+
 function buildTradeFlowItems(events: RealtimeEvent[]) {
   return events
     .filter(isTradingFlowEvent)
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+}
+
+function buildDiagnosticFlowItems(events: RealtimeEvent[]) {
+  return events
+    .filter(isDiagnosticFlowEvent)
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
 }
 
@@ -721,30 +751,57 @@ function renderEventDetail(item: RealtimeEvent) {
   const payload = item.payload || {}
 
   if (item.event_type === 'minute_features') {
-    const first = Array.isArray(payload.items) ? payload.items[0] as Record<string, unknown> | undefined : undefined
-    if (!first) return null
+    const features = Array.isArray(payload.items) ? payload.items as Record<string, unknown>[] : []
+    const first = features[0]
+    const missingSymbols = Array.isArray(payload.missing_symbols) ? payload.missing_symbols.map(String).filter(Boolean) : []
+    const staleSymbols = Array.isArray(payload.stale_symbols) ? payload.stale_symbols.map(String).filter(Boolean) : []
     return (
       <div className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
         <div>周期：{timeframeLabel(String(payload.timeframe || ''))} ｜ 数据源：{String(payload.source || '--')}</div>
-        <div className="mt-1">
-          波段：{formatPrice(Number(first.first_day_band || NaN))} ｜ B1：{formatPrice(Number(first.first_day_band_b1 || NaN))}
-        </div>
-        <div className="mt-1">
-          判定：{signalSideLabel(String(first.signal || 'hold'))}
-          {Boolean(first.cross_above) ? '（金叉）' : Boolean(first.cross_below) ? '（死叉）' : '（未交叉）'}
-        </div>
-        <div className="mt-1">
-          K 线：{formatPrice(Number(first.open || NaN))} / {formatPrice(Number(first.high || NaN))} / {formatPrice(Number(first.low || NaN))} / {formatPrice(Number(first.close || NaN))}
-        </div>
+        <div className="mt-1">最新闭合 K 线：{String(payload.latest_closed_bar_end || '--')}</div>
+        {features.length ? (
+          <div className="mt-1">
+            已判定：{features.slice(0, 4).map(row => `${String(row.symbol || '--')} ${signalSideLabel(String(row.signal || 'hold'))}`).join('；')}
+          </div>
+        ) : null}
+        {missingSymbols.length || staleSymbols.length ? (
+          <div className="mt-1 text-amber-700 dark:text-amber-300">
+            {staleSymbols.length ? `分钟线滞后：${staleSymbols.slice(0, 8).join('、')}` : ''}
+            {staleSymbols.length && missingSymbols.length ? ' ｜ ' : ''}
+            {missingSymbols.length ? `本轮缺失：${missingSymbols.slice(0, 8).join('、')}` : ''}
+          </div>
+        ) : null}
+        {first ? (
+          <>
+            <div className="mt-1">
+              波段：{formatPrice(Number(first.first_day_band || NaN))} ｜ B1：{formatPrice(Number(first.first_day_band_b1 || NaN))}
+            </div>
+            <div className="mt-1">
+              K 线：{formatPrice(Number(first.open || NaN))} / {formatPrice(Number(first.high || NaN))} / {formatPrice(Number(first.low || NaN))} / {formatPrice(Number(first.close || NaN))}
+            </div>
+          </>
+        ) : null}
       </div>
     )
   }
 
   if (item.event_type === 'minute_capture') {
+    const rowsBySymbol = payload.symbol_rows && typeof payload.symbol_rows === 'object'
+      ? payload.symbol_rows as Record<string, unknown>
+      : {}
+    const latestBySymbol = payload.symbol_latest_trade_times && typeof payload.symbol_latest_trade_times === 'object'
+      ? payload.symbol_latest_trade_times as Record<string, unknown>
+      : {}
+    const symbolRows = Object.entries(rowsBySymbol).slice(0, 8)
     return (
       <div className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-950 dark:text-slate-300">
         <div>交易日：{String(payload.trade_date || '--')} ｜ 数据源：{String(payload.source || '--')}</div>
         <div className="mt-1">写入条数：{formatNumber(Number(payload.rows || 0))}</div>
+        {symbolRows.length ? (
+          <div className="mt-1">
+            分票：{symbolRows.map(([symbol, rows]) => `${symbol} ${formatNumber(Number(rows || 0))}条 / ${String(latestBySymbol[symbol] || '--')}`).join('；')}
+          </div>
+        ) : null}
       </div>
     )
   }
@@ -806,6 +863,7 @@ export default function RealtimeMonitorPage() {
   const [streamStatus, setStreamStatus] = useState('未连接')
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<RealtimeMonitor | null>(null)
+  const [eventFlowTab, setEventFlowTab] = useState<EventFlowTab>('trading')
   const streamAbortRef = useRef<AbortController | null>(null)
   const snapshotRefreshTimerRef = useRef<number | null>(null)
 
@@ -1188,6 +1246,11 @@ export default function RealtimeMonitorPage() {
   )
 
   const eventFlowItems = useMemo(() => buildTradeFlowItems(events), [events])
+  const diagnosticFlowItems = useMemo(() => buildDiagnosticFlowItems(events), [events])
+  const activeEventFlowItems = eventFlowTab === 'trading' ? eventFlowItems : diagnosticFlowItems
+  const activeEventFlowEmptyText = eventFlowTab === 'trading'
+    ? '当前还没有交易相关事件，触发信号或委托后这里会持续刷新。'
+    : '当前还没有运行诊断事件，下一轮监控循环后这里会展示分钟线、无信号和持仓快照变化。'
   const selectedMonitorPrimaryControl = useMemo(
     () => (selectedMonitor ? primaryControlMeta(selectedMonitor.status) : null),
     [selectedMonitor],
@@ -1543,15 +1606,38 @@ export default function RealtimeMonitorPage() {
                     <Activity className="h-5 w-5 text-blue-500" />
                     事件流动
                   </div>
-                  <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">只显示交易相关事件：信号、委托、成交、撤补、拒单、风控拦截和真实持仓变化。</div>
+                  <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                    {eventFlowTab === 'trading'
+                      ? '交易执行只显示信号、委托、成交、撤补、拒单、风控拦截和真实持仓数量变化。'
+                      : '运行诊断显示每轮监控、分钟线采集、无信号、重复信号跳过和持仓快照刷新。'}
+                  </div>
+                  <div className="mt-4 flex w-full rounded-xl bg-slate-100 p-1 text-xs font-semibold dark:bg-slate-950">
+                    {[
+                      { key: 'trading' as const, label: '交易执行', count: eventFlowItems.length },
+                      { key: 'diagnostics' as const, label: '运行诊断', count: diagnosticFlowItems.length },
+                    ].map(tab => (
+                      <button
+                        key={tab.key}
+                        type="button"
+                        onClick={() => setEventFlowTab(tab.key)}
+                        className={`flex-1 rounded-lg px-3 py-2 transition ${
+                          eventFlowTab === tab.key
+                            ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
+                            : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
+                        }`}
+                      >
+                        {tab.label} {tab.count}
+                      </button>
+                    ))}
+                  </div>
                   <div className="mt-4 pr-1">
                     <VirtualList
-                      items={eventFlowItems}
+                      items={activeEventFlowItems}
                       height={980}
                       estimateSize={172}
                       gap={12}
                       overscan={5}
-                      empty={<div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">当前还没有交易相关事件，触发信号或委托后这里会持续刷新。</div>}
+                      empty={<div className="rounded-2xl bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">{activeEventFlowEmptyText}</div>}
                       itemKey={(item) => item.id}
                       renderItem={(item) => (
                         <div>
@@ -1731,6 +1817,9 @@ export default function RealtimeMonitorPage() {
                       onChange={event => setForm(current => ({ ...current, poll_interval_seconds: Number(event.target.value) || 20 }))}
                       className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                     />
+                    <div className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                      行情采样频率；交易指令会按监控 K 线去重，同一 K 线内同一信号只触发一次。
+                    </div>
                   </label>
                   <label className="block">
                     <div className="text-sm text-slate-500 dark:text-slate-400">单轮最大信号数</div>

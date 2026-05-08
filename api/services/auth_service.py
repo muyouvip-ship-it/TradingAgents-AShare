@@ -279,6 +279,9 @@ def normalize_qmt_account_config(payload: Optional[dict[str, Any]], *, role: str
 
 
 def default_qmt_account_configs() -> dict[str, dict[str, Any]]:
+    # QMT account identity must come from the user runtime settings stored in DB.
+    # Environment variables may still provide generic connectivity defaults, but
+    # they should not silently enable or inject a trading account.
     defaults: dict[str, dict[str, Any]] = {
         "paper": normalize_qmt_account_config(
             {
@@ -287,11 +290,8 @@ def default_qmt_account_configs() -> dict[str, dict[str, Any]]:
                 "enabled": False,
                 "host": settings.qmt_host,
                 "port": settings.qmt_port,
-                "account_id": settings.qmt_account_id,
                 "account_type": settings.qmt_account_type,
-                "account_name": settings.qmt_account_name or "QMT 虚拟账户",
-                "userdata_path": settings.qmt_userdata_path,
-                "bridge_base_url": settings.qmt_bridge_base_url,
+                "account_name": "QMT 模拟账户",
             },
             role="paper",
         ),
@@ -311,9 +311,6 @@ def default_qmt_account_configs() -> dict[str, dict[str, Any]]:
             role="live",
         ),
     }
-    for raw in settings.qmt_accounts():
-        role = "live" if str(raw.get("role") or "").strip().lower() == "live" else "paper"
-        defaults[role] = normalize_qmt_account_config(raw, role=role, defaults=defaults.get(role))
     return defaults
 
 

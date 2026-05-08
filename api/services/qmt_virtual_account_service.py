@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from api.core.stock_map import get_reverse_stock_map_cached_only
 from api.core.settings import settings
-from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, VirtualPositionStateDB
+from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, VirtualPositionStateDB
 from api.services import auth_service, portfolio_import_service
 from api.services.data_source_governance import build_virtual_warehouse_governance
 
@@ -137,6 +137,7 @@ def get_qmt_virtual_account_overview(
     allow_cache_fallback: bool = True,
 ) -> dict[str, Any]:
     configs = _load_runtime_configs(db=db, user_id=user_id)
+    sync_profile_map = _load_qmt_sync_profile_map(db, user_id)
     account_summaries: list[dict[str, Any]] = []
     active_payload: dict[str, Any] | None = None
     active_key = _resolve_active_key(configs, account_key, preferred_role=preferred_role)
@@ -154,6 +155,7 @@ def get_qmt_virtual_account_overview(
             )
         else:
             payload = _load_cached_payload(db, user_id, config) or _load_empty_payload(config)
+        payload = _annotate_qmt_connection_health(payload, sync_profile_map.get(config.key))
         account_summaries.append({
             "account_key": config.key,
             "role": config.role,
@@ -164,12 +166,17 @@ def get_qmt_virtual_account_overview(
             "last_synced_at": payload.get("last_synced_at"),
             "data_source": payload.get("data_source"),
             "is_stale": bool(payload.get("is_stale", False)),
+            "sync_profile": payload.get("sync_profile"),
         })
         if is_active:
             active_payload = payload
 
     if active_payload is None:
-        active_payload = _load_empty_payload(_pick_active_config(configs, active_key))
+        fallback_config = _pick_active_config(configs, active_key)
+        active_payload = _annotate_qmt_connection_health(
+            _load_empty_payload(fallback_config),
+            sync_profile_map.get(fallback_config.key),
+        )
 
     active_account_key = active_payload["connection"].get("account_key")
     response_payload = {
@@ -216,6 +223,113 @@ def sync_qmt_virtual_positions(db: Session, user_id: str, account_key: str | Non
         },
         "overview": overview,
     }
+
+
+def _load_qmt_sync_profile_map(db: Session, user_id: str) -> dict[str, dict[str, Any]]:
+    rows = (
+        db.query(QmtSyncProfileDB)
+        .filter(QmtSyncProfileDB.user_id == user_id)
+        .all()
+    )
+    return {str(row.account_key): _qmt_sync_profile_to_dict(row) for row in rows}
+
+
+def _qmt_sync_profile_to_dict(row: QmtSyncProfileDB) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "user_id": row.user_id,
+        "account_key": row.account_key,
+        "is_active": bool(row.is_active),
+        "sync_interval_seconds": int(row.sync_interval_seconds or 30),
+        "sync_tracking_board": bool(row.sync_tracking_board),
+        "alert_on_disconnect": bool(row.alert_on_disconnect),
+        "last_synced_at": row.last_synced_at.isoformat() if row.last_synced_at else None,
+        "last_status": row.last_status,
+        "last_error": row.last_error,
+        "consecutive_failures": int(row.consecutive_failures or 0),
+        "last_alerted_at": row.last_alerted_at.isoformat() if row.last_alerted_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _annotate_qmt_connection_health(payload: dict[str, Any], sync_profile: dict[str, Any] | None) -> dict[str, Any]:
+    annotated = dict(payload)
+    connection = dict(annotated.get("connection") or {})
+    profile = dict(sync_profile or {}) if sync_profile else None
+    annotated["sync_profile"] = profile
+
+    is_stale = bool(annotated.get("is_stale"))
+    direct_connected = bool(connection.get("connected")) and not is_stale
+    profile_is_fresh = _is_qmt_sync_profile_fresh(profile)
+    snapshot_available = bool(
+        annotated.get("last_synced_at")
+        or annotated.get("account")
+        or annotated.get("positions")
+        or annotated.get("orders")
+        or annotated.get("trades")
+    )
+
+    profile_success_at = str((profile or {}).get("last_synced_at") or "").strip() or None
+    if direct_connected:
+        health_status = "live"
+        health_label = "实时直连"
+        health_message = connection.get("message") or "本次 QMT 快照查询成功。"
+        effective_connected = True
+    elif profile_is_fresh:
+        health_status = "background_live"
+        health_label = "后台在线"
+        health_message = f"后台同步最近成功于 {profile_success_at}，页面当前展示快照数据。"
+        effective_connected = True
+    elif snapshot_available:
+        health_status = "snapshot_available"
+        health_label = "快照可用"
+        health_message = connection.get("message") or "页面当前展示最近一次成功同步的 QMT 快照，等待下一次后台刷新。"
+        effective_connected = False
+    else:
+        health_status = "disconnected"
+        health_label = "未连接"
+        health_message = connection.get("message") or "当前没有可用的 QMT 连接或本地快照。"
+        effective_connected = False
+
+    connection["health_status"] = health_status
+    connection["health_label"] = health_label
+    connection["health_message"] = health_message
+    connection["effective_connected"] = effective_connected
+    if profile_success_at:
+        connection["last_background_success_at"] = profile_success_at
+    if profile and profile.get("last_status"):
+        connection["background_status"] = profile.get("last_status")
+    annotated["connection"] = connection
+    return annotated
+
+
+def _is_qmt_sync_profile_fresh(profile: dict[str, Any] | None) -> bool:
+    if not profile:
+        return False
+    if not bool(profile.get("is_active")):
+        return False
+    if str(profile.get("last_status") or "").lower() != "success":
+        return False
+    last_synced_at = _parse_qmt_sync_profile_datetime(profile.get("last_synced_at"))
+    if last_synced_at is None:
+        return False
+    interval = max(int(profile.get("sync_interval_seconds") or 30), 10)
+    freshness_seconds = max(interval * 3, 120)
+    return (datetime.now(timezone.utc) - last_synced_at) <= timedelta(seconds=freshness_seconds)
+
+
+def _parse_qmt_sync_profile_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=CN_TZ).astimezone(timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def list_qmt_orders(db: Session, user_id: str, *, account_key: str | None = None) -> dict[str, Any]:
@@ -572,7 +686,11 @@ def diagnose_qmt_accounts(db: Session | None = None, user_id: str | None = None,
 
 def _runtime_configs(*, db: Session | None = None, user_id: str | None = None) -> list[QmtRuntimeConfig]:
     configs: list[QmtRuntimeConfig] = []
-    raw_accounts = auth_service.get_user_qmt_account_configs(db, user_id).values() if db is not None and user_id else settings.qmt_accounts()
+    raw_accounts = (
+        auth_service.get_user_qmt_account_configs(db, user_id).values()
+        if db is not None and user_id
+        else auth_service.default_qmt_account_configs().values()
+    )
     for raw in raw_accounts:
         configs.append(
             QmtRuntimeConfig(
@@ -592,16 +710,16 @@ def _runtime_configs(*, db: Session | None = None, user_id: str | None = None) -
         )
     return configs or [
         QmtRuntimeConfig(
-            key="qmt_default",
+            key="paper_sim",
             enabled=False,
             host=settings.qmt_host,
             port=settings.qmt_port,
             account_id="",
             account_type=settings.qmt_account_type or "STOCK",
-            account_name="QMT 账户",
+            account_name="QMT 模拟账户",
             userdata_path="",
             role="paper",
-            bridge_base_url=str(settings.qmt_bridge_base_url or "").strip(),
+            bridge_base_url="",
             bridge_token=str(settings.qmt_bridge_token or "").strip(),
             refresh_interval_seconds=max(int(settings.qmt_refresh_interval_seconds or 10), 5),
         )
@@ -677,7 +795,7 @@ def _load_account_payload(
     }
     empty = _load_empty_payload(config, connection=connection)
     if not config.enabled:
-        connection["message"] = "当前账户未启用，请在 QMT_ACCOUNTS_JSON 或环境变量中打开 enabled。"
+        connection["message"] = "当前账户未启用，请在设置页的 QMT 账户配置中打开 enabled。"
         return empty
     if not config.account_id:
         connection["message"] = "缺少 account_id，无法查询账户资产。"

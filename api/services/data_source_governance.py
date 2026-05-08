@@ -355,6 +355,16 @@ def build_virtual_warehouse_governance(payload: Mapping[str, Any]) -> dict[str, 
     is_stale = bool(payload.get("is_stale", False))
     fetched_at = str(payload.get("fetched_at") or "")
     last_synced_at = str(payload.get("last_synced_at") or "")
+    health_label = str(connection.get("health_label") or ("已连接" if connection.get("connected") else "未连接"))
+    health_message = str(connection.get("health_message") or connection.get("message") or "")
+    health_status = str(connection.get("health_status") or "")
+    effective_connected = bool(connection.get("effective_connected") or connection.get("connected"))
+    if health_status == "snapshot_available":
+        health_tone = "warn"
+    elif effective_connected:
+        health_tone = "good"
+    else:
+        health_tone = "bad"
     if background_refresh.get("active"):
         refresh_value = "刷新中"
         refresh_detail = f"后台任务开始于 {background_refresh.get('started_at') or '--'}"
@@ -382,10 +392,16 @@ def build_virtual_warehouse_governance(payload: Mapping[str, Any]) -> dict[str, 
         description="区分当前是实时 QMT、近期缓存、数据库快照，还是后台刷新中的中间状态。",
         items=[
             build_item(
+                "QMT 链路状态",
+                health_label,
+                health_message or "账户、持仓、委托与成交都沿用同一账户链路返回。",
+                tone=health_tone,
+            ),
+            build_item(
                 "账户数据源",
                 data_source,
                 "账户、持仓、委托与成交都沿用同一账户链路返回。",
-                tone="warn" if is_stale else ("good" if connection.get("connected") else "bad"),
+                tone="warn" if is_stale else ("good" if effective_connected else "bad"),
             ),
             build_item(
                 "页面状态",

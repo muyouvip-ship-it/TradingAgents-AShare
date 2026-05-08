@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone, time as dtime
 
 from sqlalchemy import text
 
-from api.core.settings import settings
 from api.database import SessionLocal
+from api.services.qmt_market_data_service import resolve_market_account_key
 from api.services import qmt_virtual_account_service, watchlist_service
 from api.services.qmt_realtime_minute_capture_service import capture_today_minute_bars
 from tradingagents.dataflows.trade_calendar import is_cn_trading_day
@@ -103,7 +103,7 @@ def _should_capture(db, row, now: datetime) -> bool:
 
 
 def _capture_single_config(db, row, now: datetime) -> None:
-    account_key = str(settings.qmt_history_account_key or "paper_sim").strip() or "paper_sim"
+    account_key = str(resolve_market_account_key(db=db, user_id=str(row.user_id)) or "paper_sim").strip() or "paper_sim"
     symbols = _resolve_capture_symbols(db, str(row.user_id), row.default_symbols or [], account_key=account_key)
     scope_key = _capture_scope_key(symbols)
     trade_date = now.astimezone().date().isoformat()
@@ -125,6 +125,8 @@ def _capture_single_config(db, row, now: datetime) -> None:
         account_key=account_key,
         symbols=symbols,
         trade_date=trade_date,
+        db=db,
+        user_id=str(row.user_id),
     )
     _touch_intraday_watermark(
         db,

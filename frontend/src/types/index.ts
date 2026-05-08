@@ -1358,6 +1358,11 @@ export interface BacktestDataWatermark {
 export interface BacktestDataSubscriptionStatus {
     config_id: number
     auto_download: boolean
+    config_enabled?: boolean | null
+    worker_enabled?: boolean | null
+    worker_running?: boolean | null
+    effective_status?: 'active' | 'config_only' | 'disabled' | string | null
+    status_message?: string | null
     timezone?: string
     next_run_at?: string | null
     now: string
@@ -1366,6 +1371,61 @@ export interface BacktestDataSubscriptionStatus {
     watermarks: BacktestDataWatermark[]
     latest_watermark_date?: string | null
     intraday_capture?: BacktestDataWatermark | null
+}
+
+export interface DailyKlineGovernanceTableSummary {
+    table_name?: string
+    layer?: string
+    source?: string
+    exists?: boolean
+    description?: string
+    total_records?: number
+    symbol_count?: number
+    trading_days?: number
+    date_range_start?: string | null
+    date_range_end?: string | null
+    latest_date_row_count?: number
+    last_table_updated_at?: string | null
+    updated_at?: string | null
+    quality_status?: string
+    publish_status?: string
+}
+
+export interface DailyKlineReconciliationRun {
+    run_id: string
+    trade_date?: string | null
+    published_count?: number
+    warning_count?: number
+    missing_count?: number
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface DailyKlineReconciliationItemSummary {
+    chosen_source?: string
+    publish_status?: string
+    quality_status?: string
+    item_count?: number
+    avg_coverage_ratio?: number
+    issue_count?: number
+    conflict_count?: number
+    warning_count?: number
+    missing_count?: number
+}
+
+export interface DailyKlineGovernanceSummaryResponse {
+    success: boolean
+    updated_at: string
+    preferred_table: string
+    read_policy?: string
+    unified: DailyKlineGovernanceTableSummary
+    legacy: DailyKlineGovernanceTableSummary
+    published: DailyKlineGovernanceTableSummary
+    norm: DailyKlineGovernanceTableSummary
+    raw_layers: DailyKlineGovernanceTableSummary[]
+    source_summary: DailyKlineGovernanceTableSummary[]
+    latest_reconciliation_runs: DailyKlineReconciliationRun[]
+    latest_reconciliation_item_summary: DailyKlineReconciliationItemSummary[]
 }
 
 export interface BacktestDataConfigItem {
@@ -1555,6 +1615,12 @@ export interface VirtualWarehouseConnection {
     userdata_path?: string
     connected: boolean
     message: string
+    effective_connected?: boolean
+    health_status?: 'live' | 'background_live' | 'snapshot_available' | 'disconnected' | string
+    health_label?: string
+    health_message?: string
+    last_background_success_at?: string | null
+    background_status?: string | null
 }
 
 export interface VirtualWarehouseAccount {
@@ -1642,6 +1708,7 @@ export interface VirtualWarehouseOverviewResponse {
         last_synced_at?: string | null
         data_source?: string
         is_stale?: boolean
+        sync_profile?: QmtSyncProfile | null
     }>
     connection: VirtualWarehouseConnection
     account: VirtualWarehouseAccount | null
@@ -1661,6 +1728,7 @@ export interface VirtualWarehouseOverviewResponse {
     last_synced_at?: string | null
     data_source?: string
     is_stale?: boolean
+    sync_profile?: QmtSyncProfile | null
 }
 
 export interface VirtualWarehouseBackgroundRefresh {

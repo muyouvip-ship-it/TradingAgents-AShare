@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from api.database import QmtSyncProfileDB, SessionLocal, UserDB
 from api.services import auth_service, qmt_virtual_account_service
 from api.services.wecom_notification_service import send_message
+from tradingagents.dataflows.trade_calendar import CN_TZ
 
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,19 @@ def _should_run(row: QmtSyncProfileDB, now: datetime) -> bool:
 
 def _run_single_profile(db: Session, row: QmtSyncProfileDB, now: datetime) -> None:
     try:
+        config = qmt_virtual_account_service._resolve_runtime_config(
+            row.account_key,
+            db=db,
+            user_id=row.user_id,
+        )
+        if not config.enabled:
+            row.last_synced_at = now
+            row.last_status = "skipped_disabled"
+            row.last_error = "当前账户未启用，后台同步已跳过。"
+            db.add(row)
+            db.commit()
+            logger.info("[qmt-sync] skipped disabled profile user=%s account=%s", row.user_id, row.account_key)
+            return
         overview = qmt_virtual_account_service.get_qmt_virtual_account_overview(
             db,
             row.user_id,
@@ -216,5 +230,5 @@ def _to_dict(row: QmtSyncProfileDB) -> dict:
 
 def _ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=CN_TZ).astimezone(timezone.utc)
     return value.astimezone(timezone.utc)

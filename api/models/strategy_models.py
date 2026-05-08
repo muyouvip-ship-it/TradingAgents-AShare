@@ -6,7 +6,7 @@
 
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import Column, String, Integer, Boolean, Float, Text, DateTime, Date, JSON, ForeignKey, Enum, Index
+from sqlalchemy import Column, String, Integer, Boolean, Float, Text, DateTime, Date, JSON, ForeignKey, Enum, Index, UniqueConstraint
 from sqlalchemy.orm import declarative_base, relationship
 import enum
 import uuid
@@ -484,6 +484,60 @@ class RealtimeEventDB(Base):
         }
 
 
+class RealtimeSignalExecutionDB(Base):
+    """实时监控信号执行账本，保证同一信号只进入一次交易链路。"""
+
+    __tablename__ = "realtime_signal_executions"
+    __table_args__ = (
+        UniqueConstraint("monitor_id", "signal_key", name="uq_realtime_signal_execution_monitor_key"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    monitor_id = Column(String(36), ForeignKey("realtime_monitors.id"), index=True, nullable=False, comment="监控实例ID")
+    user_id = Column(String(64), index=True, nullable=False, comment="用户ID")
+    account_key = Column(String(64), index=True, nullable=False, comment="账户Key")
+    strategy_id = Column(String(36), index=True, nullable=True, comment="策略ID")
+    strategy_version_id = Column(String(64), nullable=True, comment="策略版本ID")
+    symbol = Column(String(20), index=True, nullable=False, comment="股票代码")
+    side = Column(String(10), nullable=False, comment="方向")
+    timeframe = Column(String(20), index=True, nullable=True, comment="触发周期")
+    bar_end = Column(String(40), index=True, nullable=True, comment="触发K线结束时间")
+    signal_key = Column(String(80), index=True, nullable=False, comment="信号幂等键")
+    status = Column(String(32), default="reserved", index=True, comment="reserved/generated/submitted/rejected")
+    signal_identity_json = Column(JSON, nullable=True, comment="信号身份")
+    signal_payload_json = Column(JSON, nullable=True, comment="信号载荷")
+    order_intent_json = Column(JSON, nullable=True, comment="委托意图")
+    broker_result_json = Column(JSON, nullable=True, comment="券商返回")
+    error_message = Column(Text, nullable=True, comment="错误信息")
+    first_seen_at = Column(DateTime, default=datetime.now, index=True, comment="首次发现时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    monitor = relationship("RealtimeMonitorDB")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "monitor_id": self.monitor_id,
+            "user_id": self.user_id,
+            "account_key": self.account_key,
+            "strategy_id": self.strategy_id,
+            "strategy_version_id": self.strategy_version_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "timeframe": self.timeframe,
+            "bar_end": self.bar_end,
+            "signal_key": self.signal_key,
+            "status": self.status,
+            "signal_identity": self.signal_identity_json or {},
+            "signal_payload": self.signal_payload_json or {},
+            "order_intent": self.order_intent_json or {},
+            "broker_result": self.broker_result_json or {},
+            "error_message": self.error_message,
+            "first_seen_at": self.first_seen_at.isoformat() if self.first_seen_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class RealtimeApprovalDB(Base):
     """实时监控人工确认任务表。"""
 
@@ -527,6 +581,8 @@ class RealtimeApprovalDB(Base):
 
 Index("idx_realtime_events_monitor_created", RealtimeEventDB.monitor_id, RealtimeEventDB.created_at)
 Index("idx_realtime_events_user_monitor_created_id", RealtimeEventDB.user_id, RealtimeEventDB.monitor_id, RealtimeEventDB.created_at, RealtimeEventDB.id)
+Index("idx_realtime_signal_exec_monitor_bar", RealtimeSignalExecutionDB.monitor_id, RealtimeSignalExecutionDB.timeframe, RealtimeSignalExecutionDB.bar_end)
+Index("idx_realtime_signal_exec_user_symbol", RealtimeSignalExecutionDB.user_id, RealtimeSignalExecutionDB.symbol, RealtimeSignalExecutionDB.first_seen_at)
 Index("idx_realtime_approvals_user_status", RealtimeApprovalDB.user_id, RealtimeApprovalDB.status)
 
 

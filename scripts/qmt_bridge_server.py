@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -24,10 +25,40 @@ _HISTORY_JOBS: dict[str, dict[str, Any]] = {}
 _HISTORY_JOBS_LOCK = threading.Lock()
 _TRADER_CACHE: dict[str, dict[str, Any]] = {}
 _TRADER_CACHE_LOCK = threading.RLock()
+_QUOTE_SUBSCRIPTIONS: set[tuple[str, str]] = set()
+_QUOTE_SUBSCRIPTIONS_LOCK = threading.RLock()
 
 
 def _log(message: str) -> None:
     print(f"[qmt-bridge] {message}", flush=True)
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except Exception:
+            pass
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            pass
+    return str(value)
 
 
 class OrderSubmitRequest(BaseModel):
@@ -429,7 +460,8 @@ def _query_snapshot(account_id: str, account_type: str) -> dict[str, Any]:
 
     def normalize(item: Any) -> dict[str, Any]:
         if isinstance(item, dict):
-            return item
+            safe_item = _json_safe(item)
+            return safe_item if isinstance(safe_item, dict) else {}
         data: dict[str, Any] = {}
         for key in dir(item):
             if key.startswith("_"):
@@ -438,19 +470,19 @@ def _query_snapshot(account_id: str, account_type: str) -> dict[str, Any]:
             if callable(value):
                 continue
             if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
-                data[key] = value
+                data[key] = _json_safe(value)
         return data
 
     normalized_positions = [normalize(item) for item in (positions or [])]
     normalized_orders = [normalize(item) for item in (orders or [])]
     normalized_trades = [normalize(item) for item in (trades or [])]
 
-    return {
+    return _json_safe({
         "asset": normalize(asset),
         "positions": _enrich_security_names(normalized_positions),
         "orders": _enrich_security_names(normalized_orders),
         "trades": _enrich_security_names(normalized_trades),
-    }
+    })
 
 
 def _submit_order(request: OrderSubmitRequest) -> dict[str, Any]:
@@ -811,6 +843,39 @@ def _read_full_kline_light(xtdata: Any, symbol: str, period: str, start_time: st
             )
         except TypeError:
             return None
+
+
+def _ensure_quote_subscription_light(xtdata: Any, symbol: str, period: str) -> None:
+    subscriber = getattr(xtdata, "subscribe_quote", None)
+    if subscriber is None:
+        return
+    key = (symbol, period)
+    with _QUOTE_SUBSCRIPTIONS_LOCK:
+        if key in _QUOTE_SUBSCRIPTIONS:
+            return
+    attempts = (
+        lambda: subscriber(symbol, period=period, start_time="", end_time="", count=0, callback=None),
+        lambda: subscriber(stock_code=symbol, period=period, start_time="", end_time="", count=0, callback=None),
+        lambda: subscriber(symbol, period=period, count=0),
+        lambda: subscriber(symbol, period),
+        lambda: subscriber(symbol),
+    )
+    last_error: Exception | None = None
+    for attempt in attempts:
+        try:
+            attempt()
+            with _QUOTE_SUBSCRIPTIONS_LOCK:
+                _QUOTE_SUBSCRIPTIONS.add(key)
+            _log(f"subscribed quote symbol={symbol} period={period}")
+            return
+        except TypeError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            break
+    if last_error is not None:
+        _log(f"subscribe quote skipped symbol={symbol} period={period}: {last_error}")
 
 
 def _extract_field_dict_frame_light(payload: Any, symbol: str):
@@ -1176,6 +1241,8 @@ def _query_minute_bars(symbols: list[str], trade_date: str, period: str = "1m") 
     symbol_errors: dict[str, dict[str, Any]] = {}
     for symbol in normalized_symbols:
         try:
+            if trade_day == datetime.now().strftime("%Y%m%d"):
+                _ensure_quote_subscription_light(xtdata, symbol, period)
             _download_history_window_light(xtdata, symbol, period, start_time, end_time)
             raw = _read_history_window_light(xtdata, symbol, period, start_time, end_time)
             frame = _normalize_history_frame_light(raw, symbol)
@@ -1242,7 +1309,7 @@ def snapshot(
         "role": _bridge_role(),
         "trading_allowed": _bridge_trading_allowed(),
     }
-    return payload
+    return _json_safe(payload)
 
 
 @app.post("/orders")

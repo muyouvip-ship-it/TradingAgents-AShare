@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -17,6 +18,18 @@ logger = logging.getLogger(__name__)
 _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_worker_enabled() -> bool:
+    return _env_flag("ENABLE_BACKTEST_AUTO_UPDATE_WORKER", "0")
+
+
+def is_worker_running() -> bool:
+    return bool(_TASK is not None and not _TASK.done())
 
 
 async def start_background_worker() -> None:
@@ -141,6 +154,7 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
 
         task_ids: list[int] = []
         blocked_by_running = False
+        target_data_date = _resolve_target_data_date_for_config(row, now)
         for data_type in data_types:
             scope_key = _scope_key(row.default_symbols or [])
             date_range = _resolve_incremental_date_range(
@@ -151,6 +165,7 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
                 data_source=str(row.data_source_preference or "akshare"),
                 scope_key=scope_key,
                 default_days=row.default_date_range_days or 365,
+                target_date=target_data_date,
             )
             if date_range is None:
                 continue
@@ -248,9 +263,9 @@ def _resolve_incremental_date_range(
     data_source: str,
     scope_key: str,
     default_days: int,
+    target_date: date | None = None,
 ) -> tuple[date, date] | None:
-    today = datetime.now().date()
-    target_date = _resolve_target_data_date(today)
+    target_date = target_date or _resolve_target_data_date(datetime.now().date())
     actual_data_end = _resolve_actual_data_end(db, data_type=data_type, symbols=None if scope_key == "all" else _symbols_from_scope_key(scope_key))
     watermark = db.execute(text("""
         SELECT *
@@ -309,9 +324,26 @@ def _resolve_incremental_date_range(
 
 def _resolve_target_data_date(today: date) -> date:
     current = today
-    while current.weekday() >= 5:
+    while not _is_likely_cn_trading_day(current):
         current -= timedelta(days=1)
     return current
+
+
+def _resolve_target_data_date_for_config(row, now: datetime) -> date:
+    timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    local_now = now.astimezone(_safe_zoneinfo(timezone_name))
+    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "18:30")) or (18, 30)
+    target = local_now.date()
+    if (local_now.hour, local_now.minute) < schedule_time:
+        target -= timedelta(days=1)
+    return _resolve_target_data_date(target)
+
+
+def _is_likely_cn_trading_day(value: date) -> bool:
+    try:
+        return bool(is_cn_trading_day(value.isoformat()))
+    except Exception:
+        return value.weekday() < 5
 
 
 def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -> date | None:
@@ -325,18 +357,52 @@ def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -
     if table_info is None:
         return None
     table_name, date_column = table_info
+    if data_type == "daily_kline" and table_name == "market_stock_daily_kline":
+        return _resolve_market_daily_actual_end(db, symbols=symbols)
+    date_expr = date_column if date_column == "trade_date" else f"DATE({date_column})"
     if symbols:
         row = db.execute(text(f"""
-            SELECT MAX(DATE({date_column})) AS max_date
+            SELECT MAX({date_expr}) AS max_date
             FROM {table_name}
             WHERE symbol = ANY(:symbols)
         """), {"symbols": symbols}).fetchone()
     else:
         row = db.execute(text(f"""
-            SELECT MAX(DATE({date_column})) AS max_date
+            SELECT MAX({date_expr}) AS max_date
             FROM {table_name}
         """)).fetchone()
     return row.max_date if row and getattr(row, "max_date", None) else None
+
+
+def _resolve_market_daily_actual_end(db, *, symbols: list[str] | None) -> date | None:
+    values: list[date] = []
+    for table_name in ("pub_stock_daily_kline", "stock_daily_kline"):
+        if not _relation_exists(db, table_name):
+            continue
+        if symbols:
+            row = db.execute(text(f"""
+                SELECT MAX(trade_date) AS max_date
+                FROM {table_name}
+                WHERE symbol = ANY(:symbols)
+            """), {"symbols": symbols}).fetchone()
+        else:
+            row = db.execute(text(f"""
+                SELECT MAX(trade_date) AS max_date
+                FROM {table_name}
+            """)).fetchone()
+        value = row.max_date if row and getattr(row, "max_date", None) else None
+        if value is not None:
+            values.append(value)
+    return max(values) if values else None
+
+
+def _relation_exists(db, table_name: str) -> bool:
+    return bool(db.execute(text("""
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = :table_name
+    """), {"table_name": table_name}).scalar())
 
 
 def _symbols_from_scope_key(scope_key: str) -> list[str]:
@@ -358,6 +424,21 @@ def _scope_key(symbols: list[str]) -> str:
 def _build_status_payload(db, row, now: datetime) -> dict:
     timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
     next_run_at = _compute_next_run_at(row, now)
+    config_enabled = bool(getattr(row, "auto_download", False))
+    worker_enabled = is_worker_enabled()
+    worker_running = is_worker_running()
+    if not config_enabled:
+        effective_status = "disabled"
+        status_message = "订阅规则未启用，后台不会自动创建增量任务。"
+    elif worker_enabled and worker_running:
+        effective_status = "active"
+        status_message = "订阅规则已启用，后台自动更新 worker 正在运行。"
+    elif worker_enabled:
+        effective_status = "config_only"
+        status_message = "订阅规则已启用，但当前进程内后台自动更新 worker 未运行；请检查后端启动日志。"
+    else:
+        effective_status = "config_only"
+        status_message = "订阅规则已启用，但 ENABLE_BACKTEST_AUTO_UPDATE_WORKER 未开启，后台不会自动执行。"
     latest_task = db.execute(text("""
         SELECT *
         FROM backtest_data_tasks
@@ -406,7 +487,12 @@ def _build_status_payload(db, row, now: datetime) -> dict:
 
     return {
         "config_id": int(row.id),
-        "auto_download": bool(getattr(row, "auto_download", False)),
+        "auto_download": config_enabled,
+        "config_enabled": config_enabled,
+        "worker_enabled": worker_enabled,
+        "worker_running": worker_running,
+        "effective_status": effective_status,
+        "status_message": status_message,
         "timezone": timezone_name,
         "next_run_at": next_run_at.isoformat() if next_run_at else None,
         "now": now.isoformat(),

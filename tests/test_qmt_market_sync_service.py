@@ -52,3 +52,46 @@ def test_run_stock_daily_sync_prefers_auto_update(monkeypatch):
     assert payload["success"] is True
     assert payload["mode"] == "backtest_auto_update"
     assert payload["task_ids"] == [101, 102]
+
+
+def test_capture_intraday_for_target_uses_user_db_context(monkeypatch):
+    fake_db = object()
+    captured = {}
+
+    class FakeSessionLocal:
+        def __enter__(self):
+            return fake_db
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_capture(symbols, *, trade_date, period, account_key, db, user_id):
+        captured.update(
+            {
+                "symbols": symbols,
+                "trade_date": trade_date,
+                "period": period,
+                "account_key": account_key,
+                "db": db,
+                "user_id": user_id,
+            }
+        )
+        return {"success": True, "rows": 1}
+
+    monkeypatch.setattr(qmt_market_sync_service, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(qmt_market_sync_service, "capture_intraday_symbols", fake_capture)
+
+    target = qmt_market_sync_service._MarketSyncTarget(
+        user_id="user-1",
+        account_key="paper_sim",
+        symbols=["300520.SZ"],
+    )
+    result = qmt_market_sync_service._capture_intraday_for_target(target, trade_date="2026-05-08")
+
+    assert result == {"success": True, "rows": 1}
+    assert captured["symbols"] == ["300520.SZ"]
+    assert captured["trade_date"] == "2026-05-08"
+    assert captured["period"] == "1m"
+    assert captured["account_key"] == "paper_sim"
+    assert captured["db"] is fake_db
+    assert captured["user_id"] == "user-1"

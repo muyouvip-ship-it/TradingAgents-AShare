@@ -1,6 +1,65 @@
 from datetime import date
 
 from api.services import qmt_market_data_service
+from api.services.qmt_virtual_account_service import QmtRuntimeConfig
+
+
+def _qmt_config(key: str, *, enabled: bool, role: str, bridge: str = "") -> QmtRuntimeConfig:
+    return QmtRuntimeConfig(
+        key=key,
+        enabled=enabled,
+        host="127.0.0.1",
+        port=58610,
+        account_id="",
+        account_type="STOCK",
+        account_name=key,
+        userdata_path="",
+        role=role,
+        bridge_base_url=bridge,
+        bridge_token="",
+        refresh_interval_seconds=10,
+    )
+
+
+def test_resolve_market_account_key_uses_db_config_not_disabled_default(monkeypatch):
+    monkeypatch.setattr(
+        qmt_market_data_service.qmt_virtual_account_service,
+        "_load_runtime_configs",
+        lambda db=None, user_id=None: [
+            _qmt_config("paper_sim", enabled=True, role="paper", bridge="http://192.168.10.1:8710"),
+            _qmt_config("live_real", enabled=True, role="live", bridge="http://192.168.10.1:8711"),
+        ],
+    )
+
+    assert (
+        qmt_market_data_service.resolve_market_account_key(
+            db=object(),
+            user_id="user-1",
+            preferred_account_key="paper_sim",
+        )
+        == "paper_sim"
+    )
+
+
+def test_resolve_market_account_key_falls_back_to_enabled_paper(monkeypatch):
+    monkeypatch.setattr(
+        qmt_market_data_service.qmt_virtual_account_service,
+        "_load_runtime_configs",
+        lambda db=None, user_id=None: [
+            _qmt_config("paper_sim", enabled=False, role="paper", bridge=""),
+            _qmt_config("paper_db", enabled=True, role="paper", bridge="http://192.168.10.1:8710"),
+            _qmt_config("live_real", enabled=True, role="live", bridge="http://192.168.10.1:8711"),
+        ],
+    )
+
+    assert (
+        qmt_market_data_service.resolve_market_account_key(
+            db=object(),
+            user_id="user-1",
+            preferred_account_key="paper_sim",
+        )
+        == "paper_db"
+    )
 
 
 def test_sync_index_minute_history_persists_rows_by_trade_day(monkeypatch):

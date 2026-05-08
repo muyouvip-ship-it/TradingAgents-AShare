@@ -277,6 +277,8 @@ def fetch_daily_bars(
     start_date: str,
     end_date: str,
     account_key: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
     persist: bool = True,
 ) -> dict[str, Any]:
     normalized = normalize_market_symbol(symbol)
@@ -284,7 +286,14 @@ def fetch_daily_bars(
         raise ValueError("symbol is required")
     if not is_index_symbol(normalized):
         raise ValueError("daily bar sync currently supports index symbols only")
-    rows = _fetch_daily_rows_safe([normalized], start_date=start_date, end_date=end_date, account_key=account_key)
+    rows = _fetch_daily_rows_safe(
+        [normalized],
+        start_date=start_date,
+        end_date=end_date,
+        account_key=account_key,
+        db=db,
+        user_id=user_id,
+    )
     if rows and persist:
         _upsert_index_daily_rows(rows)
     items = _load_daily_rows_from_db(normalized, start_date, end_date) or rows
@@ -302,12 +311,16 @@ def sync_major_index_daily(
     start_date: str,
     end_date: str,
     account_key: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     rows = _fetch_daily_rows_safe(
         [item["symbol"] for item in MAJOR_INDEX_PRESETS],
         start_date=start_date,
         end_date=end_date,
         account_key=account_key,
+        db=db,
+        user_id=user_id,
     )
     if rows:
         _upsert_index_daily_rows(rows)
@@ -473,8 +486,37 @@ def _resolve_market_config(
     db: Session | None = None,
     user_id: str | None = None,
 ) -> qmt_virtual_account_service.QmtRuntimeConfig:
-    preferred_key = str(account_key or settings.qmt_history_account_key or "").strip() or None
+    preferred_key = resolve_market_account_key(db=db, user_id=user_id, preferred_account_key=account_key)
     return qmt_virtual_account_service._resolve_runtime_config(preferred_key, db=db, user_id=user_id)
+
+
+def resolve_market_account_key(
+    *,
+    db: Session | None = None,
+    user_id: str | None = None,
+    preferred_account_key: str | None = None,
+) -> str | None:
+    preferred_key = str(preferred_account_key or settings.qmt_history_account_key or "").strip()
+    configs = qmt_virtual_account_service._load_runtime_configs(db=db, user_id=user_id)
+
+    def _usable(config: qmt_virtual_account_service.QmtRuntimeConfig) -> bool:
+        return bool(config.enabled and (config.bridge_base_url or config.userdata_path))
+
+    if preferred_key:
+        preferred = next((config for config in configs if config.key == preferred_key), None)
+        if preferred is not None and _usable(preferred):
+            return preferred.key
+
+    for role in ("paper", "live"):
+        for config in configs:
+            if config.role == role and _usable(config):
+                return config.key
+
+    for config in configs:
+        if config.enabled:
+            return config.key
+
+    return preferred_key or (configs[0].key if configs else None)
 
 
 def _sync_index_minute_history_via_akshare(
@@ -789,8 +831,10 @@ def _fetch_daily_rows_safe(
     start_date: str,
     end_date: str,
     account_key: str | None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    config = _resolve_market_config(account_key)
+    config = _resolve_market_config(account_key, db=db, user_id=user_id)
     try:
         if config.bridge_base_url:
             payload = _bridge_post(

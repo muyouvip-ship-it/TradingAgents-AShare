@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 import pandas as pd
 from sqlalchemy import and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.core.strategy_db import get_strategy_db_ctx
@@ -19,6 +21,7 @@ from api.models.strategy_models import (
     RealtimeApprovalDB,
     RealtimeEventDB,
     RealtimeMonitorDB,
+    RealtimeSignalExecutionDB,
 )
 from api.services.data_source_governance import (
     build_realtime_monitor_governance,
@@ -42,6 +45,17 @@ _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 5
 _EVENT_SUBSCRIBERS: dict[tuple[str, str], list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]]] = {}
 _EVENT_SUBSCRIBERS_LOCK = threading.Lock()
+_SIGNAL_PROCESSED_EVENT_TYPES = {
+    "signal_generated",
+    "signal_blocked",
+    "order_rejected",
+    "approval_created",
+    "order_intent",
+    "order_submitted",
+    "order_error",
+}
+_FUSE_EVENT_COOLDOWN_SECONDS = 300
+_REPETITIVE_STATUS_EVENT_COOLDOWN_SECONDS = 300
 
 
 def subscribe_event_queue(user_id: str, monitor_id: str) -> asyncio.Queue[dict[str, Any]]:
@@ -93,7 +107,7 @@ def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload
         raise ValueError("策略 DSL 编译未通过，不能创建实时监控实例：" + "；".join(compiled.errors))
 
     account_key = str(payload.get("account_key") or "paper_sim").strip() or "paper_sim"
-    account_role = _account_role(account_key)
+    account_role = _account_role(account_key, db=main_db, user_id=user_id)
     live_trading_enabled = bool(payload.get("live_trading_enabled", False))
     execution_mode = str(payload.get("execution_mode") or "auto").strip() or "auto"
     if account_role == "live" and live_trading_enabled and not bool(payload.get("live_confirmed")):
@@ -190,6 +204,7 @@ def start_monitor(db: Session, user_id: str, monitor_id: str) -> dict[str, Any]:
 
     monitor.status = "running"
     monitor.fused_reason = None
+    _clear_fuse_guard(monitor)
     monitor.updated_at = _now_dt()
     db.add(monitor)
     db.commit()
@@ -228,6 +243,8 @@ def resume_monitor(db: Session, user_id: str, monitor_id: str) -> dict[str, Any]
     if monitor.status not in {"paused", "halted", "ready"}:
         raise ValueError("只有 ready/paused/halted 状态可以恢复运行")
     monitor.status = "running"
+    monitor.fused_reason = None
+    _clear_fuse_guard(monitor)
     monitor.updated_at = _now_dt()
     db.add(monitor)
     db.commit()
@@ -243,6 +260,7 @@ def fuse_reset_monitor(db: Session, user_id: str, monitor_id: str) -> dict[str, 
         raise ValueError("当前实例未处于熔断状态")
     monitor.status = "paused"
     monitor.fused_reason = None
+    _clear_fuse_guard(monitor)
     monitor.updated_at = _now_dt()
     db.add(monitor)
     db.commit()
@@ -370,7 +388,13 @@ def list_trades(db: Session, user_id: str, monitor_id: str) -> list[dict[str, An
 
 def get_positions(db: Session, main_db: Session, user_id: str, monitor_id: str) -> dict[str, Any]:
     monitor = _require_monitor(db, user_id, monitor_id)
-    overview = _get_realtime_qmt_overview(main_db, user_id, monitor.account_key)
+    overview = qmt_virtual_account_service.get_qmt_virtual_account_overview(
+        main_db,
+        user_id,
+        account_key=monitor.account_key,
+        prefer_cache=True,
+        allow_cache_fallback=True,
+    )
     payload = {
         "monitor_id": monitor.id,
         "account_key": monitor.account_key,
@@ -400,6 +424,24 @@ def approve_task(db: Session, main_db: Session, user_id: str, approval_id: str, 
         raise ValueError("该确认任务已处理")
     intent = dict(approval.order_intent_json or {})
     result = _execute_order_intent(db, main_db, monitor, intent, reason="manual_approval")
+    if intent.get("signal_key"):
+        _update_signal_execution(
+            db,
+            monitor,
+            {
+                "signal_key": intent.get("signal_key"),
+                "symbol": intent.get("symbol"),
+                "side": intent.get("side"),
+                "timeframe": intent.get("signal_timeframe"),
+                "bar_end": intent.get("signal_bar_end"),
+                "reason": intent.get("order_remark"),
+                "source": "manual_approval",
+            },
+            "approval_executed" if result.get("success") else "approval_order_error",
+            order_intent=intent,
+            broker_result=result if result.get("success") else None,
+            error_message=None if result.get("success") else str(result.get("error") or "approval_order_error"),
+        )
     approval.status = "executed" if result.get("success") else "approved"
     approval.decision_json = dict(decision or {}) | {"broker_result": result}
     approval.decided_at = _now_dt()
@@ -503,18 +545,25 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
         monitor.last_heartbeat_at = now
         monitor.updated_at = now
         if not _is_monitor_trading_window(now) and not bool((monitor.config_json or {}).get("allow_outside_session")):
-            _append_event(
-                strategy_db,
+            if _mark_repetitive_status_event_allowed(
                 monitor,
                 "cycle_skipped",
-                payload={
-                    "cycle_id": cycle_id,
-                    "reason": "outside_trading_session",
-                    "trigger_source": trigger_source,
-                    "session": "09:30-11:30,13:00-15:00",
-                },
-                correlation_id=cycle_id,
-            )
+                "outside_trading_session",
+                now,
+                force_emit=trigger_source == "manual",
+            ):
+                _append_event(
+                    strategy_db,
+                    monitor,
+                    "cycle_skipped",
+                    payload={
+                        "cycle_id": cycle_id,
+                        "reason": "outside_trading_session",
+                        "trigger_source": trigger_source,
+                        "session": "09:30-11:30,13:00-15:00",
+                    },
+                    correlation_id=cycle_id,
+                )
             _update_state_stats(monitor, latest_cycle=cycle_id)
             strategy_db.add(monitor)
             strategy_db.commit()
@@ -529,6 +578,25 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
         symbols = _resolve_monitor_symbols(main_db, monitor.user_id, monitor.account_key, strategy, pool, overview=overview)
         pool["resolved_symbols"] = symbols
         monitor.monitor_pool_json = pool
+        if not symbols:
+            if _mark_repetitive_status_event_allowed(
+                monitor,
+                "cycle_skipped",
+                "empty_universe",
+                now,
+                force_emit=trigger_source == "manual",
+            ):
+                _append_event(
+                    strategy_db,
+                    monitor,
+                    "cycle_skipped",
+                    payload={"reason": "empty_universe", "trigger_source": trigger_source},
+                    correlation_id=cycle_id,
+                )
+            _update_state_stats(monitor, latest_cycle=cycle_id)
+            strategy_db.add(monitor)
+            strategy_db.commit()
+            return
         _append_event(
             strategy_db,
             monitor,
@@ -536,17 +604,6 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
             payload={"cycle_id": cycle_id, "symbol_count": len(symbols), "trigger_source": trigger_source},
             correlation_id=cycle_id,
         )
-        if not symbols:
-            _append_event(
-                strategy_db,
-                monitor,
-                "cycle_skipped",
-                payload={"reason": "empty_universe", "trigger_source": trigger_source},
-                correlation_id=cycle_id,
-            )
-            strategy_db.add(monitor)
-            strategy_db.commit()
-            return
         _refresh_execution_state(strategy_db, main_db, monitor, overview, correlation_id=cycle_id)
         quotes = qmt_virtual_account_service._fetch_live_quotes(
             symbols,
@@ -619,29 +676,75 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
             correlation_id=cycle_id,
         )
 
-        signals = _generate_signals(monitor, strategy, overview, quotes, minute_features)
+        bar_clock_key = _signal_bar_clock_key(monitor, minute_features)
+        if not force and _should_skip_signal_evaluation_for_bar(monitor, bar_clock_key):
+            if _mark_signal_clock_skip_seen(monitor, bar_clock_key):
+                _append_event(
+                    strategy_db,
+                    monitor,
+                    "signal_evaluation_skipped",
+                    payload={
+                        "cycle_id": cycle_id,
+                        "trigger_source": trigger_source,
+                        "reason": "same_bar_already_evaluated",
+                        "bar_clock_key": bar_clock_key,
+                        "timeframe": minute_features.get("timeframe"),
+                        "latest_closed_bar_end": minute_features.get("latest_closed_bar_end"),
+                    },
+                    correlation_id=cycle_id,
+                )
+            _update_state_stats(monitor, latest_cycle=cycle_id)
+            strategy_db.add(monitor)
+            strategy_db.commit()
+            return
+        _mark_signal_bar_evaluated(monitor, bar_clock_key, minute_features)
+
+        max_signals = max(int((monitor.config_json or {}).get("max_signals_per_cycle") or 3), 1)
+        raw_signals = _generate_signals(monitor, strategy, overview, quotes, minute_features)
+        signals, suppressed_signals = _filter_actionable_signals(strategy_db, monitor, raw_signals, limit=max_signals)
         if not signals:
-            _append_event(
-                strategy_db,
-                monitor,
-                "no_signal",
-                payload={"cycle_id": cycle_id, "trigger_source": trigger_source},
-                correlation_id=cycle_id,
-            )
+            if suppressed_signals:
+                if _mark_signal_suppression_seen(monitor, suppressed_signals):
+                    _append_event(
+                        strategy_db,
+                        monitor,
+                        "signal_deduplicated",
+                        payload={
+                            "cycle_id": cycle_id,
+                            "trigger_source": trigger_source,
+                            "suppressed_count": len(suppressed_signals),
+                            "reason": "same_signal_already_processed_in_bar",
+                            "signal_keys": [signal.get("signal_key") for signal in suppressed_signals[:10]],
+                            "bar_ends": sorted({str(signal.get("bar_end") or "") for signal in suppressed_signals if signal.get("bar_end")}),
+                        },
+                        correlation_id=cycle_id,
+                    )
+            else:
+                _append_event(
+                    strategy_db,
+                    monitor,
+                    "no_signal",
+                    payload={"cycle_id": cycle_id, "trigger_source": trigger_source},
+                    correlation_id=cycle_id,
+                )
             _update_state_stats(monitor, latest_cycle=cycle_id)
             strategy_db.add(monitor)
             strategy_db.commit()
             return
 
         for signal in signals:
+            signal_key = str(signal.get("signal_key") or _signal_request_id(monitor, signal))
+            signal["signal_key"] = signal_key
             _append_event(
                 strategy_db,
                 monitor,
                 "signal_generated",
                 symbol=signal["symbol"],
                 signal_payload=signal,
+                request_id=signal_key,
                 correlation_id=cycle_id,
             )
+            _update_signal_execution(strategy_db, monitor, signal, "generated")
             intent = _build_order_intent(monitor, overview, signal)
             risk = _risk_check(strategy_db, monitor, intent, signal)
             if not risk["passed"]:
@@ -664,6 +767,15 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                             "lot_size": _monitor_lot_size(monitor),
                         },
                         correlation_id=cycle_id,
+                        request_id=signal_key,
+                    )
+                    _update_signal_execution(
+                        strategy_db,
+                        monitor,
+                        signal,
+                        "blocked",
+                        order_intent=intent,
+                        error_message="available_position_below_lot_size",
                     )
                     continue
                 _append_event(
@@ -674,8 +786,10 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                     signal_payload=signal,
                     risk_payload=risk,
                     order_payload=intent,
+                    request_id=signal_key,
                     correlation_id=cycle_id,
                 )
+                _update_signal_execution(strategy_db, monitor, signal, "risk_rejected", order_intent=intent, error_message=str(risk.get("reason") or "risk_rejected"))
                 _bump_stat(monitor, "rejections")
                 continue
 
@@ -690,12 +804,15 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                     risk_payload=risk,
                     order_payload=intent,
                     payload={"approval_id": approval.id, "reason": approval.reason},
+                    request_id=signal_key,
                     correlation_id=cycle_id,
                 )
+                _update_signal_execution(strategy_db, monitor, signal, "approval_pending", order_intent=intent)
                 _bump_stat(monitor, "approvals")
                 continue
 
-            _append_event(strategy_db, monitor, "order_intent", symbol=signal["symbol"], signal_payload=signal, risk_payload=risk, order_payload=intent, correlation_id=cycle_id)
+            _append_event(strategy_db, monitor, "order_intent", symbol=signal["symbol"], signal_payload=signal, risk_payload=risk, order_payload=intent, request_id=signal_key, correlation_id=cycle_id)
+            _update_signal_execution(strategy_db, monitor, signal, "intent_created", order_intent=intent)
             broker_result = _execute_order_intent(strategy_db, main_db, monitor, intent, reason="auto_monitor")
             _append_event(
                 strategy_db,
@@ -707,7 +824,17 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
                 order_payload=intent,
                 broker_result=broker_result if broker_result.get("success") else {},
                 error_payload={} if broker_result.get("success") else broker_result,
+                request_id=signal_key,
                 correlation_id=cycle_id,
+            )
+            _update_signal_execution(
+                strategy_db,
+                monitor,
+                signal,
+                "submitted" if broker_result.get("success") else "order_error",
+                order_intent=intent,
+                broker_result=broker_result if broker_result.get("success") else None,
+                error_message=None if broker_result.get("success") else str(broker_result.get("error") or "order_error"),
             )
             if broker_result.get("success"):
                 _bump_stat(monitor, "orders")
@@ -725,6 +852,60 @@ def _monitor_due(monitor: RealtimeMonitorDB) -> bool:
     if monitor.last_heartbeat_at is None:
         return True
     return (_now_dt() - _ensure_utc(monitor.last_heartbeat_at)) >= timedelta(seconds=max(interval, 5))
+
+
+def _signal_bar_clock_key(monitor: RealtimeMonitorDB, minute_features: dict[str, Any]) -> str | None:
+    latest_closed_bar_end = str(minute_features.get("latest_closed_bar_end") or "").strip()
+    if not latest_closed_bar_end:
+        return None
+    config = dict(monitor.config_json or {})
+    signal_mode = str(config.get("signal_mode") or minute_features.get("signal_mode") or "intraday_confirmation").strip().lower()
+    timeframe = str(config.get("signal_timeframe") or minute_features.get("timeframe") or "30m").strip().lower()
+    return f"{signal_mode}:{timeframe}:{latest_closed_bar_end}"
+
+
+def _should_skip_signal_evaluation_for_bar(monitor: RealtimeMonitorDB, bar_clock_key: str | None) -> bool:
+    if not bar_clock_key or _has_intrabar_risk_rules(monitor):
+        return False
+    state = dict(monitor.state_json or {})
+    clock = dict(state.get("signal_clock") or {})
+    return clock.get("last_evaluated_bar_key") == bar_clock_key
+
+
+def _mark_signal_bar_evaluated(
+    monitor: RealtimeMonitorDB,
+    bar_clock_key: str | None,
+    minute_features: dict[str, Any],
+) -> None:
+    if not bar_clock_key:
+        return
+    state = dict(monitor.state_json or {})
+    clock = dict(state.get("signal_clock") or {})
+    clock["last_evaluated_bar_key"] = bar_clock_key
+    clock["last_evaluated_at"] = _now_dt().isoformat()
+    clock["timeframe"] = minute_features.get("timeframe")
+    clock["latest_closed_bar_end"] = minute_features.get("latest_closed_bar_end")
+    state["signal_clock"] = clock
+    monitor.state_json = state
+
+
+def _mark_signal_clock_skip_seen(monitor: RealtimeMonitorDB, bar_clock_key: str | None) -> bool:
+    if not bar_clock_key:
+        return False
+    state = dict(monitor.state_json or {})
+    clock = dict(state.get("signal_clock") or {})
+    if clock.get("last_skip_bar_key") == bar_clock_key:
+        return False
+    clock["last_skip_bar_key"] = bar_clock_key
+    clock["last_skip_at"] = _now_dt().isoformat()
+    state["signal_clock"] = clock
+    monitor.state_json = state
+    return True
+
+
+def _has_intrabar_risk_rules(monitor: RealtimeMonitorDB) -> bool:
+    risk = dict(monitor.risk_config_json or {})
+    return float(risk.get("stop_loss_pct") or 0.0) > 0
 
 
 def _compile_strategy_payload(strategy: dict[str, Any]):
@@ -1110,6 +1291,190 @@ def _minute_result_covers_trade_date(items: list[dict[str, Any]], trade_date: st
     return False
 
 
+def _filter_actionable_signals(
+    db: Session,
+    monitor: RealtimeMonitorDB,
+    signals: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not signals:
+        return [], []
+    normalized_signals: list[dict[str, Any]] = []
+    request_ids: list[str] = []
+    for raw_signal in signals:
+        signal = dict(raw_signal)
+        signal_key = _signal_request_id(monitor, signal)
+        signal["signal_key"] = signal_key
+        signal["signal_identity"] = _signal_identity_payload(monitor, signal)
+        normalized_signals.append(signal)
+        request_ids.append(signal_key)
+
+    event_rows = (
+        db.query(RealtimeEventDB.request_id)
+        .filter(
+            RealtimeEventDB.monitor_id == monitor.id,
+            RealtimeEventDB.request_id.in_(request_ids),
+            RealtimeEventDB.event_type.in_(_SIGNAL_PROCESSED_EVENT_TYPES),
+        )
+        .all()
+    )
+    ledger_rows = (
+        db.query(RealtimeSignalExecutionDB.signal_key)
+        .filter(
+            RealtimeSignalExecutionDB.monitor_id == monitor.id,
+            RealtimeSignalExecutionDB.signal_key.in_(request_ids),
+        )
+        .all()
+    )
+    processed = {str(row[0]) for row in event_rows if row and row[0]}
+    processed |= {str(row[0]) for row in ledger_rows if row and row[0]}
+    actionable: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    seen_in_batch: set[str] = set()
+    max_actionable = max(int(limit), 1) if limit is not None else None
+    for signal in normalized_signals:
+        signal_key = str(signal.get("signal_key") or "")
+        if signal_key in processed or signal_key in seen_in_batch:
+            suppressed.append(signal)
+            continue
+        seen_in_batch.add(signal_key)
+        if max_actionable is not None and len(actionable) >= max_actionable:
+            continue
+        if not _reserve_signal_execution(db, monitor, signal):
+            suppressed.append(signal)
+            continue
+        actionable.append(signal)
+    return actionable, suppressed
+
+
+def _reserve_signal_execution(db: Session, monitor: RealtimeMonitorDB, signal: dict[str, Any]) -> bool:
+    signal_key = str(signal.get("signal_key") or "")
+    if not signal_key:
+        return False
+    identity = dict(signal.get("signal_identity") or _signal_identity_payload(monitor, signal))
+    row = RealtimeSignalExecutionDB(
+        id=uuid4().hex,
+        monitor_id=monitor.id,
+        user_id=monitor.user_id,
+        account_key=monitor.account_key,
+        strategy_id=monitor.strategy_id,
+        strategy_version_id=monitor.strategy_version_id,
+        symbol=str(identity.get("symbol") or _normalize_symbol(signal.get("symbol"))),
+        side=str(identity.get("side") or signal.get("side") or ""),
+        timeframe=str(identity.get("timeframe") or signal.get("timeframe") or ""),
+        bar_end=str(identity.get("bar_end") or signal.get("bar_end") or ""),
+        signal_key=signal_key,
+        status="reserved",
+        signal_identity_json=_json_safe(identity),
+        signal_payload_json=_json_safe(signal),
+        first_seen_at=_now_dt(),
+        updated_at=_now_dt(),
+    )
+    try:
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
+        return True
+    except IntegrityError:
+        return False
+
+
+def _update_signal_execution(
+    db: Session,
+    monitor: RealtimeMonitorDB,
+    signal: dict[str, Any],
+    status: str,
+    *,
+    order_intent: dict[str, Any] | None = None,
+    broker_result: dict[str, Any] | None = None,
+    error_message: str | None = None,
+) -> None:
+    signal_key = str(signal.get("signal_key") or "")
+    if not signal_key:
+        return
+    row = (
+        db.query(RealtimeSignalExecutionDB)
+        .filter(
+            RealtimeSignalExecutionDB.monitor_id == monitor.id,
+            RealtimeSignalExecutionDB.signal_key == signal_key,
+        )
+        .first()
+    )
+    if row is None:
+        identity = _signal_identity_payload(monitor, signal)
+        row = RealtimeSignalExecutionDB(
+            id=uuid4().hex,
+            monitor_id=monitor.id,
+            user_id=monitor.user_id,
+            account_key=monitor.account_key,
+            strategy_id=monitor.strategy_id,
+            strategy_version_id=monitor.strategy_version_id,
+            symbol=str(identity.get("symbol") or _normalize_symbol(signal.get("symbol"))),
+            side=str(identity.get("side") or signal.get("side") or ""),
+            timeframe=str(identity.get("timeframe") or signal.get("timeframe") or ""),
+            bar_end=str(identity.get("bar_end") or signal.get("bar_end") or ""),
+            signal_key=signal_key,
+            first_seen_at=_now_dt(),
+        )
+    row.status = status
+    row.signal_payload_json = _json_safe(signal)
+    if not row.signal_identity_json:
+        row.signal_identity_json = _json_safe(_signal_identity_payload(monitor, signal))
+    if order_intent is not None:
+        row.order_intent_json = _json_safe(order_intent)
+    if broker_result is not None:
+        row.broker_result_json = _json_safe(broker_result)
+    row.error_message = error_message
+    row.updated_at = _now_dt()
+    db.add(row)
+
+
+def _signal_request_id(monitor: RealtimeMonitorDB, signal: dict[str, Any]) -> str:
+    identity = _signal_identity_payload(monitor, signal)
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sig_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _signal_identity_payload(monitor: RealtimeMonitorDB, signal: dict[str, Any]) -> dict[str, Any]:
+    timeframe = str(signal.get("timeframe") or signal.get("signal_timeframe") or "tick").strip().lower() or "tick"
+    bar_end = str(signal.get("bar_end") or signal.get("bar_time") or "").strip()
+    if not bar_end:
+        if str(signal.get("source") or "").strip().lower() == "risk_stop_loss":
+            bar_end = _now_dt().astimezone().date().isoformat()
+        else:
+            bar_end = "unknown_bar"
+    return {
+        "monitor_id": monitor.id,
+        "strategy_id": monitor.strategy_id,
+        "strategy_version_id": monitor.strategy_version_id or "",
+        "account_key": monitor.account_key,
+        "symbol": _normalize_symbol(signal.get("symbol")),
+        "side": str(signal.get("side") or "").strip().lower(),
+        "source": str(signal.get("source") or "").strip().lower(),
+        "reason": str(signal.get("reason") or "").strip().lower(),
+        "timeframe": timeframe,
+        "bar_end": bar_end,
+    }
+
+
+def _mark_signal_suppression_seen(monitor: RealtimeMonitorDB, suppressed_signals: list[dict[str, Any]]) -> bool:
+    keys = sorted({str(signal.get("signal_key") or "") for signal in suppressed_signals if signal.get("signal_key")})
+    if not keys:
+        return False
+    state = dict(monitor.state_json or {})
+    fence = dict(state.get("signal_fence") or {})
+    suppression_key = "|".join(keys)
+    if fence.get("last_suppression_key") == suppression_key:
+        return False
+    fence["last_suppression_key"] = suppression_key
+    fence["last_suppression_at"] = _now_dt().isoformat()
+    fence["last_suppressed_count"] = len(suppressed_signals)
+    state["signal_fence"] = fence
+    monitor.state_json = state
+    return True
+
+
 def _supplement_first_day_band_result(
     *,
     account_key: str,
@@ -1165,6 +1530,7 @@ def _generate_signals(
     signals: list[dict[str, Any]] = []
     risk = dict(monitor.risk_config_json or {})
     stop_loss_pct = float(risk.get("stop_loss_pct") or 0.0)
+    current_bar_end = str(minute_features.get("latest_closed_bar_end") or "")
     for symbol, position in positions.items():
         quote = quotes.get(symbol) or {}
         price = _to_float(quote.get("price"), position.get("current_price"))
@@ -1179,6 +1545,8 @@ def _generate_signals(
                     "target_position_pct": 0.0,
                     "strategy_id": strategy["id"],
                     "source": "risk_stop_loss",
+                    "timeframe": "risk",
+                    "bar_end": _now_dt().astimezone().date().isoformat(),
                 }
             )
     if signal_mode == "first_day_band":
@@ -1202,6 +1570,8 @@ def _generate_signals(
                         "strategy_id": strategy["id"],
                         "source": "first_day_band_realtime",
                         "timeframe": signal_timeframe,
+                        "bar_end": item.get("bar_end") or current_bar_end,
+                        "bar_start": item.get("bar_start"),
                     }
                 )
             if action == "sell":
@@ -1215,15 +1585,18 @@ def _generate_signals(
                         "strategy_id": strategy["id"],
                         "source": "first_day_band_realtime",
                         "timeframe": signal_timeframe,
+                        "bar_end": item.get("bar_end") or current_bar_end,
+                        "bar_start": item.get("bar_start"),
                     }
                 )
     else:
-        confirmed_symbols = {
-            item.get("symbol")
+        confirmed_items = [
+            item
             for item in minute_features.get("items") or []
-            if item.get("confirmed") is True
-        }
-        for symbol in confirmed_symbols:
+            if isinstance(item, dict) and item.get("confirmed") is True and item.get("symbol")
+        ]
+        for item in confirmed_items:
+            symbol = item.get("symbol")
             quote = quotes.get(symbol) or {}
             price = _to_float(quote.get("price"), quote.get("close"))
             if not price:
@@ -1237,6 +1610,9 @@ def _generate_signals(
                     "target_position_pct": _target_position_pct(strategy),
                     "strategy_id": strategy["id"],
                     "source": "dsl_realtime_ir",
+                    "timeframe": signal_timeframe,
+                    "bar_end": item.get("bar_end") or current_bar_end,
+                    "bar_start": item.get("bar_start"),
                 }
             )
     return signals
@@ -1284,6 +1660,9 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
         "target_position_pct": signal.get("target_position_pct"),
         "available_position": round(available_position, 2),
         "current_position": round(current_position, 2),
+        "signal_key": signal.get("signal_key"),
+        "signal_timeframe": signal.get("timeframe"),
+        "signal_bar_end": signal.get("bar_end"),
     }
     if reentry_anchor_quantity is not None:
         intent["reentry_anchor_quantity"] = reentry_anchor_quantity
@@ -1375,13 +1754,92 @@ def _execute_order_intent(db: Session, main_db: Session, monitor: RealtimeMonito
 
 
 def _fuse_monitor(db: Session, monitor: RealtimeMonitorDB, reason: str) -> None:
+    now = _now_dt()
+    should_emit_event = _mark_fuse_event_allowed(monitor, reason, now)
     monitor.status = "fused"
     monitor.fused_reason = reason
-    monitor.updated_at = _now_dt()
+    monitor.updated_at = now
     db.add(monitor)
-    _append_event(db, monitor, "monitor_fused", error_payload={"reason": reason})
+    if should_emit_event:
+        _append_event(db, monitor, "monitor_fused", error_payload={"reason": reason})
     db.commit()
     _runtime_log(f"监控实例熔断 monitor={monitor.id} reason={reason}", level="ERROR")
+
+
+def _mark_fuse_event_allowed(monitor: RealtimeMonitorDB, reason: str, now: datetime) -> bool:
+    state = dict(monitor.state_json or {})
+    guard = dict(state.get("fuse_guard") or {})
+    last_reason = str(guard.get("last_reason") or "")
+    last_event_at = _parse_datetime_value(guard.get("last_event_at"))
+    if (
+        monitor.status == "fused"
+        and last_reason == str(reason)
+        and last_event_at is not None
+        and (_ensure_utc(now) - _ensure_utc(last_event_at)).total_seconds() < _FUSE_EVENT_COOLDOWN_SECONDS
+    ):
+        guard["suppressed_count"] = int(guard.get("suppressed_count") or 0) + 1
+        guard["last_suppressed_at"] = now.isoformat()
+        state["fuse_guard"] = guard
+        monitor.state_json = state
+        return False
+    guard["last_reason"] = str(reason)
+    guard["last_event_at"] = now.isoformat()
+    guard["suppressed_count"] = 0
+    state["fuse_guard"] = guard
+    monitor.state_json = state
+    return True
+
+
+def _clear_fuse_guard(monitor: RealtimeMonitorDB) -> None:
+    state = dict(monitor.state_json or {})
+    if "fuse_guard" in state:
+        state.pop("fuse_guard", None)
+        monitor.state_json = state
+
+
+def _mark_repetitive_status_event_allowed(
+    monitor: RealtimeMonitorDB,
+    event_type: str,
+    reason: str,
+    now: datetime,
+    *,
+    force_emit: bool = False,
+) -> bool:
+    if force_emit:
+        return True
+    state = dict(monitor.state_json or {})
+    guard = dict(state.get("event_guard") or {})
+    guard_key = f"{event_type}:{reason}"
+    item = dict(guard.get(guard_key) or {})
+    last_event_at = _parse_datetime_value(item.get("last_event_at"))
+    if (
+        last_event_at is not None
+        and (_ensure_utc(now) - _ensure_utc(last_event_at)).total_seconds() < _REPETITIVE_STATUS_EVENT_COOLDOWN_SECONDS
+    ):
+        item["suppressed_count"] = int(item.get("suppressed_count") or 0) + 1
+        item["last_suppressed_at"] = now.isoformat()
+        guard[guard_key] = item
+        state["event_guard"] = guard
+        monitor.state_json = state
+        return False
+    item["last_event_at"] = now.isoformat()
+    item["suppressed_count"] = 0
+    guard[guard_key] = item
+    state["event_guard"] = guard
+    monitor.state_json = state
+    return True
+
+
+def _parse_datetime_value(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def _append_event(
@@ -2145,8 +2603,8 @@ def _target_position_pct(strategy: dict[str, Any]) -> float:
     return float(position.get("initial_position_pct") or position.get("max_single_position_pct") or 0.02)
 
 
-def _account_role(account_key: str) -> str:
-    for account in qmt_virtual_account_service._runtime_configs():
+def _account_role(account_key: str, *, db: Session | None = None, user_id: str | None = None) -> str:
+    for account in qmt_virtual_account_service._runtime_configs(db=db, user_id=user_id):
         if account.key == account_key:
             return str(account.role or "paper").lower()
     return "paper" if "paper" in account_key else "live" if "live" in account_key else "paper"

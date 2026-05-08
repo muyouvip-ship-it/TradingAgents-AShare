@@ -151,6 +151,66 @@ function isBulkSellTaskActive(status?: string | null) {
   return ['pending', 'running'].includes(String(status || '').trim().toLowerCase())
 }
 
+function resolveQmtConnectionHealth(
+  payload: VirtualWarehouseOverviewResponse | null,
+  backgroundRefresh: VirtualWarehouseBackgroundRefresh | null,
+) {
+  const connection = payload?.connection
+  const status = String(connection?.health_status || '')
+  const hasSnapshot = Boolean(
+    payload?.last_synced_at
+    || payload?.account
+    || payload?.positions?.length
+    || payload?.orders?.length
+    || payload?.trades?.length
+  )
+  const baseDetail = connection?.health_message || connection?.message || ''
+
+  if (status === 'live' || (!payload?.is_stale && connection?.connected)) {
+    return {
+      label: connection?.health_label || '实时直连',
+      detail: baseDetail || '本次 QMT 快照查询成功。',
+      tone: 'good',
+      icon: 'wifi',
+      badgeClass: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
+    }
+  }
+  if (status === 'background_live' || connection?.effective_connected) {
+    return {
+      label: connection?.health_label || '后台在线',
+      detail: baseDetail || `后台同步最近成功于 ${formatDateTime(connection?.last_background_success_at)}。`,
+      tone: 'good',
+      icon: 'wifi',
+      badgeClass: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
+    }
+  }
+  if (status === 'snapshot_available' || hasSnapshot) {
+    return {
+      label: connection?.health_label || '快照可用',
+      detail: baseDetail || '页面当前展示最近一次成功同步的 QMT 快照。',
+      tone: 'warn',
+      icon: 'database',
+      badgeClass: 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
+    }
+  }
+  if (backgroundRefresh?.active) {
+    return {
+      label: '刷新中',
+      detail: `后台刷新中，开始于 ${formatDateTime(backgroundRefresh.started_at)}。`,
+      tone: 'info',
+      icon: 'database',
+      badgeClass: 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300',
+    }
+  }
+  return {
+    label: connection?.health_label || '未连接',
+    detail: baseDetail || '当前没有可用的 QMT 连接或本地快照。',
+    tone: 'bad',
+    icon: 'off',
+    badgeClass: 'bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
+  }
+}
+
 export function WarehousePage({
   roleFilter = 'paper',
   pageTitle = '虚拟仓',
@@ -364,6 +424,7 @@ export function WarehousePage({
     {
       enabled: !(bulkSellTask && isBulkSellTaskActive(bulkSellTask.status)),
       intervalMs: (payload?.refresh_interval_seconds || 10) * 1000,
+      pauseWhenHidden: false,
       runImmediately: false,
     },
   )
@@ -543,6 +604,10 @@ export function WarehousePage({
     return '页面默认优先展示本地快照，后台会异步补最新数据'
   }, [backgroundRefresh])
   const backendGovernance = payload?.data_governance || null
+  const connectionHealth = useMemo(
+    () => resolveQmtConnectionHealth(payload, backgroundRefresh),
+    [backgroundRefresh, payload],
+  )
   const governanceWarnings = useMemo(() => {
     if (backendGovernance?.warnings?.length) {
       const merged = [...backendGovernance.warnings]
@@ -550,19 +615,25 @@ export function WarehousePage({
       return merged
     }
     const warnings: string[] = []
-    if (connection?.message) warnings.push(connection.message)
+    if (connectionHealth.tone !== 'good' && connectionHealth.detail) warnings.push(connectionHealth.detail)
     if (backgroundRefresh?.last_error) warnings.push(`后台刷新异常：${backgroundRefresh.last_error}`)
     if (error) warnings.push(error)
     return warnings
-  }, [backgroundRefresh?.last_error, backendGovernance?.warnings, connection?.message, error])
+  }, [backgroundRefresh?.last_error, backendGovernance?.warnings, connectionHealth.detail, connectionHealth.tone, error])
   const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
     if (backendGovernance?.items?.length) return backendGovernance.items
     return ([
     {
+      label: 'QMT 链路状态',
+      value: connectionHealth.label,
+      detail: connectionHealth.detail,
+      tone: connectionHealth.tone as DataSourceGovernanceItem['tone'],
+    },
+    {
       label: '账户数据源',
       value: payload?.data_source || connection?.provider || '--',
-      detail: connection?.connected ? '账户、持仓、订单与成交都从当前 QMT 链路生成' : '当前未建立有效账户连接',
-      tone: payload?.is_stale ? 'warn' : connection?.connected ? 'good' : 'bad',
+      detail: connectionHealth.detail,
+      tone: payload?.is_stale ? 'warn' : connectionHealth.tone as DataSourceGovernanceItem['tone'],
     },
     {
       label: '页面状态',
@@ -583,7 +654,7 @@ export function WarehousePage({
       tone: backgroundRefresh?.active ? 'info' : backgroundRefresh?.last_error ? 'bad' : backgroundRefresh?.last_success_at ? 'good' : 'neutral',
     },
   ])
-  }, [backgroundRefresh?.active, backgroundRefresh?.last_error, backgroundRefresh?.last_success_at, backgroundRefreshLabel, backendGovernance?.items, connection?.connected, connection?.provider, lastSyncTime, payload?.data_source, payload?.fetched_at, payload?.is_stale])
+  }, [backgroundRefresh?.active, backgroundRefresh?.last_error, backgroundRefresh?.last_success_at, backgroundRefreshLabel, backendGovernance?.items, connection?.provider, connectionHealth.detail, connectionHealth.label, connectionHealth.tone, lastSyncTime, payload?.data_source, payload?.fetched_at, payload?.is_stale])
 
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">{pageTitle}加载中...</div>
@@ -604,9 +675,9 @@ export function WarehousePage({
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-sm">
-              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${connection?.connected ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300'}`}>
-                {connection?.connected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
-                {connection?.connected ? '已连接' : '未连接'}
+              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${connectionHealth.badgeClass}`}>
+                {connectionHealth.icon === 'wifi' ? <Wifi className="h-4 w-4" /> : connectionHealth.icon === 'database' ? <Database className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+                {connectionHealth.label}
               </span>
               <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
                 地址 {connection?.host}:{connection?.port}
@@ -648,8 +719,8 @@ export function WarehousePage({
                 })}
               </div>
             ) : null}
-            {connection?.message ? (
-              <p className={`text-sm ${connection.connected ? 'text-slate-500 dark:text-slate-400' : 'text-amber-600 dark:text-amber-300'}`}>{connection.message}</p>
+            {connectionHealth.detail ? (
+              <p className={`text-sm ${connectionHealth.tone === 'bad' ? 'text-rose-600 dark:text-rose-300' : connectionHealth.tone === 'warn' ? 'text-amber-600 dark:text-amber-300' : 'text-slate-500 dark:text-slate-400'}`}>{connectionHealth.detail}</p>
             ) : null}
             <p className={`text-sm ${backgroundRefresh?.last_error ? 'text-rose-600 dark:text-rose-300' : 'text-slate-500 dark:text-slate-400'}`}>
               {backgroundRefreshLabel}

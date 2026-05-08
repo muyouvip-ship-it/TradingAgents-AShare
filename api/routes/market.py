@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from api.core.stock_map import get_reverse_stock_map
 from api.core.stock_utils import normalize_symbol, search_cn_stock_by_name
 from api.database import get_db
-from api.deps import require_api_user
+from api.deps import optional_web_user, require_api_user
 from api.services.qmt_market_data_service import (
     build_market_integrity_report,
     fetch_daily_bars,
@@ -63,7 +63,7 @@ def search_stocks(
         if found:
             results.append({"symbol": found, "name": code_to_name.get(found, q), "source": "akshare"})
 
-    quote_map = _load_quote_map([item["symbol"] for item in results[:20]])
+    quote_map = _load_quote_map([item["symbol"] for item in results[:20]], db=db, user_id=str(current_user.id))
     latest_map = _load_latest_stock_changes(db, [item["symbol"] for item in results[:20]])
     for item in results:
         quote = quote_map.get(item["symbol"]) or quote_map.get(item["symbol"].split(".", 1)[0]) or {}
@@ -83,15 +83,22 @@ def search_stocks(
 
 
 @router.get("/kline")
-def get_kline(symbol: str, start_date: str, end_date: str, db: Session = Depends(get_db)):
+def get_kline(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(optional_web_user),
+):
     normalized = normalize_symbol(symbol)
+    user_id = str(current_user.id) if current_user is not None else None
     code = normalized.split(".", 1)[0]
     index_codes = {item["code"] for item in INDEX_PRESETS}
     is_index = normalized in {item["symbol"] for item in INDEX_PRESETS} or code in index_codes
     rows = _load_kline_rows(db, code, start_date, end_date, prefer_index=is_index)
     if is_index and not rows:
         try:
-            fetch_daily_bars(normalized, start_date=start_date, end_date=end_date)
+            fetch_daily_bars(normalized, start_date=start_date, end_date=end_date, db=db, user_id=user_id)
             rows = _load_kline_rows(db, code, start_date, end_date, prefer_index=True)
         except Exception:
             rows = rows or []
@@ -124,7 +131,7 @@ def get_kline(symbol: str, start_date: str, end_date: str, db: Session = Depends
         )
         previous_close = close
 
-    _append_live_candle(candles, normalized, start_date, end_date)
+    _append_live_candle(candles, normalized, start_date, end_date, db=db, user_id=user_id)
     return {
         "symbol": normalized,
         "start_date": start_date,
@@ -140,8 +147,11 @@ def get_intraday(
     trade_date: str,
     period: str = Query("1m", pattern="^1m$"),
     include_latest_quote: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user=Depends(optional_web_user),
 ):
     normalized = normalize_symbol(symbol)
+    user_id = str(current_user.id) if current_user is not None else None
     payload = _fetch_intraday_bars_compat(
         normalized,
         trade_date=trade_date,
@@ -150,14 +160,21 @@ def get_intraday(
         account_key=None,
         persist=True,
         quote_timeout_seconds=FAST_INTRADAY_QUOTE_TIMEOUT_SECONDS,
+        db=db,
+        user_id=user_id,
     )
     return payload
 
 
 @router.get("/quote")
-def get_market_quote(symbol: str):
+def get_market_quote(
+    symbol: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(optional_web_user),
+):
     normalized = normalize_symbol(symbol)
-    quote = _fetch_realtime_quotes_compat([normalized], timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS).get(normalized)
+    user_id = str(current_user.id) if current_user is not None else None
+    quote = _fetch_realtime_quotes_compat([normalized], timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS, db=db, user_id=user_id).get(normalized)
     if not quote:
         raise HTTPException(status_code=404, detail=f"QMT quote unavailable for {normalized}")
     return {
@@ -173,9 +190,9 @@ def get_market_overview(
     db: Session = Depends(get_db),
     current_user=Depends(require_api_user),
 ) -> Dict[str, Any]:
-    del current_user
+    user_id = str(current_user.id)
     index_symbols = [item["symbol"] for item in INDEX_PRESETS]
-    quote_map = _load_quote_map(index_symbols, timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS)
+    quote_map = _load_quote_map(index_symbols, timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS, db=db, user_id=user_id)
     indices = []
     for item in INDEX_PRESETS:
         latest = _load_latest_index_item(db, item["code"])
@@ -320,14 +337,29 @@ def _has_column(db: Session, table_name: str, column_name: str) -> bool:
         return False
 
 
-def _fetch_realtime_quotes_compat(symbols: list[str], *, timeout_seconds: float | None = None) -> dict[str, dict[str, Any]]:
+def _fetch_realtime_quotes_compat(
+    symbols: list[str],
+    *,
+    timeout_seconds: float | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    kwargs: dict[str, Any] = {}
+    if timeout_seconds is not None:
+        kwargs["timeout_seconds"] = timeout_seconds
+    if db is not None:
+        kwargs["db"] = db
+    if user_id is not None:
+        kwargs["user_id"] = user_id
     try:
-        if timeout_seconds is None:
-            parsed = fetch_realtime_quotes(symbols)
-        else:
-            parsed = fetch_realtime_quotes(symbols, timeout_seconds=timeout_seconds)
+        parsed = fetch_realtime_quotes(symbols, **kwargs)
     except TypeError:
-        parsed = fetch_realtime_quotes(symbols)
+        kwargs.pop("db", None)
+        kwargs.pop("user_id", None)
+        try:
+            parsed = fetch_realtime_quotes(symbols, **kwargs)
+        except TypeError:
+            parsed = fetch_realtime_quotes(symbols)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -340,6 +372,8 @@ def _fetch_intraday_bars_compat(
     account_key: str | None,
     persist: bool,
     quote_timeout_seconds: float | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
 ):
     kwargs = {
         "trade_date": trade_date,
@@ -350,19 +384,34 @@ def _fetch_intraday_bars_compat(
     }
     if quote_timeout_seconds is not None:
         kwargs["quote_timeout_seconds"] = quote_timeout_seconds
+    if db is not None:
+        kwargs["db"] = db
+    if user_id is not None:
+        kwargs["user_id"] = user_id
     try:
         return fetch_intraday_bars(symbol, **kwargs)
     except TypeError:
         kwargs.pop("quote_timeout_seconds", None)
-        return fetch_intraday_bars(symbol, **kwargs)
+        try:
+            return fetch_intraday_bars(symbol, **kwargs)
+        except TypeError:
+            kwargs.pop("db", None)
+            kwargs.pop("user_id", None)
+            return fetch_intraday_bars(symbol, **kwargs)
 
 
-def _load_quote_map(symbols: list[str], *, timeout_seconds: float | None = None) -> dict[str, dict[str, Any]]:
+def _load_quote_map(
+    symbols: list[str],
+    *,
+    timeout_seconds: float | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
     normalized = [normalize_symbol(symbol) for symbol in symbols]
     try:
-        parsed = _fetch_realtime_quotes_compat(normalized, timeout_seconds=timeout_seconds)
+        parsed = _fetch_realtime_quotes_compat(normalized, timeout_seconds=timeout_seconds, db=db, user_id=user_id)
     except Exception:
         return {}
     if not isinstance(parsed, dict):
@@ -900,8 +949,16 @@ def _derive_chanlun_points(fractals: list[dict[str, Any]], zhongshu: list[dict[s
     return points
 
 
-def _append_live_candle(candles: list[dict], symbol: str, start_date: str, end_date: str) -> None:
-    quote = _fetch_realtime_quotes_compat([symbol], timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS).get(symbol) or {}
+def _append_live_candle(
+    candles: list[dict],
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    db: Session | None = None,
+    user_id: str | None = None,
+) -> None:
+    quote = _fetch_realtime_quotes_compat([symbol], timeout_seconds=FAST_QUOTE_TIMEOUT_SECONDS, db=db, user_id=user_id).get(symbol) or {}
     quote_time = str(quote.get("quote_time") or "")
     quote_date = quote_time[:10]
     if not quote_date or quote_date < start_date or quote_date > end_date:

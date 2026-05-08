@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timezone
 
 from sqlalchemy import text
 
 from api.backtest_data_api import _refresh_daily_kline_cache_from_db
-from api.core.settings import settings
 from api.database import SessionLocal
 from api.services.qmt_market_data_service import (
     build_market_integrity_report,
     capture_intraday_symbols,
     get_index_presets,
     is_index_symbol,
+    resolve_market_account_key,
     sync_major_index_daily,
 )
 from api.services.market_data_pipeline_service import preferred_daily_kline_table
@@ -27,6 +28,13 @@ _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
 _LAST_EOD_SYNC_DATE: date | None = None
 _LAST_REPAIR_SYNC_DATE: date | None = None
+
+
+@dataclass(frozen=True)
+class _MarketSyncTarget:
+    user_id: str
+    account_key: str
+    symbols: list[str]
 
 
 async def start_background_worker() -> None:
@@ -71,33 +79,68 @@ def _scan_and_run_once() -> None:
         return
 
     trade_date = local_now.date().isoformat()
-    account_key = str(settings.qmt_history_account_key or "paper_sim").strip() or "paper_sim"
-    symbols = _load_active_market_symbols(account_key)
+    targets = _load_market_sync_targets()
+    if not targets:
+        return
+    all_symbols = _merge_symbols([target.symbols for target in targets])
+    run_eod = _should_run_eod_sync(local_now, _LAST_EOD_SYNC_DATE)
+    run_repair = _should_run_repair_sync(local_now, _LAST_REPAIR_SYNC_DATE)
 
     if _is_trading_session(local_now):
-        capture_result = capture_intraday_symbols(symbols, trade_date=trade_date, period="1m", account_key=account_key)
-        logger.info(
-            "[qmt-market-sync] intraday capture rows=%s symbols=%s success=%s",
-            capture_result.get("rows", 0),
-            len(symbols),
-            capture_result.get("success"),
-        )
+        for target in targets:
+            capture_result = _capture_intraday_for_target(target, trade_date=trade_date)
+            logger.info(
+                "[qmt-market-sync] intraday capture user=%s account=%s rows=%s symbols=%s success=%s",
+                target.user_id,
+                target.account_key,
+                capture_result.get("rows", 0),
+                len(target.symbols),
+                capture_result.get("success"),
+            )
 
-    if _should_run_eod_sync(local_now, _LAST_EOD_SYNC_DATE):
-        _run_eod_sync(local_now, symbols, account_key=account_key)
+    if run_eod:
+        stock_daily_result = _run_stock_daily_sync(local_now, all_symbols)
+        for target in targets:
+            _run_eod_sync(local_now, target, stock_daily_result=stock_daily_result)
         _LAST_EOD_SYNC_DATE = local_now.date()
 
-    if _should_run_repair_sync(local_now, _LAST_REPAIR_SYNC_DATE):
-        _run_repair_sync(local_now, symbols, account_key=account_key)
+    if run_repair:
+        stock_daily_result = _run_stock_daily_sync(local_now, all_symbols)
+        for target in targets:
+            _run_repair_sync(local_now, target, stock_daily_result=stock_daily_result)
         _LAST_REPAIR_SYNC_DATE = local_now.date()
 
 
-def _run_eod_sync(local_now: datetime, symbols: list[str], *, account_key: str) -> None:
-    trade_date = local_now.date().isoformat()
-    intraday_result = capture_intraday_symbols(symbols, trade_date=trade_date, period="1m", account_key=account_key)
-    stock_daily_result = _run_stock_daily_sync(local_now, symbols)
-    index_daily_result = sync_major_index_daily(start_date=trade_date, end_date=trade_date, account_key=account_key)
+def _capture_intraday_for_target(target: _MarketSyncTarget, *, trade_date: str) -> dict[str, object]:
     with SessionLocal() as db:
+        return capture_intraday_symbols(
+            target.symbols,
+            trade_date=trade_date,
+            period="1m",
+            account_key=target.account_key,
+            db=db,
+            user_id=target.user_id,
+        )
+
+
+def _run_eod_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_daily_result: dict[str, object] | None = None) -> None:
+    trade_date = local_now.date().isoformat()
+    with SessionLocal() as db:
+        intraday_result = capture_intraday_symbols(
+            target.symbols,
+            trade_date=trade_date,
+            period="1m",
+            account_key=target.account_key,
+            db=db,
+            user_id=target.user_id,
+        )
+        index_daily_result = sync_major_index_daily(
+            start_date=trade_date,
+            end_date=trade_date,
+            account_key=target.account_key,
+            db=db,
+            user_id=target.user_id,
+        )
         latest_trade_date = _load_latest_stock_daily_trade_date(db)
         cache_result = _refresh_daily_kline_cache_from_db(
             db,
@@ -105,8 +148,11 @@ def _run_eod_sync(local_now: datetime, symbols: list[str], *, account_key: str) 
             end_date=latest_trade_date,
         ) if latest_trade_date else {"updated": False, "records": 0}
         integrity = build_market_integrity_report(db, target_date=trade_date)
+    stock_daily_result = stock_daily_result or _run_stock_daily_sync(local_now, target.symbols)
     logger.info(
-        "[qmt-market-sync] eod sync trade_date=%s intraday_rows=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        "[qmt-market-sync] eod sync user=%s account=%s trade_date=%s intraday_rows=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        target.user_id,
+        target.account_key,
         trade_date,
         intraday_result.get("rows", 0),
         stock_daily_result.get("mode"),
@@ -117,11 +163,16 @@ def _run_eod_sync(local_now: datetime, symbols: list[str], *, account_key: str) 
     )
 
 
-def _run_repair_sync(local_now: datetime, symbols: list[str], *, account_key: str) -> None:
+def _run_repair_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_daily_result: dict[str, object] | None = None) -> None:
     trade_date = local_now.date().isoformat()
-    stock_daily_result = _run_stock_daily_sync(local_now, symbols)
-    index_daily_result = sync_major_index_daily(start_date=trade_date, end_date=trade_date, account_key=account_key)
     with SessionLocal() as db:
+        index_daily_result = sync_major_index_daily(
+            start_date=trade_date,
+            end_date=trade_date,
+            account_key=target.account_key,
+            db=db,
+            user_id=target.user_id,
+        )
         latest_trade_date = _load_latest_stock_daily_trade_date(db)
         cache_result = _refresh_daily_kline_cache_from_db(
             db,
@@ -129,8 +180,11 @@ def _run_repair_sync(local_now: datetime, symbols: list[str], *, account_key: st
             end_date=latest_trade_date,
         ) if latest_trade_date else {"updated": False, "records": 0}
         integrity = build_market_integrity_report(db, target_date=trade_date)
+    stock_daily_result = stock_daily_result or _run_stock_daily_sync(local_now, target.symbols)
     logger.info(
-        "[qmt-market-sync] repair sync trade_date=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        "[qmt-market-sync] repair sync user=%s account=%s trade_date=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        target.user_id,
+        target.account_key,
         trade_date,
         stock_daily_result.get("mode"),
         stock_daily_result.get("records", 0),
@@ -236,18 +290,19 @@ def _load_latest_stock_daily_trade_date(db) -> date | None:
     return db.execute(text(f"SELECT MAX(trade_date) FROM {table_name}")).scalar()
 
 
-def _load_active_market_symbols(account_key: str) -> list[str]:
-    seen: set[str] = set()
-    symbols: list[str] = []
+def _load_market_sync_targets(preferred_account_key: str | None = None) -> list[_MarketSyncTarget]:
+    target_symbols: dict[tuple[str, str], list[str]] = {}
+    seen_by_target: dict[tuple[str, str], set[str]] = {}
 
-    def _add_many(values: list[str]) -> None:
+    def _add_many(key: tuple[str, str], values: list[str]) -> None:
+        symbols = target_symbols.setdefault(key, [])
+        seen = seen_by_target.setdefault(key, set())
         for item in values:
             symbol = str(item or "").strip().upper()
             if symbol and symbol not in seen:
                 seen.add(symbol)
                 symbols.append(symbol)
 
-    _add_many([item["symbol"] for item in get_index_presets()])
     with SessionLocal() as db:
         rows = db.execute(text("""
             SELECT *
@@ -258,11 +313,46 @@ def _load_active_market_symbols(account_key: str) -> list[str]:
         """)).fetchall()
         for row in rows:
             enabled = {str(item).strip() for item in (row.enabled_data_types or []) if str(item).strip()}
-            if "minute_kline" not in enabled:
+            if not ({"daily_kline", "minute_kline"} & enabled):
                 continue
-            resolved = _resolve_capture_symbols(db, str(row.user_id), row.default_symbols or [], account_key=account_key)
-            _add_many(resolved)
-    return symbols[:400]
+            user_id = str(row.user_id)
+            account_key = str(
+                resolve_market_account_key(
+                    db=db,
+                    user_id=user_id,
+                    preferred_account_key=preferred_account_key,
+                )
+                or "paper_sim"
+            ).strip() or "paper_sim"
+            key = (user_id, account_key)
+            _add_many(key, [item["symbol"] for item in get_index_presets()])
+            if "minute_kline" in enabled:
+                resolved = _resolve_capture_symbols(db, user_id, row.default_symbols or [], account_key=account_key)
+                _add_many(key, resolved)
+            else:
+                _add_many(key, [str(item) for item in (row.default_symbols or []) if str(item).strip()])
+
+    return [
+        _MarketSyncTarget(user_id=user_id, account_key=account_key, symbols=symbols[:400])
+        for (user_id, account_key), symbols in target_symbols.items()
+        if symbols
+    ]
+
+
+def _merge_symbols(groups: list[list[str]]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for group in groups:
+        for item in group:
+            symbol = str(item or "").strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                result.append(symbol)
+    return result
+
+
+def _load_active_market_symbols(account_key: str) -> list[str]:
+    return _merge_symbols([target.symbols for target in _load_market_sync_targets(preferred_account_key=account_key)])[:400]
 
 
 def _is_trading_day(local_now: datetime) -> bool:
