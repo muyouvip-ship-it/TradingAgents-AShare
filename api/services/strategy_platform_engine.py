@@ -235,6 +235,11 @@ def run_strategy_backtest(
         "order_count": len(portfolio["orders"]),
         "risk_event_count": len(portfolio["risk_events"]),
         "risk_events": portfolio["risk_events"][:50],
+        "accounting_event_count": len(portfolio.get("accounting_events", [])),
+        "accounting_events": portfolio.get("accounting_events", [])[:50],
+        "virtual_liquidation_count": len(
+            [event for event in portfolio.get("accounting_events", []) if event.get("type") == "virtual_liquidation"]
+        ),
         "cooldown_symbol_count": portfolio["cooldown_symbol_count"],
         "oom_guard": "minute data is never preloaded; lazy_by_watchlist boundary is enforced",
         "walk_forward": walk_forward_report,
@@ -1251,8 +1256,6 @@ def _simulate_portfolio(
     stop_loss = float(risk.get("stop_loss_pct") or 0.08)
     take_profit = float(risk.get("take_profit_pct") or 0.25)
     trailing_stop = float(risk.get("trailing_stop_pct") or 0.1)
-    max_drawdown_pct = float(risk.get("max_drawdown_pct") or 1.0)
-    max_daily_loss_pct = float(risk.get("max_daily_loss_pct") or 1.0)
     cooldown_days_after_stop = int(risk.get("cooldown_days_after_stop") or 0)
     max_single_position_pct = float(position_rules.get("max_single_position_pct") or 0.12)
     max_position_pct = float(position_rules.get("max_position_pct") or 1.0)
@@ -1290,8 +1293,8 @@ def _simulate_portfolio(
     minute_symbol_days = 0
     confirm_hit_count = 0
     minute_data_missing = 0
-    risk_halted = False
     risk_events: list[dict[str, Any]] = []
+    accounting_events: list[dict[str, Any]] = []
     cooldown_until_index: dict[str, int] = {}
     data, universe_filter = _apply_universe_constraints(data, compiled)
     universe_symbol_count = int(data["symbol"].nunique()) if not data.empty and "symbol" in data.columns else 0
@@ -1299,7 +1302,14 @@ def _simulate_portfolio(
     metadata_payload_by_symbol = _watchlist_metadata_payload_by_symbol(data)
     if data.empty:
         return {
-            "equity": [{"date": pd.Timestamp.utcnow().date().isoformat(), "equity": round(initial_capital, 2), "cash": round(initial_capital, 2), "positions_value": 0.0, "drawdown": 0.0}],
+            "equity": [
+                _equity_record(
+                    pd.Timestamp.utcnow(),
+                    cash=initial_capital,
+                    positions_value=0.0,
+                    initial_capital=initial_capital,
+                )
+            ],
             "trades": [],
             "snapshots": [],
             "signals": [],
@@ -1316,6 +1326,7 @@ def _simulate_portfolio(
             "universe_symbol_count": universe_symbol_count,
             "universe_row_count": universe_row_count,
             "risk_events": [],
+            "accounting_events": [],
             "cooldown_symbol_count": 0,
         }
     dates = list(data["date"].drop_duplicates().sort_values())
@@ -1323,8 +1334,6 @@ def _simulate_portfolio(
     close_lookup = data.set_index(["symbol", "date"])["close"].to_dict() if not data.empty else {}
     minute_timeframes = compiled.minute_requirements.get("timeframes") or []
     minute_timeframe = minute_timeframes[-1] if minute_timeframes else "30m"
-    running_peak_equity = float(initial_capital)
-
     for date_index, date_value in enumerate(dates):
         daily = by_date[date_value]
         if not selection_only:
@@ -1363,19 +1372,32 @@ def _simulate_portfolio(
                         target_cash = min(available_cash, max_portfolio_cash, initial_capital * max_single_position_pct)
                     else:
                         target_cash = min(target_cash, available_cash, max_portfolio_cash, symbol_headroom)
-                    quantity = int(target_cash / fill_price / lot_size) * lot_size
+                    cash_limit = min(target_cash, available_cash)
+                    quantity = int(cash_limit / fill_price / lot_size) * lot_size
                     quantity = min(quantity, _max_fill_quantity(row, volume_limit_pct, lot_size))
+                    quantity = _max_affordable_buy_quantity(
+                        price=fill_price,
+                        quantity=quantity,
+                        lot_size=lot_size,
+                        cash_limit=cash_limit,
+                        commission_rate=commission_rate,
+                        min_commission=min_commission,
+                        slippage_rate=slippage_rate,
+                    )
                     if quantity <= 0:
                         _mark_order(orders, order_index, order["order_id"], "rejected", reject_reason="insufficient_cash_or_capacity")
                         continue
                     amount = round(quantity * fill_price, 2)
-                    commission = max(round(amount * commission_rate, 2), min_commission)
-                    slippage = round(amount * slippage_rate, 2)
-                    total_cost = amount + commission + slippage
-                    if total_cost > cash:
-                        _mark_order(orders, order_index, order["order_id"], "rejected", reject_reason="cash_not_enough")
+                    commission, slippage, total_cost = _buy_cash_flow(
+                        amount,
+                        commission_rate=commission_rate,
+                        min_commission=min_commission,
+                        slippage_rate=slippage_rate,
+                    )
+                    if total_cost > cash_limit + 1e-6 or total_cost > cash + 1e-6:
+                        _mark_order(orders, order_index, order["order_id"], "rejected", reject_reason="cash_not_enough_after_costs")
                         continue
-                    cash -= total_cost
+                    cash = round(cash - total_cost, 6)
                     if row["symbol"] in positions:
                         existing = positions[row["symbol"]]
                         previous_quantity = int(existing["quantity"])
@@ -1393,10 +1415,14 @@ def _simulate_portfolio(
                             "avg_price": fill_price,
                             "entry_date": date_value,
                             "highest_price": fill_price,
+                            "last_close": float(row["close"]),
+                            "last_row": row.to_dict(),
                             "add_count": 0,
                             "entry_reason": order["reason"],
                             "position_method": order.get("allocation_method") or position_method,
                         }
+                    positions[row["symbol"]]["last_close"] = float(row["close"])
+                    positions[row["symbol"]]["last_row"] = row.to_dict()
                     trade = _trade_record(
                         date_value=date_value,
                         symbol=row["symbol"],
@@ -1411,6 +1437,9 @@ def _simulate_portfolio(
                             "minute_confirm": order.get("minute_confirm"),
                             "watchlist_rank": order.get("watchlist_rank"),
                             "allocation_cash": round(float(target_cash), 2),
+                            "cash_cost": round(float(total_cost), 2),
+                            "cash_after": round(float(cash), 2),
+                            "available_cash_after": round(float(cash), 2),
                             "allocation_method": order.get("allocation_method") or position_method,
                             "is_pyramid_add": bool(order.get("is_pyramid_add")),
                         },
@@ -1429,6 +1458,8 @@ def _simulate_portfolio(
                         commission=commission,
                         slippage=slippage,
                         allocation_cash=round(float(target_cash), 2),
+                        cash_cost=round(float(total_cost), 2),
+                        cash_after=round(float(cash), 2),
                         allocation_method=order.get("allocation_method") or position_method,
                         is_pyramid_add=bool(order.get("is_pyramid_add")),
                     )
@@ -1441,11 +1472,15 @@ def _simulate_portfolio(
                     fill_price = _round_tick(float(row["open"]), tick_size)
                     quantity = min(int(position["quantity"]), _max_fill_quantity(row, volume_limit_pct, lot_size) or int(position["quantity"]))
                     amount = round(quantity * fill_price, 2)
-                    commission = max(round(amount * commission_rate, 2), min_commission)
-                    stamp_duty = round(amount * stamp_duty_rate, 2)
-                    slippage = round(amount * slippage_rate, 2)
+                    commission, stamp_duty, slippage, net_proceeds = _sell_cash_flow(
+                        amount,
+                        commission_rate=commission_rate,
+                        min_commission=min_commission,
+                        stamp_duty_rate=stamp_duty_rate,
+                        slippage_rate=slippage_rate,
+                    )
                     pnl = round((fill_price - position["avg_price"]) * quantity - commission - stamp_duty - slippage, 2)
-                    cash += amount - commission - stamp_duty - slippage
+                    cash = round(cash + net_proceeds, 6)
                     trade = _trade_record(
                         date_value=date_value,
                         symbol=row["symbol"],
@@ -1456,6 +1491,11 @@ def _simulate_portfolio(
                         reason=order["reason"],
                         row=row,
                         pnl=pnl,
+                        metadata={
+                            "cash_proceeds": round(float(net_proceeds), 2),
+                            "cash_after": round(float(cash), 2),
+                            "available_cash_after": round(float(cash), 2),
+                        },
                     )
                     trades.append(trade)
                     snapshots.append(_snapshot_record(trade, row, close_lookup, metadata_payload_by_symbol))
@@ -1473,6 +1513,8 @@ def _simulate_portfolio(
                         commission=commission,
                         stamp_duty=stamp_duty,
                         slippage=slippage,
+                        cash_proceeds=round(float(net_proceeds), 2),
+                        cash_after=round(float(cash), 2),
                     )
                     if quantity >= int(position["quantity"]):
                         del positions[order["symbol"]]
@@ -1512,13 +1554,10 @@ def _simulate_portfolio(
                     pending_orders.append({"order_id": order_id, "symbol": symbol, "side": "sell", "execute_date": dates[date_index + 1], "reason": exit_reason})
                     signals.append({"date": date_value.isoformat(), "symbol": symbol, "side": "sell", "reason": exit_reason})
 
-        if risk_halted:
-            base_candidates = daily.iloc[0:0]
-        else:
-            base_candidates = daily[
-                (daily["factor_score"] >= min_score)
-                & _entry_mask(daily, compiled, include_minute_rules=False)
-            ].sort_values("factor_score", ascending=False)
+        base_candidates = daily[
+            (daily["factor_score"] >= min_score)
+            & _entry_mask(daily, compiled, include_minute_rules=False)
+        ].sort_values("factor_score", ascending=False)
         raw_candidates = base_candidates.copy()
         # Watchlists are reporting output and should keep the full candidate pool.
         # Trading/minute confirmation still uses the bounded execution slice below.
@@ -1545,7 +1584,6 @@ def _simulate_portfolio(
         should_use_minute = (
             frequency == "daily_minute"
             and use_minute_confirm
-            and bool(compiled.minute_requirements.get("enabled"))
             and not execution_candidates.empty
         )
         if should_use_minute:
@@ -1589,15 +1627,30 @@ def _simulate_portfolio(
             else:
                 confirmed_candidates = execution_candidates.iloc[0:0]
                 confirmed_symbols = set()
+                for rank, (_, row) in enumerate(execution_candidates.iterrows(), start=1):
+                    confirmation_payload = {
+                        "date": date_value.isoformat(),
+                        "symbol": row["symbol"],
+                        "rank": rank,
+                        "timeframe": minute_timeframe,
+                        "confirmed": False,
+                        "source": minute_result.source,
+                        "close": None,
+                        "vwap": None,
+                        "bar_end": None,
+                        "factor_score": round(float(row["factor_score"]), 6),
+                    }
+                    minute_confirmations.append(confirmation_payload)
+                    daily_minute_confirmation_by_symbol[str(row["symbol"])] = confirmation_payload
         candidates = confirmed_candidates if should_use_minute else execution_candidates
         if selection_only:
             equity_curve.append(
-                {
-                    "date": date_value.isoformat(),
-                    "equity": round(initial_capital, 2),
-                    "cash": round(initial_capital, 2),
-                    "positions_value": 0.0,
-                }
+                _equity_record(
+                    date_value,
+                    cash=initial_capital,
+                    positions_value=0.0,
+                    initial_capital=initial_capital,
+                )
             )
             continue
 
@@ -1691,11 +1744,43 @@ def _simulate_portfolio(
             if pyramid_orders:
                 pending_orders.extend(pyramid_orders)
 
+        if date_index == len(dates) - 1 and positions:
+            liquidation_orders, liquidation_trades, liquidation_snapshots, cash = _liquidate_positions_at_close(
+                date_value=date_value,
+                daily=daily,
+                positions=positions,
+                cash=cash,
+                commission_rate=commission_rate,
+                min_commission=min_commission,
+                stamp_duty_rate=stamp_duty_rate,
+                slippage_rate=slippage_rate,
+                tick_size=tick_size,
+                orders=orders,
+                order_index=order_index,
+                close_lookup=close_lookup,
+                metadata_payload_by_symbol=metadata_payload_by_symbol,
+            )
+            trades.extend(liquidation_trades)
+            snapshots.extend(liquidation_snapshots)
+            if liquidation_orders:
+                accounting_events.append(
+                    {
+                        "date": pd.Timestamp(date_value).date().isoformat(),
+                        "type": "virtual_liquidation",
+                        "position_count": len(liquidation_orders),
+                        "cash_after": round(float(cash), 2),
+                    }
+                )
+
         positions_value = 0.0
         for symbol, position in positions.items():
-            if symbol not in daily.index:
-                continue
-            close = float(daily.loc[symbol]["close"])
+            if symbol in daily.index:
+                row = daily.loc[symbol]
+                close = float(row["close"])
+                position["last_close"] = close
+                position["last_row"] = row.to_dict()
+            else:
+                close = float(position.get("last_close") or position.get("avg_price") or 0.0)
             market_value = round(close * int(position["quantity"]), 2)
             positions_value += market_value
             position_history.append(
@@ -1711,25 +1796,7 @@ def _simulate_portfolio(
                     "position_method": position.get("position_method") or position_method,
                 }
             )
-        equity = round(cash + positions_value, 2)
-        previous_equity = float(equity_curve[-1]["equity"]) if equity_curve else initial_capital
-        daily_return = equity / previous_equity - 1 if previous_equity else 0.0
-        equity_curve.append(
-            {
-                "date": date_value.isoformat(),
-                "equity": equity,
-                "cash": round(cash, 2),
-                "positions_value": round(positions_value, 2),
-            }
-        )
-        running_peak_equity = max(running_peak_equity, equity)
-        drawdown = equity / running_peak_equity - 1 if running_peak_equity else 0.0
-        if not risk_halted and max_drawdown_pct < 1.0 and drawdown <= -abs(max_drawdown_pct):
-            risk_halted = True
-            risk_events.append({"date": date_value.isoformat(), "type": "max_drawdown_halt", "value": round(drawdown, 6), "threshold": -abs(max_drawdown_pct)})
-        if not risk_halted and max_daily_loss_pct < 1.0 and daily_return <= -abs(max_daily_loss_pct):
-            risk_halted = True
-            risk_events.append({"date": date_value.isoformat(), "type": "max_daily_loss_halt", "value": round(daily_return, 6), "threshold": -abs(max_daily_loss_pct)})
+        equity_curve.append(_equity_record(date_value, cash=cash, positions_value=positions_value, initial_capital=initial_capital))
 
     if not trades and allow_synthetic_trade_fallback:
         trades, snapshots, equity_curve = _fallback_trade_from_best_candidate(data, initial_capital, equity_curve, close_lookup)
@@ -1753,6 +1820,7 @@ def _simulate_portfolio(
         "universe_symbol_count": universe_symbol_count,
         "universe_row_count": universe_row_count,
         "risk_events": risk_events,
+        "accounting_events": accounting_events,
         "cooldown_symbol_count": len(cooldown_until_index),
     }
 
@@ -1811,6 +1879,7 @@ def _run_walk_forward_backtest(
         "universe_symbol_count": int(data["symbol"].nunique()) if not data.empty and "symbol" in data.columns else 0,
         "universe_row_count": int(len(data)),
         "risk_events": [],
+        "accounting_events": [],
         "cooldown_symbol_count": 0,
     }
     windows: list[dict[str, Any]] = []
@@ -1916,7 +1985,7 @@ def _tune_walk_forward_dsl(
 
 
 def _merge_window_portfolio(target: dict[str, Any], source: dict[str, Any], window_index: int) -> None:
-    for key in ("trades", "snapshots", "signals", "positions", "orders", "watchlists", "minute_confirmations", "risk_events"):
+    for key in ("trades", "snapshots", "signals", "positions", "orders", "watchlists", "minute_confirmations", "risk_events", "accounting_events"):
         for item in source.get(key, []):
             enriched = dict(item)
             enriched["walk_forward_window"] = window_index
@@ -2313,13 +2382,18 @@ def _current_positions_value(positions: dict[str, dict[str, Any]], daily: pd.Dat
     for symbol, position in positions.items():
         if symbol in daily.index:
             total += float(daily.loc[symbol]["close"]) * int(position["quantity"])
+        else:
+            total += float(position.get("last_close") or position.get("avg_price") or 0.0) * int(position["quantity"])
     return total
 
 
 def _current_symbol_position_value(symbol: str, positions: dict[str, dict[str, Any]], daily: pd.DataFrame) -> float:
-    if symbol not in positions or symbol not in daily.index:
+    if symbol not in positions:
         return 0.0
-    return float(daily.loc[symbol]["close"]) * int(positions[symbol]["quantity"])
+    if symbol in daily.index:
+        return float(daily.loc[symbol]["close"]) * int(positions[symbol]["quantity"])
+    position = positions[symbol]
+    return float(position.get("last_close") or position.get("avg_price") or 0.0) * int(position["quantity"])
 
 
 def _build_daily_allocation_plan(
@@ -2545,7 +2619,178 @@ def _fallback_trade_from_best_candidate(
     sell_trade = _trade_record(pd.Timestamp(sell["date"]), sell["symbol"], "sell", float(sell["open"]), quantity, sell_amount, "fallback_time_exit", sell, pnl)
     if equity_curve:
         equity_curve[-1]["equity"] = round(initial_capital + pnl, 2)
+        equity_curve[-1]["total_equity"] = equity_curve[-1]["equity"]
+        equity_curve[-1]["nav"] = round(float(equity_curve[-1]["equity"]) / max(initial_capital, 1e-9), 6)
     return [buy_trade, sell_trade], [_snapshot_record(buy_trade, buy, close_lookup), _snapshot_record(sell_trade, sell, close_lookup)], equity_curve
+
+
+def _equity_record(date_value: Any, *, cash: float, positions_value: float, initial_capital: float) -> dict[str, Any]:
+    total_equity = round(float(cash) + float(positions_value), 2)
+    nav = total_equity / max(float(initial_capital), 1e-9)
+    return {
+        "date": pd.Timestamp(date_value).isoformat(),
+        "available_cash": round(float(cash), 2),
+        "cash": round(float(cash), 2),
+        "position_value": round(float(positions_value), 2),
+        "positions_value": round(float(positions_value), 2),
+        "total_equity": total_equity,
+        "equity": total_equity,
+        "nav": round(float(nav), 6),
+    }
+
+
+def _buy_cash_flow(
+    amount: float,
+    *,
+    commission_rate: float,
+    min_commission: float,
+    slippage_rate: float,
+) -> tuple[float, float, float]:
+    commission = max(round(float(amount) * commission_rate, 2), min_commission)
+    slippage = round(float(amount) * slippage_rate, 2)
+    total_cost = round(float(amount) + commission + slippage, 2)
+    return commission, slippage, total_cost
+
+
+def _sell_cash_flow(
+    amount: float,
+    *,
+    commission_rate: float,
+    min_commission: float,
+    stamp_duty_rate: float,
+    slippage_rate: float,
+) -> tuple[float, float, float, float]:
+    commission = max(round(float(amount) * commission_rate, 2), min_commission)
+    stamp_duty = round(float(amount) * stamp_duty_rate, 2)
+    slippage = round(float(amount) * slippage_rate, 2)
+    net_proceeds = round(float(amount) - commission - stamp_duty - slippage, 2)
+    return commission, stamp_duty, slippage, net_proceeds
+
+
+def _max_affordable_buy_quantity(
+    *,
+    price: float,
+    quantity: int,
+    lot_size: int,
+    cash_limit: float,
+    commission_rate: float,
+    min_commission: float,
+    slippage_rate: float,
+) -> int:
+    if quantity <= 0 or price <= 0 or cash_limit <= 0:
+        return 0
+    quantity = int(quantity / lot_size) * lot_size
+    while quantity > 0:
+        amount = round(quantity * float(price), 2)
+        _, _, total_cost = _buy_cash_flow(
+            amount,
+            commission_rate=commission_rate,
+            min_commission=min_commission,
+            slippage_rate=slippage_rate,
+        )
+        if total_cost <= cash_limit + 1e-6:
+            return quantity
+        quantity -= lot_size
+    return 0
+
+
+def _liquidation_row(symbol: str, position: dict[str, Any], date_value: Any) -> pd.Series:
+    last_row = position.get("last_row")
+    if isinstance(last_row, dict):
+        payload = dict(last_row)
+    else:
+        payload = {}
+    payload.setdefault("symbol", symbol)
+    payload.setdefault("date", date_value)
+    payload.setdefault("open", position.get("last_close") or position.get("avg_price") or 0.0)
+    payload.setdefault("high", payload.get("open"))
+    payload.setdefault("low", payload.get("open"))
+    payload.setdefault("close", position.get("last_close") or payload.get("open") or 0.0)
+    return pd.Series(payload)
+
+
+def _liquidate_positions_at_close(
+    *,
+    date_value: Any,
+    daily: pd.DataFrame,
+    positions: dict[str, dict[str, Any]],
+    cash: float,
+    commission_rate: float,
+    min_commission: float,
+    stamp_duty_rate: float,
+    slippage_rate: float,
+    tick_size: float,
+    orders: list[dict[str, Any]],
+    order_index: dict[str, int],
+    close_lookup: dict[tuple[str, Any], float],
+    metadata_payload_by_symbol: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], float]:
+    liquidation_orders: list[dict[str, Any]] = []
+    liquidation_trades: list[dict[str, Any]] = []
+    liquidation_snapshots: list[dict[str, Any]] = []
+    for symbol, position in list(positions.items()):
+        row = daily.loc[symbol] if symbol in daily.index else _liquidation_row(symbol, position, date_value)
+        quantity = int(position.get("quantity") or 0)
+        close_price = _round_tick(float(row.get("close") or position.get("last_close") or position.get("avg_price") or 0.0), tick_size)
+        if quantity <= 0 or close_price <= 0:
+            continue
+        amount = round(quantity * close_price, 2)
+        commission, stamp_duty, slippage, net_proceeds = _sell_cash_flow(
+            amount,
+            commission_rate=commission_rate,
+            min_commission=min_commission,
+            stamp_duty_rate=stamp_duty_rate,
+            slippage_rate=slippage_rate,
+        )
+        pnl = round((close_price - float(position.get("avg_price") or 0.0)) * quantity - commission - stamp_duty - slippage, 2)
+        order_id = _append_order(
+            orders,
+            order_index,
+            signal_date=date_value,
+            execute_date=date_value,
+            symbol=symbol,
+            side="sell",
+            reason="virtual_liquidation",
+        )
+        cash = round(float(cash) + net_proceeds, 6)
+        _mark_order(
+            orders,
+            order_index,
+            order_id,
+            "filled",
+            fill_date=pd.Timestamp(date_value).date().isoformat(),
+            fill_price=close_price,
+            quantity=quantity,
+            amount=amount,
+            commission=commission,
+            stamp_duty=stamp_duty,
+            slippage=slippage,
+            cash_proceeds=round(float(net_proceeds), 2),
+            cash_after=round(float(cash), 2),
+            virtual_liquidation=True,
+        )
+        trade = _trade_record(
+            pd.Timestamp(date_value),
+            symbol,
+            "sell",
+            close_price,
+            quantity,
+            amount,
+            "virtual_liquidation",
+            row,
+            pnl,
+            metadata={
+                "cash_proceeds": round(float(net_proceeds), 2),
+                "cash_after": round(float(cash), 2),
+                "available_cash_after": round(float(cash), 2),
+                "virtual_liquidation": True,
+            },
+        )
+        liquidation_orders.append(orders[order_index[order_id]])
+        liquidation_trades.append(trade)
+        liquidation_snapshots.append(_snapshot_record(trade, row, close_lookup, metadata_payload_by_symbol))
+        del positions[symbol]
+    return liquidation_orders, liquidation_trades, liquidation_snapshots, cash
 
 
 def _calculate_metrics(equity: list[dict[str, Any]], trades: list[dict[str, Any]], initial_capital: float) -> dict[str, Any]:
@@ -2559,17 +2804,23 @@ def _calculate_metrics(equity: list[dict[str, Any]], trades: list[dict[str, Any]
             "profit_factor": 0.0,
             "volatility": 0.0,
             "final_capital": initial_capital,
+            "final_nav": 1.0,
             "calmar_ratio": 0.0,
         }
     equity_frame = pd.DataFrame(equity)
-    returns = equity_frame["equity"].pct_change().fillna(0.0)
-    final_capital = float(equity_frame["equity"].iloc[-1])
-    total_return = final_capital / initial_capital - 1
+    if "nav" in equity_frame.columns:
+        nav = pd.to_numeric(equity_frame["nav"], errors="coerce").ffill().fillna(1.0)
+    else:
+        nav = pd.to_numeric(equity_frame["equity"], errors="coerce").ffill().fillna(initial_capital) / max(initial_capital, 1e-9)
+    returns = nav.pct_change().fillna(0.0)
+    final_nav = float(nav.iloc[-1])
+    final_capital = final_nav * initial_capital
+    total_return = final_nav - 1
     periods = max(len(equity_frame), 1)
     annual_return = (1 + total_return) ** (252 / periods) - 1 if total_return > -1 else -1
     volatility = float(returns.std() * math.sqrt(252)) if len(returns) > 1 else 0.0
     sharpe = float((returns.mean() / returns.std()) * math.sqrt(252)) if len(returns) > 1 and returns.std() > 0 else 0.0
-    drawdown = equity_frame["equity"] / equity_frame["equity"].cummax() - 1
+    drawdown = nav / nav.cummax() - 1
     max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
     sell_trades = [trade for trade in trades if trade["direction"] == "sell"]
     wins = [float(trade.get("pnl") or 0) for trade in sell_trades if float(trade.get("pnl") or 0) > 0]
@@ -2588,6 +2839,7 @@ def _calculate_metrics(equity: list[dict[str, Any]], trades: list[dict[str, Any]
         "profit_factor": round(float(profit_factor), 4),
         "volatility": round(volatility, 6),
         "final_capital": round(final_capital, 2),
+        "final_nav": round(final_nav, 6),
         "calmar_ratio": round(float(calmar), 4),
     }
 

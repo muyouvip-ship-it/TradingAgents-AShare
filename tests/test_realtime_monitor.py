@@ -35,7 +35,7 @@ def _create_strategy(client: TestClient, name: str) -> str:
             "description": "实时监控测试策略",
             "dsl": _default_dsl("trading").model_dump(),
             "status": "active",
-            "source": "manual",
+            "source": "test",
         },
     )
     assert response.status_code == 200

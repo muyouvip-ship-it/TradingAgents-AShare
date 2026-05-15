@@ -64,6 +64,37 @@ def test_strategy_platform_repository_persists_strategy_payload(db):
     assert len(items) == 1
 
 
+def test_strategy_platform_repository_hides_test_strategies_by_default(db):
+    base_payload = {
+        "id": "strategy_repo_test_hidden",
+        "name": "实时测试策略-abcdef",
+        "strategy_type": "trading",
+        "status": "active",
+        "description": "实时监控测试策略",
+        "source": "test",
+        "current_version_id": "version_1",
+        "version": 1,
+        "is_active": True,
+        "run_count": 0,
+        "performance": None,
+        "current_version": {
+            "id": "version_1",
+            "strategy_id": "strategy_repo_test_hidden",
+            "version": 1,
+            "dsl": {"schema_version": "1.0", "strategy_type": "trading"},
+            "compile_status": "passed",
+            "compiled_hash": "abc123",
+            "change_summary": "init",
+            "created_at": "2026-04-20T00:00:00+00:00",
+        },
+        "tags": ["AI创建", "待回测"],
+    }
+    save_platform_strategy(db, base_payload)
+
+    assert list_platform_strategies(db) == []
+    assert len(list_platform_strategies(db, include_test=True)) == 1
+
+
 def test_strategy_platform_repository_persists_backtest_and_updates_metrics(db):
     save_platform_strategy(
         db,

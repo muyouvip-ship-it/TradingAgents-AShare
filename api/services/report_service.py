@@ -16,12 +16,19 @@ STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
 def _extract_price_regex(text: Optional[str], price_type: str) -> Optional[float]:
     if not text:
         return None
+    normalized = re.sub(r"[*_`#>\[\]（）()]", "", str(text))
     if price_type == "target":
-        patterns = (r"目标价[:：]\s*[¥$]?\s*(\d+\.?\d*)", r"target[:：]\s*[¥$]?\s*(\d+\.?\d*)")
+        patterns = (
+            r"目标(?:价|价格|位|价位)?(?:区间)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)",
+            r"(?:target|target\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)",
+        )
     else:
-        patterns = (r"止损价[:：]\s*[¥$]?\s*(\d+\.?\d*)", r"stop[-\s_]?loss[:：]\s*[¥$]?\s*(\d+\.?\d*)")
+        patterns = (
+            r"止损(?:价|价格|位|价位)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)",
+            r"(?:stop[-\s_]?loss|stop\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)",
+        )
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, normalized, re.IGNORECASE)
         if match:
             return float(match.group(1))
     return None
@@ -47,10 +54,10 @@ def resolve_report_fields(
     final_trade_decision = result_data.get("final_trade_decision")
     trader_investment_plan = result_data.get("trader_investment_plan")
     confidence = confidence_override if confidence_override is not None else _extract_confidence_regex(final_trade_decision)
-    target_price = target_price_override
+    target_price = target_price_override if target_price_override is not None else _safe_float(result_data.get("target_price"))
     if target_price is None:
         target_price = _extract_price_regex(final_trade_decision, "target") or _extract_price_regex(trader_investment_plan, "target")
-    stop_loss_price = stop_loss_override
+    stop_loss_price = stop_loss_override if stop_loss_override is not None else _safe_float(result_data.get("stop_loss_price"))
     if stop_loss_price is None:
         stop_loss_price = _extract_price_regex(final_trade_decision, "stop_loss") or _extract_price_regex(trader_investment_plan, "stop_loss")
     return {
@@ -70,6 +77,15 @@ def resolve_report_fields(
         "target_price": target_price,
         "stop_loss_price": stop_loss_price,
     }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def init_report(db: Session, report_id: str, symbol: str, trade_date: str, user_id: Optional[str] = None) -> ReportDB:

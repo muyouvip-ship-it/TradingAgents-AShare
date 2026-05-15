@@ -1,11 +1,29 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ApiRequestOptions = RequestInit & {
     timeoutMs?: number
 }
 
+type BacktestDetailPageOptions = {
+    skip?: number
+    limit?: number
+    sort_by?: string
+    sort_order?: 'asc' | 'desc'
+}
+
+type BacktestDetailResponse<T> = {
+    items: T[]
+    total?: number
+    skip?: number
+    limit?: number
+    sort_by?: string | null
+    sort_order?: 'asc' | 'desc'
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000
 const DAILY_REVIEW_GENERATE_TIMEOUT_MS = 180000
+const BACKTEST_DETAIL_PAGE_SIZE = 5000
+const BACKTEST_DETAIL_MAX_ITEMS = 50000
 
 function isLoopbackHostname(hostname: string): boolean {
     const normalized = hostname.trim().toLowerCase()
@@ -194,6 +212,39 @@ class ApiService {
             method: 'POST',
             body: JSON.stringify(payload),
         })
+    }
+
+    async getNewsEyeThemes(params?: {
+        window?: NewsThemeWindow | string
+        limit?: number
+        include_evidence?: boolean
+    }): Promise<NewsThemeRankingResponse> {
+        const query = new URLSearchParams()
+        if (params?.window) query.append('window', params.window)
+        if (params?.limit) query.append('limit', String(params.limit))
+        if (typeof params?.include_evidence === 'boolean') query.append('include_evidence', String(params.include_evidence))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<NewsThemeRankingResponse>(`/v1/news-eye/themes${suffix}`)
+    }
+
+    async getNewsEyeThemeSnapshots(params: {
+        date: string
+        window?: NewsThemeWindow | string
+        limit?: number
+    }): Promise<NewsThemeSnapshotResponse> {
+        const query = new URLSearchParams({ date: params.date })
+        if (params.window) query.append('window', params.window)
+        if (params.limit) query.append('limit', String(params.limit))
+        return this.request<NewsThemeSnapshotResponse>(`/v1/news-eye/theme-snapshots?${query}`)
+    }
+
+    async getNewsEyeThemePerformance(params: {
+        snapshot_date: string
+        horizon?: '1d' | '3d' | '5d' | string
+    }): Promise<NewsThemePerformanceResponse> {
+        const query = new URLSearchParams({ snapshot_date: params.snapshot_date })
+        if (params.horizon) query.append('horizon', params.horizon)
+        return this.request<NewsThemePerformanceResponse>(`/v1/news-eye/theme-performance?${query}`)
     }
 
     async chatCompletion(
@@ -880,44 +931,82 @@ class ApiService {
         })
     }
 
-    async getStrategyPlatformBacktestTrades(runId: string): Promise<{ items: BacktestTradeRecord[] }> {
-        return this.request<{ items: BacktestTradeRecord[] }>(`/v1/backtests/${runId}/trades`)
+    private buildBacktestDetailQuery(options: BacktestDetailPageOptions = {}): string {
+        const params = new URLSearchParams()
+        params.set('skip', String(options.skip ?? 0))
+        params.set('limit', String(options.limit ?? BACKTEST_DETAIL_PAGE_SIZE))
+        if (options.sort_by) params.set('sort_by', options.sort_by)
+        if (options.sort_order) params.set('sort_order', options.sort_order)
+        return params.toString()
     }
 
-    async getStrategyPlatformBacktestEquity(runId: string): Promise<{ items: BacktestEquityPoint[] }> {
-        return this.request<{ items: BacktestEquityPoint[] }>(`/v1/backtests/${runId}/equity`)
+    private getBacktestDetailPage<T>(
+        runId: string,
+        endpoint: string,
+        options: BacktestDetailPageOptions = {},
+    ): Promise<BacktestDetailResponse<T>> {
+        return this.request<BacktestDetailResponse<T>>(
+            `/v1/backtests/${runId}/${endpoint}?${this.buildBacktestDetailQuery(options)}`,
+        )
+    }
+
+    private async getAllBacktestDetailItems<T>(
+        runId: string,
+        endpoint: string,
+        options: Omit<BacktestDetailPageOptions, 'skip' | 'limit'> = {},
+    ): Promise<BacktestDetailResponse<T>> {
+        const items: T[] = []
+        let total: number | undefined
+        for (let skip = 0; skip < BACKTEST_DETAIL_MAX_ITEMS; skip += BACKTEST_DETAIL_PAGE_SIZE) {
+            const page = await this.getBacktestDetailPage<T>(runId, endpoint, {
+                ...options,
+                skip,
+                limit: BACKTEST_DETAIL_PAGE_SIZE,
+            })
+            items.push(...page.items)
+            total = page.total ?? total
+            if (page.items.length < BACKTEST_DETAIL_PAGE_SIZE) break
+            if (typeof total === 'number' && items.length >= total) break
+        }
+        return { items, total }
+    }
+
+    async getStrategyPlatformBacktestTrades(runId: string): Promise<BacktestDetailResponse<BacktestTradeRecord>> {
+        return this.getAllBacktestDetailItems<BacktestTradeRecord>(runId, 'trades')
+    }
+
+    async getStrategyPlatformBacktestEquity(runId: string): Promise<BacktestDetailResponse<BacktestEquityPoint>> {
+        return this.getAllBacktestDetailItems<BacktestEquityPoint>(runId, 'equity')
     }
 
     async getStrategyPlatformBacktestWatchlists(
         runId: string,
-        options: { skip?: number; limit?: number; sort_by?: string; sort_order?: 'asc' | 'desc' } = {},
-    ): Promise<{ items: BacktestWatchlistItem[], total?: number }> {
-        const params = new URLSearchParams()
-        params.set('skip', String(options.skip ?? 0))
-        params.set('limit', String(options.limit ?? 1000))
-        if (options.sort_by) params.set('sort_by', options.sort_by)
-        if (options.sort_order) params.set('sort_order', options.sort_order)
-        return this.request<{ items: BacktestWatchlistItem[], total?: number }>(`/v1/backtests/${runId}/watchlists?${params.toString()}`)
+        options?: BacktestDetailPageOptions,
+    ): Promise<BacktestDetailResponse<BacktestWatchlistItem>> {
+        if (options && (options.skip !== undefined || options.limit !== undefined)) {
+            return this.getBacktestDetailPage<BacktestWatchlistItem>(runId, 'watchlists', options)
+        }
+        return this.getAllBacktestDetailItems<BacktestWatchlistItem>(runId, 'watchlists', options)
     }
 
-    async getStrategyPlatformBacktestMinuteConfirmations(runId: string): Promise<{ items: BacktestMinuteConfirmationItem[] }> {
-        return this.request<{ items: BacktestMinuteConfirmationItem[] }>(`/v1/backtests/${runId}/minute-confirmations`)
+    async getStrategyPlatformBacktestMinuteConfirmations(runId: string): Promise<BacktestDetailResponse<BacktestMinuteConfirmationItem>> {
+        return this.getAllBacktestDetailItems<BacktestMinuteConfirmationItem>(runId, 'minute-confirmations')
     }
 
-    async getStrategyPlatformBacktestTradeSnapshots(runId: string): Promise<{ items: BacktestTradeSnapshot[] }> {
-        return this.request<{ items: BacktestTradeSnapshot[] }>(`/v1/backtests/${runId}/trade-snapshots`)
+    async getStrategyPlatformBacktestTradeSnapshots(runId: string): Promise<BacktestDetailResponse<BacktestTradeSnapshot>> {
+        return this.getAllBacktestDetailItems<BacktestTradeSnapshot>(runId, 'trade-snapshots')
     }
 
-    async getStrategyPlatformBacktestSignals(runId: string): Promise<{ items: BacktestSignalItem[] }> {
-        return this.request<{ items: BacktestSignalItem[] }>(`/v1/backtests/${runId}/signals`)
+    async getStrategyPlatformBacktestSignals(runId: string): Promise<BacktestDetailResponse<BacktestSignalItem>> {
+        return this.getAllBacktestDetailItems<BacktestSignalItem>(runId, 'signals')
     }
 
-    async getStrategyPlatformBacktestPositions(runId: string): Promise<{ items: BacktestPositionItem[] }> {
-        return this.request<{ items: BacktestPositionItem[] }>(`/v1/backtests/${runId}/positions`)
+    async getStrategyPlatformBacktestPositions(runId: string): Promise<BacktestDetailResponse<BacktestPositionItem>> {
+        return this.getAllBacktestDetailItems<BacktestPositionItem>(runId, 'positions')
     }
 
-    async getStrategyPlatformBacktestOrders(runId: string): Promise<{ items: BacktestOrderItem[] }> {
-        return this.request<{ items: BacktestOrderItem[] }>(`/v1/backtests/${runId}/orders`)
+    async getStrategyPlatformBacktestOrders(runId: string): Promise<BacktestDetailResponse<BacktestOrderItem>> {
+        return this.getAllBacktestDetailItems<BacktestOrderItem>(runId, 'orders')
     }
 
     async createEvolutionExperiment(data: {

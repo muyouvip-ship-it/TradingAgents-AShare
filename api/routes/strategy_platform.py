@@ -57,6 +57,7 @@ router = APIRouter(tags=["Strategy Platform"])
 StrategyType = Literal["selection", "trading", "risk", "portfolio"]
 StrategyStatus = Literal["draft", "active", "paused", "archived", "candidate"]
 StrategyTier = Literal["aggressive", "stable", "defensive"]
+StrategySource = Literal["manual", "llm", "evolution", "template", "test"]
 
 
 class StrategyDsl(BaseModel):
@@ -98,7 +99,7 @@ class StrategyDefinition(BaseModel):
     strategy_type: StrategyType
     status: StrategyStatus
     description: str | None = None
-    source: Literal["manual", "llm", "evolution", "template"] = "manual"
+    source: StrategySource = "manual"
     current_version_id: str | None = None
     version: int = 1
     is_active: bool = False
@@ -219,7 +220,7 @@ class StrategyCreateRequest(BaseModel):
     strategy_type: StrategyType
     description: str | None = None
     dsl: StrategyDsl
-    source: Literal["manual", "llm", "evolution", "template"] = "manual"
+    source: StrategySource = "manual"
     status: StrategyStatus = "draft"
     template_id: str | None = None
     template_name: str | None = None
@@ -231,7 +232,7 @@ class StrategyUpdateRequest(BaseModel):
     strategy_type: StrategyType
     description: str | None = None
     dsl: StrategyDsl
-    source: Literal["manual", "llm", "evolution", "template"] | None = None
+    source: StrategySource | None = None
     status: StrategyStatus | None = None
 
 
@@ -492,7 +493,7 @@ def _make_strategy(
     strategy_type: StrategyType,
     status: StrategyStatus,
     description: str,
-    source: Literal["manual", "llm", "evolution", "template"] = "manual",
+    source: StrategySource = "manual",
     performance: StrategyPerformance | None = None,
     dsl: StrategyDsl | None = None,
     tags: list[str] | None = None,

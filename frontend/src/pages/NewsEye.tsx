@@ -3,14 +3,18 @@ import type { LucideIcon } from 'lucide-react'
 import {
   Activity,
   AlertCircle,
+  BarChart3,
   Clock3,
   Database,
   Filter,
+  Flame,
   Globe2,
+  History,
   Loader2,
   Radar,
   RefreshCw,
   Search,
+  ShieldAlert,
   Sparkles,
   Telescope,
   TrendingUp,
@@ -20,16 +24,41 @@ import {
 import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
-import type { ApiDataSourceGovernancePayload, NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag } from '@/types'
+import type { ApiDataSourceGovernancePayload, NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag, NewsThemePerformanceItem, NewsThemeRankingItem, NewsThemeWindow } from '@/types'
 
 const PAGE_SIZE = 80
 const NEWS_PREVIEW_COLLAPSE_THRESHOLD = 90
+const THEME_WINDOWS: Array<{ value: NewsThemeWindow; label: string }> = [
+  { value: 'premarket', label: '盘前/周末' },
+  { value: '24h', label: '24h' },
+  { value: '72h', label: '72h' },
+  { value: '7d', label: '7d' },
+]
+const THEME_PERFORMANCE_HORIZONS = ['1d', '3d', '5d'] as const
+
+function todayDateInputValue() {
+  const date = new Date()
+  const offset = date.getTimezoneOffset()
+  const local = new Date(date.getTime() - offset * 60_000)
+  return local.toISOString().slice(0, 10)
+}
 
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatPercentValue(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
+  return `${(Number(value) * 100).toFixed(0)}%`
+}
+
+function formatChangePct(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
+  const numberValue = Number(value)
+  return `${numberValue > 0 ? '+' : ''}${numberValue.toFixed(2)}%`
 }
 
 function sentimentLabel(sentiment: string) {
@@ -57,6 +86,19 @@ function statusTone(status?: string) {
     return 'border-rose-200 bg-rose-50/85 text-rose-700 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-300'
   }
   return 'border-slate-200 bg-white/80 text-slate-600 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300'
+}
+
+function sourceTierTone(tier?: string) {
+  if (tier === 'S') return 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-300'
+  if (tier === 'A') return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300'
+  if (tier === 'B') return 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-500/20 dark:bg-sky-500/10 dark:text-sky-300'
+  return 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
+}
+
+function disagreementLabel(level?: string) {
+  if (level === 'healthy') return '健康分歧'
+  if (level === 'high') return '高分歧'
+  return '一致预期'
 }
 
 function sentimentTone(sentiment: string) {
@@ -133,6 +175,91 @@ function MetricCard({
   )
 }
 
+function ThemeRankingCard({
+  item,
+  selected,
+  onSelect,
+}: {
+  item: NewsThemeRankingItem
+  selected: boolean
+  onSelect: (item: NewsThemeRankingItem) => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(item)}
+      className={`w-full rounded-[18px] border p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 dark:hover:border-slate-600 ${
+        selected
+          ? 'border-sky-300 bg-sky-50/80 dark:border-sky-500/30 dark:bg-sky-500/10'
+          : 'border-slate-200 bg-white/92 dark:border-slate-800 dark:bg-slate-900/76'
+      }`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="rounded-full bg-slate-950 px-2 py-0.5 text-[10px] font-semibold text-white dark:bg-white dark:text-slate-950">
+              #{item.rank}
+            </span>
+            {item.policy_boost ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+                <Flame className="h-3 w-3" />
+                政策催化
+              </span>
+            ) : null}
+            <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(item.source_tier)}`}>
+              {item.source_tier}级源
+            </span>
+          </div>
+          <div className="mt-2 truncate text-base font-semibold text-slate-950 dark:text-white">
+            {item.theme}
+            {item.parent_theme ? <span className="ml-1 text-xs font-normal text-slate-400">/ {item.parent_theme}</span> : null}
+          </div>
+        </div>
+        <div className="shrink-0 text-right">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Score</div>
+          <div className="text-xl font-semibold text-slate-950 dark:text-white">{item.score.toFixed(1)}</div>
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-3 gap-1.5 text-center text-[11px]">
+        <div className="rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-800">
+          <div className="font-semibold text-slate-900 dark:text-slate-100">{item.message_count}</div>
+          <div className="text-slate-500 dark:text-slate-400">消息</div>
+        </div>
+        <div className="rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-800">
+          <div className="font-semibold text-slate-900 dark:text-slate-100">{formatPercentValue(item.consensus_rate)}</div>
+          <div className="text-slate-500 dark:text-slate-400">共识</div>
+        </div>
+        <div className="rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-800">
+          <div className="font-semibold text-slate-900 dark:text-slate-100">{disagreementLabel(item.disagreement_level)}</div>
+          <div className="text-slate-500 dark:text-slate-400">分歧</div>
+        </div>
+      </div>
+      <p className="mt-3 line-clamp-2 text-xs leading-5 text-slate-600 dark:text-slate-300">
+        {item.summary || item.catalyst || '等待更多资讯确认。'}
+      </p>
+    </button>
+  )
+}
+
+function PerformanceRow({ item }: { item: NewsThemePerformanceItem }) {
+  const positive = typeof item.change_pct === 'number' && item.change_pct > 0
+  const negative = typeof item.change_pct === 'number' && item.change_pct < 0
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_80px_84px] items-center gap-2 rounded-xl border border-slate-200 bg-white/88 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900/68">
+      <div className="min-w-0">
+        <div className="truncate font-semibold text-slate-900 dark:text-slate-100">{item.theme}</div>
+        <div className="mt-0.5 truncate text-[11px] text-slate-400">
+          {item.start_date || '--'} 至 {item.end_date || '--'}
+        </div>
+      </div>
+      <div className="text-slate-500 dark:text-slate-400">{item.horizon}</div>
+      <div className={`text-right font-semibold ${positive ? 'text-rose-600 dark:text-rose-300' : negative ? 'text-emerald-600 dark:text-emerald-300' : 'text-slate-500 dark:text-slate-400'}`}>
+        {formatChangePct(item.change_pct)}
+      </div>
+    </div>
+  )
+}
+
 function renderSymbolLabel(symbol: NewsEyeSymbolTag) {
   return symbol.name || symbol.symbol
 }
@@ -171,12 +298,58 @@ export default function NewsEye() {
     last_error?: string | null
     saved_count?: number
   } | null>(null)
+  const [themeWindow, setThemeWindow] = useState<NewsThemeWindow>('premarket')
+  const [themeItems, setThemeItems] = useState<NewsThemeRankingItem[]>([])
+  const [themeUpdatedAt, setThemeUpdatedAt] = useState<string | null>(null)
+  const [themeLoading, setThemeLoading] = useState(true)
+  const [themeError, setThemeError] = useState<string | null>(null)
+  const [selectedTheme, setSelectedTheme] = useState<string>('')
+  const [snapshotDate, setSnapshotDate] = useState(todayDateInputValue())
+  const [snapshotItems, setSnapshotItems] = useState<NewsThemeRankingItem[]>([])
+  const [performanceItems, setPerformanceItems] = useState<NewsThemePerformanceItem[]>([])
+  const [performanceHorizon, setPerformanceHorizon] = useState<typeof THEME_PERFORMANCE_HORIZONS[number]>('3d')
+  const [historyLoading, setHistoryLoading] = useState(false)
   const [filters, setFilters] = useState({
     source: '',
     sentiment: 'all',
     symbol: '',
     sector: '',
   })
+
+  const loadThemes = useCallback(async () => {
+    setThemeLoading(true)
+    try {
+      const response = await api.getNewsEyeThemes({
+        window: themeWindow,
+        limit: 20,
+        include_evidence: true,
+      })
+      setThemeItems(response.items || [])
+      setThemeUpdatedAt(response.updated_at)
+      setThemeError(null)
+    } catch (err) {
+      setThemeError(err instanceof Error ? err.message : '加载主线机会榜失败')
+    } finally {
+      setThemeLoading(false)
+    }
+  }, [themeWindow])
+
+  const loadThemeHistory = useCallback(async () => {
+    if (!snapshotDate) return
+    setHistoryLoading(true)
+    try {
+      const [snapshots, performance] = await Promise.all([
+        api.getNewsEyeThemeSnapshots({ date: snapshotDate, window: 'premarket', limit: 20 }),
+        api.getNewsEyeThemePerformance({ snapshot_date: snapshotDate, horizon: performanceHorizon }),
+      ])
+      setSnapshotItems(snapshots.items || [])
+      setPerformanceItems(performance.items || [])
+    } catch (err) {
+      setThemeError(err instanceof Error ? err.message : '加载历史回溯失败')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [performanceHorizon, snapshotDate])
 
   const loadItems = useCallback(async (options?: { offset?: number; append?: boolean }) => {
     const offset = options?.offset ?? 0
@@ -219,13 +392,16 @@ export default function NewsEye() {
     setRefreshing(true)
     try {
       await api.refreshNewsEye(120)
-      await loadItems({ offset: 0, append: false })
+      await Promise.all([
+        loadItems({ offset: 0, append: false }),
+        loadThemes(),
+      ])
     } catch (err) {
       setError(err instanceof Error ? err.message : '刷新资讯失败')
     } finally {
       setRefreshing(false)
     }
-  }, [loadItems])
+  }, [loadItems, loadThemes])
 
   useEffect(() => {
     setLoading(true)
@@ -236,8 +412,19 @@ export default function NewsEye() {
     void loadItems({ offset: 0, append: false })
   }, [loadItems])
 
+  useEffect(() => {
+    void loadThemes()
+  }, [loadThemes])
+
+  useEffect(() => {
+    void loadThemeHistory()
+  }, [loadThemeHistory])
+
   usePolling(
-    () => loadItems({ offset: 0, append: false }),
+    () => Promise.all([
+      loadItems({ offset: 0, append: false }),
+      loadThemes(),
+    ]),
     { intervalMs: 20000, runImmediately: false },
   )
 
@@ -368,6 +555,16 @@ export default function NewsEye() {
   const buildOriginalSearchUrl = useCallback((item: NewsEyeItem) => {
     const query = `${item.source} ${item.content.slice(0, 48)}`
     return `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`
+  }, [])
+
+  const selectedThemeItem = useMemo(
+    () => themeItems.find(item => item.theme === selectedTheme) || themeItems[0],
+    [selectedTheme, themeItems],
+  )
+
+  const handleThemeSelect = useCallback((item: NewsThemeRankingItem) => {
+    setSelectedTheme(item.theme)
+    setFilters(prev => ({ ...prev, sentiment: 'all', sector: item.theme }))
   }, [])
 
   return (
@@ -512,6 +709,192 @@ export default function NewsEye() {
         </div>
       </section>
 
+      <section className="rounded-[22px] border border-slate-200 bg-white/92 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900/78">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div className="inline-flex items-center gap-2 rounded-full bg-rose-50 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+              <Flame className="h-3 w-3" />
+              Theme Opportunity Radar
+            </div>
+            <h2 className="mt-2 text-xl font-semibold text-slate-950 dark:text-white">主线机会榜</h2>
+            <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
+              消息驱动的主线观察，不是直接买卖建议；高分方向仍需结合竞价、量能和龙头承接确认。
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {THEME_WINDOWS.map(option => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setThemeWindow(option.value)}
+                className={`rounded-xl border px-3 py-2 text-xs font-semibold transition ${
+                  themeWindow === option.value
+                    ? 'border-slate-950 bg-slate-950 text-white dark:border-white dark:bg-white dark:text-slate-950'
+                    : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {themeError ? (
+          <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
+            {themeError}
+          </div>
+        ) : null}
+
+        <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
+          <div>
+            {themeLoading ? (
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <div key={index} className="h-44 animate-pulse rounded-[18px] border border-slate-200 bg-slate-100 dark:border-slate-800 dark:bg-slate-800/70" />
+                ))}
+              </div>
+            ) : themeItems.length === 0 ? (
+              <div className="rounded-[18px] border border-dashed border-slate-300 bg-slate-50/80 px-4 py-10 text-center dark:border-slate-700 dark:bg-slate-900/50">
+                <BarChart3 className="mx-auto h-8 w-8 text-slate-400" />
+                <p className="mt-3 text-sm font-semibold text-slate-800 dark:text-slate-100">暂无可排序主线</p>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">等待后台采集更多带板块标签的资讯。</p>
+              </div>
+            ) : (
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {themeItems.slice(0, 9).map(item => (
+                  <ThemeRankingCard
+                    key={item.theme}
+                    item={item}
+                    selected={selectedThemeItem?.theme === item.theme}
+                    onSelect={handleThemeSelect}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-3">
+            <div className="rounded-[18px] border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-700 dark:bg-slate-950/35">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 dark:text-slate-500">
+                    Evidence
+                  </div>
+                  <h3 className="mt-1 text-base font-semibold text-slate-950 dark:text-white">
+                    {selectedThemeItem?.theme || '等待选择主线'}
+                  </h3>
+                </div>
+                {selectedThemeItem ? (
+                  <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${sourceTierTone(selectedThemeItem.source_tier)}`}>
+                    {selectedThemeItem.source_tier}级源
+                  </span>
+                ) : null}
+              </div>
+
+              {selectedThemeItem ? (
+                <>
+                  <p className="mt-3 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                    {selectedThemeItem.catalyst || selectedThemeItem.summary || '等待更多催化线索。'}
+                  </p>
+                  <div className="mt-3 grid grid-cols-3 gap-2 text-center text-[11px]">
+                    <div className="rounded-xl bg-white px-2 py-2 dark:bg-slate-900">
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">{selectedThemeItem.score.toFixed(1)}</div>
+                      <div className="text-slate-500 dark:text-slate-400">推荐值</div>
+                    </div>
+                    <div className="rounded-xl bg-white px-2 py-2 dark:bg-slate-900">
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">{selectedThemeItem.positive_count}/{selectedThemeItem.negative_count}</div>
+                      <div className="text-slate-500 dark:text-slate-400">利好/利空</div>
+                    </div>
+                    <div className="rounded-xl bg-white px-2 py-2 dark:bg-slate-900">
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">{formatPercentValue(selectedThemeItem.consensus_rate)}</div>
+                      <div className="text-slate-500 dark:text-slate-400">共识率</div>
+                    </div>
+                  </div>
+                  <div className="mt-3 rounded-xl border border-amber-200/80 bg-amber-50/80 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
+                    <div className="flex items-center gap-2 font-medium">
+                      <ShieldAlert className="h-3.5 w-3.5" />
+                      风险提示
+                    </div>
+                    <div className="mt-1">{selectedThemeItem.risk_note || '仍需结合竞价、量能和核心标的承接确认。'}</div>
+                  </div>
+                  {selectedThemeItem.related_symbols?.length ? (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {selectedThemeItem.related_symbols.slice(0, 8).map(symbol => (
+                        <span key={symbol.symbol} className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">
+                          {renderSymbolLabel(symbol)}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div className="mt-3 space-y-2">
+                    {(selectedThemeItem.evidence_items || []).slice(0, 4).map(evidence => (
+                      <div key={evidence.id} className="rounded-xl border border-slate-200 bg-white/86 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900/70">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(evidence.source_tier)}`}>{evidence.source_tier}</span>
+                          <span className="text-[11px] text-slate-400">{evidence.source}</span>
+                          <span className="text-[11px] text-slate-400">{formatDateTime(evidence.published_at)}</span>
+                        </div>
+                        <div className="mt-1.5 line-clamp-2 leading-5 text-slate-700 dark:text-slate-300">{evidence.content}</div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">点击左侧主题查看支撑消息。</p>
+              )}
+            </div>
+
+            <div className="rounded-[18px] border border-slate-200 bg-white/90 p-4 dark:border-slate-800 dark:bg-slate-900/72">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="inline-flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 dark:text-slate-500">
+                    <History className="h-3 w-3" />
+                    Backtest Loop
+                  </div>
+                  <h3 className="mt-1 text-base font-semibold text-slate-950 dark:text-white">历史回溯</h3>
+                </div>
+                {historyLoading ? <Loader2 className="h-4 w-4 animate-spin text-slate-400" /> : null}
+              </div>
+              <div className="mt-3 grid grid-cols-[minmax(0,1fr)_92px] gap-2">
+                <input
+                  type="date"
+                  value={snapshotDate}
+                  onChange={(event) => setSnapshotDate(event.target.value)}
+                  className="input w-full"
+                />
+                <select
+                  value={performanceHorizon}
+                  onChange={(event) => setPerformanceHorizon(event.target.value as typeof THEME_PERFORMANCE_HORIZONS[number])}
+                  className="input w-full"
+                >
+                  {THEME_PERFORMANCE_HORIZONS.map(horizon => (
+                    <option key={horizon} value={horizon}>{horizon}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="mt-3 space-y-2">
+                {performanceItems.length ? performanceItems.slice(0, 5).map(item => (
+                  <PerformanceRow key={`${item.theme}-${item.horizon}`} item={item} />
+                )) : snapshotItems.length ? snapshotItems.slice(0, 5).map(item => (
+                  <div key={item.theme} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-800/60">
+                    <span className="font-semibold text-slate-900 dark:text-slate-100">#{item.rank} {item.theme}</span>
+                    <span className="ml-2 text-slate-500 dark:text-slate-400">等待后续表现数据</span>
+                  </div>
+                )) : (
+                  <div className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center text-xs text-slate-400 dark:border-slate-700 dark:text-slate-500">
+                    该日期暂无主线快照
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 text-[11px] text-slate-400 dark:text-slate-500">
+          榜单更新时间 {formatDateTime(themeUpdatedAt)}，点击主题会同步筛选下方资讯流。
+        </div>
+      </section>
+
       <DataSourceGovernanceCard
         title="数据源治理"
         description={backendGovernance?.description || '资讯页的页面缓存、后台轮询状态和真实外部新闻源必须分开看。'}
@@ -542,7 +925,10 @@ export default function NewsEye() {
             {hasFilters ? (
               <button
                 type="button"
-                onClick={() => setFilters({ source: '', sentiment: 'all', symbol: '', sector: '' })}
+                onClick={() => {
+                  setSelectedTheme('')
+                  setFilters({ source: '', sentiment: 'all', symbol: '', sector: '' })
+                }}
                 className="rounded-full border border-slate-200 px-2.5 py-1 font-medium text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
               >
                 清空筛选

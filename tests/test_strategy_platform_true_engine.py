@@ -9,7 +9,7 @@ from api.routes.strategy_platform import _default_dsl
 from api.services.a_share_market_rules import get_a_share_market_rule, round_to_tick
 from api.services.minute_data_service import evaluate_intraday_confirmation, get_minute_cache_root, load_aggregated_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
-from api.services.strategy_platform_engine import run_strategy_backtest, _simulate_portfolio
+from api.services.strategy_platform_engine import run_strategy_backtest, _calculate_metrics, _simulate_portfolio
 
 
 def test_compile_strategy_dsl_returns_execution_ir():
@@ -266,6 +266,115 @@ def test_portfolio_watchlist_keeps_full_candidate_pool_beyond_max_positions():
     assert len(first_day_watchlists) == len(symbols)
     assert max(item["rank"] for item in first_day_watchlists) == len(symbols)
     assert len(buy_orders) == 1
+
+
+def _accounting_rows(closes: list[float], *, symbol: str = "300999.SZ") -> list[dict]:
+    rows = []
+    for date_index, close in enumerate(closes):
+        date_value = pd.Timestamp("2024-01-02") + pd.Timedelta(days=date_index)
+        rows.append(
+            {
+                "symbol": symbol,
+                "date": date_value,
+                "open": close,
+                "high": close * 1.02,
+                "low": close * 0.98,
+                "close": close,
+                "pre_close": closes[date_index - 1] if date_index else close,
+                "volume": 1_000_000,
+                "amount": close * 1_000_000,
+                "turnover_rate": 2.0,
+                "ma5": close * 0.95,
+                "ma20": close * 0.9,
+                "momentum_20d": 0.2,
+                "momentum_60d": 0.2,
+                "volatility_20d": 0.2,
+                "rsi_14": 60,
+                "atr_14": close * 0.02,
+                "money_flow_strength_20d": 0.2,
+                "weekly_trend_pass": True,
+                "factor_score": 1.0,
+            }
+        )
+    return rows
+
+
+def _accounting_dsl() -> dict:
+    dsl = _default_dsl("portfolio").model_dump()
+    dsl["universe"]["include_concepts"] = []
+    dsl["universe"]["filters"] = []
+    dsl["universe"]["min_listing_days"] = 0
+    dsl["entry"]["conditions"] = []
+    dsl["exit"]["conditions"] = []
+    dsl["factor_model"]["select"] = {"top_n": 1, "min_score": 0.0}
+    dsl["position"].update(
+        {
+            "method": "equal_weight",
+            "max_single_position_pct": 1.0,
+            "max_position_pct": 1.0,
+            "cash_reserve_pct": 0.0,
+            "initial_position_pct": 1.0,
+        }
+    )
+    dsl["risk"].update(
+        {
+            "max_positions": 1,
+            "stop_loss_pct": 1.0,
+            "take_profit_pct": 5.0,
+            "trailing_stop_pct": 1.0,
+            "max_drawdown_pct": 0.01,
+            "max_daily_loss_pct": 0.01,
+        }
+    )
+    dsl["execution"].update(
+        {
+            "commission_rate": 0.001,
+            "min_commission": 5,
+            "stamp_duty_rate": 0.001,
+            "slippage_model": {"type": "bps", "value": 10},
+        }
+    )
+    return dsl
+
+
+def test_backtest_accounting_uses_nav_and_forces_final_liquidation():
+    portfolio = _simulate_portfolio(
+        pd.DataFrame(_accounting_rows([10.0, 11.0, 12.0])),
+        compiled=compile_strategy_dsl(_accounting_dsl()),
+        initial_capital=10_000,
+        frequency="daily",
+        use_minute_confirm=False,
+    )
+    metrics = _calculate_metrics(portfolio["equity"], portfolio["trades"], 10_000)
+    buy_trade = next(trade for trade in portfolio["trades"] if trade["direction"] == "buy")
+
+    assert all(float(item["available_cash"]) >= 0 for item in portfolio["equity"])
+    assert buy_trade["quantity"] == 900
+    assert buy_trade["cash_cost"] <= 10_000
+    assert portfolio["equity"][-1]["position_value"] == 0.0
+    assert portfolio["equity"][-1]["positions_value"] == 0.0
+    assert portfolio["equity"][-1]["total_equity"] == portfolio["equity"][-1]["available_cash"]
+    assert portfolio["equity"][-1]["nav"] == round(portfolio["equity"][-1]["total_equity"] / 10_000, 6)
+    assert metrics["total_return"] == round(portfolio["equity"][-1]["nav"] - 1, 6)
+    assert metrics["final_nav"] == portfolio["equity"][-1]["nav"]
+    assert any(trade.get("virtual_liquidation") for trade in portfolio["trades"])
+    assert any(order.get("virtual_liquidation") for order in portfolio["orders"])
+    assert len([event for event in portfolio["accounting_events"] if event["type"] == "virtual_liquidation"]) == 1
+
+
+def test_backtest_does_not_halt_on_drawdown_or_daily_loss_limits():
+    portfolio = _simulate_portfolio(
+        pd.DataFrame(_accounting_rows([10.0, 8.0, 7.5, 7.0, 6.5])),
+        compiled=compile_strategy_dsl(_accounting_dsl()),
+        initial_capital=10_000,
+        frequency="daily",
+        use_minute_confirm=False,
+    )
+
+    watchlist_dates = {item["date"][:10] for item in portfolio["watchlists"]}
+    assert "2024-01-06" in watchlist_dates
+    assert portfolio["risk_events"] == []
+    assert any(event["type"] == "virtual_liquidation" for event in portfolio["accounting_events"])
 
 
 def test_backtest_endpoint_supports_walk_forward():

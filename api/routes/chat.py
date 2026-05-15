@@ -301,6 +301,8 @@ def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_i
     latest_turnover = _safe_float(rows[0].get("turnover_rate")) if rows else None
     latest_mcap = _safe_float(rows[0].get("float_market_cap")) if rows else None
     latest_profit = _safe_float(rows[0].get("net_profit_ttm")) if rows else None
+    target_price = None
+    stop_loss_price = None
 
     if latest_close is None:
         direction = "中性"
@@ -317,6 +319,15 @@ def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_i
             direction, decision, confidence = "偏空", "WATCH", 64
         else:
             direction, decision, confidence = "中性", "HOLD", 52
+        if decision == "BUY":
+            target_price = round(latest_close * 1.06, 2)
+            stop_loss_price = round(latest_close * 0.96, 2)
+        elif decision == "HOLD":
+            target_price = round(latest_close * 1.03, 2)
+            stop_loss_price = round(latest_close * 0.97, 2)
+        else:
+            target_price = round(latest_close * 1.02, 2)
+            stop_loss_price = round(latest_close * 0.97, 2)
         market_report = (
             f"## 市场分析\n\n- 标的：`{symbol}`\n"
             f"- 分析日期：`{trade_date}`\n"
@@ -348,12 +359,16 @@ def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_i
     trader_investment_plan = (
         "## 交易计划\n\n"
         f"- 建议动作：`{decision}`\n"
-        f"- 建议跟踪位：`{latest_close:.2f}`\n" if latest_close is not None else "## 交易计划\n\n- 当前无足够数据生成交易计划。\n"
+        f"- 建议跟踪位：`{latest_close:.2f}`\n"
+        f"- 目标价：`{target_price:.2f}`\n"
+        f"- 止损价：`{stop_loss_price:.2f}`\n" if latest_close is not None and target_price is not None and stop_loss_price is not None else "## 交易计划\n\n- 当前无足够数据生成交易计划。\n"
     )
     final_trade_decision = (
         f"方向：{direction}\n"
         f"动作：{decision}\n"
         f"置信度：{confidence}%\n"
+        + (f"目标价：{target_price:.2f}\n止损价：{stop_loss_price:.2f}\n" if target_price is not None and stop_loss_price is not None else "")
+        +
         "说明：当前为本地轻量分析结果，用于恢复智能分析闭环和快速排障。"
     )
 
@@ -383,6 +398,8 @@ def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_i
         "investment_plan": investment_plan,
         "trader_investment_plan": trader_investment_plan,
         "final_trade_decision": final_trade_decision,
+        "target_price": target_price,
+        "stop_loss_price": stop_loss_price,
         "user_context": _build_user_context_snapshot(symbol, user_id),
     }
     return result_payload, risk_items, key_metrics, decision

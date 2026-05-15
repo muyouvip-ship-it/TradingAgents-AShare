@@ -35,11 +35,12 @@ function extractConfidence(text?: string): number | undefined {
 
 function extractPrice(text: string | undefined, type: 'target' | 'stop'): number | undefined {
     if (!text) return undefined
+    const normalized = text.replace(/[*_`#>\[\]（）()]/g, '')
     const patterns = type === 'target'
-        ? [/目标价[:：]\s*[¥$]?\s*([\d.]+)/, /目标价格[:：]\s*[¥$]?\s*([\d.]+)/, /target[:：]\s*[¥$]?\s*([\d.]+)/i]
-        : [/止损价[:：]\s*[¥$]?\s*([\d.]+)/, /止损价格[:：]\s*[¥$]?\s*([\d.]+)/, /stop[-\s_]?loss[:：]\s*[¥$]?\s*([\d.]+)/i]
+        ? [/目标(?:价|价格|位|价位)?(?:区间)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:target|target\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
+        : [/止损(?:价|价格|位|价位)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:stop[-\s_]?loss|stop\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
     for (const p of patterns) {
-        const m = text.match(p)
+        const m = normalized.match(p)
         if (m) return parseFloat(m[1])
     }
     return undefined

@@ -24,6 +24,7 @@ from api.data_source_monitor import get_data_source_monitor
 from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats, write_daily_kline_parquet_cache
 from api.services.market_data_pipeline_service import DAILY_RAW_TABLES, preferred_daily_kline_table
 from api.services.qmt_market_data_service import sync_index_minute_history
+from tradingagents.dataflows.trade_calendar import is_cn_trading_day
 from .backtest_data_models import (
     BacktestDataTaskCreate, BacktestDataTask,
     BacktestDataConfigCreate, BacktestDataConfig,
@@ -43,6 +44,8 @@ _TABLE_STATS_MAPPING = {
     "minute_kline": ("stock_minute_kline", "trade_time"),
     "index_minute_kline": ("index_minute_kline", "trade_time"),
 }
+
+_DAILY_KLINE_CALENDAR_TABLES = ("stock_daily_kline", "pub_stock_daily_kline")
 
 
 def _normalize_config_payload(payload: dict) -> dict:
@@ -481,6 +484,100 @@ def _max_date(*values) -> date | None:
 def _max_datetime(*values) -> datetime | None:
     datetimes = [value for value in values if isinstance(value, datetime)]
     return max(datetimes) if datetimes else None
+
+
+def _daily_kline_calendar_source_tables(db: Session) -> list[str]:
+    return [table_name for table_name in _DAILY_KLINE_CALENDAR_TABLES if _relation_exists(db, table_name)]
+
+
+def _daily_kline_calendar_min_max(db: Session) -> tuple[date | None, date | None, list[str]]:
+    source_tables = _daily_kline_calendar_source_tables(db)
+    min_values: list[date] = []
+    max_values: list[date] = []
+    for table_name in source_tables:
+        date_range = _fast_min_max_date(db, table_name, "trade_date")
+        if not date_range:
+            continue
+        min_value, max_value = date_range
+        if min_value:
+            min_values.append(min_value)
+        if max_value:
+            max_values.append(max_value)
+    if min_values or max_values:
+        return (min(min_values) if min_values else None, max(max_values) if max_values else None, source_tables)
+
+    fallback_table = preferred_daily_kline_table()
+    if fallback_table not in source_tables and _relation_exists(db, fallback_table):
+        date_range = _fast_min_max_date(db, fallback_table, "trade_date")
+        if date_range:
+            return date_range[0], date_range[1], [fallback_table]
+    return None, None, source_tables
+
+
+def _daily_kline_calendar_is_rest_day(value: date) -> bool:
+    try:
+        return not is_cn_trading_day(value.isoformat())
+    except Exception:
+        return value.weekday() >= 5
+
+
+def _daily_kline_calendar_rows(
+    db: Session,
+    *,
+    start_date: date,
+    end_date: date,
+    source_tables: list[str],
+) -> list[Any]:
+    physical_tables = [table_name for table_name in source_tables if table_name in _DAILY_KLINE_CALENDAR_TABLES]
+    if physical_tables:
+        branches: list[str] = []
+        for index, table_name in enumerate(physical_tables):
+            normalized_symbol_expr = _normalized_symbol_sql("symbol")
+            branches.append(f"""
+                SELECT trade_date, symbol_key
+                FROM (
+                    SELECT
+                        trade_date::date AS trade_date,
+                        {normalized_symbol_expr} AS symbol_key
+                    FROM {table_name}
+                    WHERE trade_date >= :start_date
+                      AND trade_date < :end_date
+                      AND symbol IS NOT NULL
+                ) daily_calendar_{index}
+                WHERE symbol_key <> ''
+            """)
+        return db.execute(text(f"""
+            WITH daily_symbols AS (
+                {" UNION ".join(branches)}
+            )
+            SELECT
+                trade_date,
+                COUNT(*) AS row_count,
+                COUNT(*) AS symbol_count
+            FROM daily_symbols
+            GROUP BY trade_date
+            ORDER BY trade_date
+        """), {
+            "start_date": start_date,
+            "end_date": end_date,
+        }).fetchall()
+
+    table_name = preferred_daily_kline_table()
+    normalized_symbol_expr = _normalized_symbol_sql("symbol")
+    return db.execute(text(f"""
+        SELECT
+            trade_date::date AS trade_date,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT {normalized_symbol_expr}) AS symbol_count
+        FROM {table_name}
+        WHERE trade_date >= :start_date
+          AND trade_date < :end_date
+        GROUP BY trade_date::date
+        ORDER BY trade_date::date
+    """), {
+        "start_date": start_date,
+        "end_date": end_date,
+    }).fetchall()
 
 
 def _load_daily_kline_frame_for_cache(
@@ -938,15 +1035,7 @@ def get_daily_kline_coverage_calendar(
     """返回股票日K线按年的月度覆盖视图。"""
     try:
         del current_user
-        table_name = preferred_daily_kline_table()
-        coverage = db.execute(text(f"""
-            SELECT
-                MIN(trade_date) AS min_date,
-                MAX(trade_date) AS max_date
-            FROM {table_name}
-        """)).fetchone()
-        min_date = coverage.min_date if coverage else None
-        max_date = coverage.max_date if coverage else None
+        min_date, max_date, source_tables = _daily_kline_calendar_min_max(db)
         if min_date is None or max_date is None:
             raise HTTPException(status_code=404, detail="数据库 stock_daily_kline 暂无可展示数据")
 
@@ -958,21 +1047,12 @@ def get_daily_kline_coverage_calendar(
 
         start_date = date(selected_year, 1, 1)
         end_date = date(selected_year + 1, 1, 1)
-        normalized_symbol_expr = _normalized_symbol_sql("symbol")
-        rows = db.execute(text(f"""
-            SELECT
-                trade_date::date AS trade_date,
-                COUNT(*) AS row_count,
-                COUNT(DISTINCT {normalized_symbol_expr}) AS symbol_count
-            FROM {table_name}
-            WHERE trade_date >= :start_date
-              AND trade_date < :end_date
-            GROUP BY trade_date::date
-            ORDER BY trade_date::date
-        """), {
-            "start_date": start_date,
-            "end_date": end_date,
-        }).fetchall()
+        rows = _daily_kline_calendar_rows(
+            db,
+            start_date=start_date,
+            end_date=end_date,
+            source_tables=source_tables,
+        )
 
         coverage_by_date = {
             row.trade_date: {
@@ -992,6 +1072,7 @@ def get_daily_kline_coverage_calendar(
                 current_date = date(selected_year, month, day)
                 payload = coverage_by_date.get(current_date)
                 has_data = payload is not None and int(payload.get("symbol_count") or 0) > 0
+                is_rest_day = _daily_kline_calendar_is_rest_day(current_date)
                 if has_data:
                     days_with_data += 1
                 month_days.append({
@@ -999,6 +1080,8 @@ def get_daily_kline_coverage_calendar(
                     "day": day,
                     "weekday": int(current_date.weekday()),
                     "has_data": has_data,
+                    "is_trading_day": not is_rest_day,
+                    "is_rest_day": is_rest_day,
                     "symbol_count": int(payload.get("symbol_count") or 0) if payload else 0,
                     "row_count": int(payload.get("row_count") or 0) if payload else 0,
                 })
@@ -1017,6 +1100,7 @@ def get_daily_kline_coverage_calendar(
             "max_year": max_year,
             "available_years": list(range(min_year, max_year + 1)),
             "total_days_with_data": total_days_with_data,
+            "source_tables": source_tables,
             "months": months,
         }
     except HTTPException:
@@ -1500,6 +1584,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                 total_records = 0
                 success_count = 0
                 error_count = 0
+                specific_error_message = None
                 
                 # 根据数据类型下载
                 if task.task_type == 'daily_kline':
@@ -1524,21 +1609,40 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 import_result = import_stock_daily_from_quantclass(db, download_result['data_path'])
                                 
                                 if import_result['success']:
-                                    total_records = import_result['records_imported']
-                                    success_count = import_result['stocks_count']
-                                    cache_refresh = _refresh_daily_kline_cache_from_db(
-                                        db,
-                                        start_date=import_result.get('min_trade_date'),
-                                        end_date=import_result.get('max_trade_date'),
-                                    )
-                                    logger.info(
-                                        "量化课堂日K缓存刷新: updated=%s records=%s range=%s~%s",
-                                        cache_refresh.get("updated"),
-                                        cache_refresh.get("records"),
-                                        cache_refresh.get("date_range_start"),
-                                        cache_refresh.get("date_range_end"),
-                                    )
-                                    logger.info(f"量化课堂导入成功: {total_records}条记录, {success_count}只股票")
+                                    imported_max_date = import_result.get('max_trade_date')
+                                    requested_end_date = task.date_range_end
+                                    if imported_max_date and requested_end_date and imported_max_date < requested_end_date:
+                                        error_count = 1
+                                        stale_message = (
+                                            f"量化课堂返回的数据最新日期为 {imported_max_date}，"
+                                            f"未覆盖请求结束日期 {requested_end_date}"
+                                        )
+                                        specific_error_message = stale_message
+                                        logger.error(stale_message)
+                                        with get_db_ctx() as db_update:
+                                            db_update.execute(text("""
+                                                UPDATE backtest_data_tasks
+                                                SET error_message = :error_message,
+                                                    updated_at = NOW()
+                                                WHERE id = :task_id
+                                            """), {"task_id": task_id, "error_message": stale_message})
+                                            db_update.commit()
+                                    else:
+                                        total_records = import_result['records_imported']
+                                        success_count = import_result['stocks_count']
+                                        cache_refresh = _refresh_daily_kline_cache_from_db(
+                                            db,
+                                            start_date=import_result.get('min_trade_date'),
+                                            end_date=import_result.get('max_trade_date'),
+                                        )
+                                        logger.info(
+                                            "量化课堂日K缓存刷新: updated=%s records=%s range=%s~%s",
+                                            cache_refresh.get("updated"),
+                                            cache_refresh.get("records"),
+                                            cache_refresh.get("date_range_start"),
+                                            cache_refresh.get("date_range_end"),
+                                        )
+                                        logger.info(f"量化课堂导入成功: {total_records}条记录, {success_count}只股票")
                                 else:
                                     error_count = 1
                                     logger.error(f"量化课堂导入失败: {import_result.get('error')}")
@@ -1940,11 +2044,11 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                 if error_count > 0 and success_count == 0:
                     final_status = 'failed'
                     clear_error_message = False
-                    final_error_message = f"任务执行失败，成功 {success_count}，失败 {error_count}"
+                    final_error_message = specific_error_message or f"任务执行失败，成功 {success_count}，失败 {error_count}"
                 elif error_count > 0:
                     final_status = 'completed'
                     clear_error_message = False
-                    final_error_message = f"任务部分成功，成功 {success_count}，失败 {error_count}"
+                    final_error_message = specific_error_message or f"任务部分成功，成功 {success_count}，失败 {error_count}"
 
                 # 更新任务状态
                 with get_db_ctx() as db:
@@ -1961,7 +2065,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             downloaded_records = :total_records,
                             error_message = CASE
                                 WHEN :clear_error_message THEN NULL
-                                ELSE COALESCE(error_message, :final_error_message)
+                                ELSE :final_error_message
                             END,
                             completed_at = NOW(),
                             updated_at = NOW()

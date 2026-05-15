@@ -7,8 +7,15 @@ from sqlalchemy.orm import Session
 
 from api.database import get_db
 from api.deps import require_api_user
-from api.schemas.news_eye import NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse
-from api.services import news_eye_service
+from api.schemas.news_eye import (
+    NewsEyeAnalyzeRequest,
+    NewsEyeAnalyzeResponse,
+    NewsEyeListResponse,
+    NewsThemePerformanceResponse,
+    NewsThemeRankingResponse,
+    NewsThemeSnapshotResponse,
+)
+from api.services import news_eye_service, news_theme_service
 
 router = APIRouter(prefix="/v1/news-eye", tags=["News Eye"])
 
@@ -33,6 +40,55 @@ def list_news_items(
         sentiment=sentiment,
         symbol=symbol,
         sector=sector,
+    )
+
+
+@router.get("/themes", response_model=NewsThemeRankingResponse)
+def list_news_themes(
+    window: str = Query("premarket"),
+    limit: int = Query(20, ge=1, le=50),
+    include_evidence: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_api_user),
+) -> dict[str, Any]:
+    del current_user
+    return news_theme_service.list_theme_rankings(
+        db,
+        window=window,
+        limit=limit,
+        include_evidence=include_evidence,
+    )
+
+
+@router.get("/theme-snapshots", response_model=NewsThemeSnapshotResponse)
+def list_news_theme_snapshots(
+    date: str = Query(..., min_length=10, max_length=10),
+    window: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_api_user),
+) -> dict[str, Any]:
+    del current_user
+    return news_theme_service.list_theme_snapshots(
+        db,
+        snapshot_date=date,
+        window=window,
+        limit=limit,
+    )
+
+
+@router.get("/theme-performance", response_model=NewsThemePerformanceResponse)
+def get_news_theme_performance(
+    snapshot_date: str = Query(..., min_length=10, max_length=10),
+    horizon: str = Query("3d"),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_api_user),
+) -> dict[str, Any]:
+    del current_user
+    return news_theme_service.get_theme_performance(
+        db,
+        snapshot_date=snapshot_date,
+        horizon=horizon,
     )
 
 

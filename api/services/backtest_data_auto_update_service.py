@@ -128,7 +128,21 @@ def _should_run(row, now: datetime) -> bool:
         return local_last_run.date() <= (local_today - timedelta(days=7))
     if frequency == "monthly":
         return (local_last_run.year, local_last_run.month) != (local_now.year, local_now.month)
-    return local_last_run.date() < local_today
+    if local_last_run.date() < local_today:
+        return True
+    if local_last_run.date() > local_today:
+        return False
+
+    last_run_time = (local_last_run.hour, local_last_run.minute)
+    current_time = (local_now.hour, local_now.minute)
+    if last_run_time < schedule_time <= current_time:
+        return True
+
+    last_success = _ensure_utc(getattr(row, "last_success_at", None))
+    retry_minutes = max(int(os.getenv("BACKTEST_AUTO_UPDATE_RETRY_MINUTES", "30") or 30), 5)
+    if (last_success is None or last_success < last_run) and (local_now - local_last_run) >= timedelta(minutes=retry_minutes):
+        return True
+    return False
 
 
 def _run_single_config(config_id: int, now: datetime, *, force: bool = False) -> list[int]:

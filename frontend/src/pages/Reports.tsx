@@ -50,11 +50,12 @@ function extractConfidence(text?: string): number | undefined {
 
 function extractPrice(text: string | undefined, type: 'target' | 'stop'): number | undefined {
     if (!text) return undefined
+    const normalized = text.replace(/[*_`#>\[\]（）()]/g, '')
     const patterns = type === 'target'
-        ? [/目标价[:：]\s*[¥$]?\s*([\d.]+)/, /目标价格[:：]\s*[¥$]?\s*([\d.]+)/, /target[:：]\s*[¥$]?\s*([\d.]+)/i]
-        : [/止损价[:：]\s*[¥$]?\s*([\d.]+)/, /止损价格[:：]\s*[¥$]?\s*([\d.]+)/, /stop[-\s_]?loss[:：]\s*[¥$]?\s*([\d.]+)/i]
+        ? [/目标(?:价|价格|位|价位)?(?:区间)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:target|target\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
+        : [/止损(?:价|价格|位|价位)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:stop[-\s_]?loss|stop\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
     for (const pattern of patterns) {
-        const m = text.match(pattern)
+        const m = normalized.match(pattern)
         if (!m) continue
         const value = Number(m[1])
         if (Number.isFinite(value)) return value
@@ -508,7 +509,7 @@ export default function Reports() {
                     <div>置信度表示当前分析结论的把握度，不等于上涨概率。</div>
                     {isLightweightRecoveryReport ? (
                         <div className="mt-1 text-amber-600 dark:text-amber-300">
-                            当前这份报告来自本地轻量恢复链路，所以常见 64%-68% 这类保守值，且通常不会给出目标价/止损价。
+                            当前这份报告来自本地轻量恢复链路，所以常见 52%-68% 这类保守值；目标价/止损价按近期收盘价和简单风控比例估算。
                         </div>
                     ) : null}
                 </div>

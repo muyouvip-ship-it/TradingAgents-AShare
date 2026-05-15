@@ -576,6 +576,83 @@ export interface NewsEyeAnalyzeResponse {
     raw?: string | null
 }
 
+export type NewsThemeWindow = 'premarket' | '24h' | '72h' | '7d'
+
+export interface NewsThemeEvidenceItem {
+    id: string
+    content: string
+    source: string
+    published_at: string
+    sentiment: 'positive' | 'negative' | 'neutral' | string
+    source_tier: 'S' | 'A' | 'B' | 'C' | string
+    policy_boost: boolean
+    score: number
+    raw_tags: string[]
+    url?: string | null
+}
+
+export interface NewsThemeRankingItem {
+    theme: string
+    parent_theme?: string | null
+    rank: number
+    score: number
+    message_count: number
+    positive_count: number
+    negative_count: number
+    neutral_count?: number
+    consensus_rate?: number | null
+    source_tier: 'S' | 'A' | 'B' | 'C' | string
+    policy_boost: boolean
+    disagreement_level: 'none' | 'healthy' | 'high' | string
+    crowding_risk?: string | null
+    related_symbols: NewsEyeSymbolTag[]
+    raw_tags: string[]
+    summary?: string | null
+    catalyst?: string | null
+    risk_note?: string | null
+    market_confirmation?: Record<string, number>
+    evidence_items: NewsThemeEvidenceItem[]
+    window?: string
+    window_start?: string
+    window_end?: string
+    snapshot_date?: string
+}
+
+export interface NewsThemeRankingResponse {
+    window: NewsThemeWindow | string
+    items: NewsThemeRankingItem[]
+    updated_at: string
+    source: string
+    message: string
+}
+
+export interface NewsThemeSnapshotResponse {
+    snapshot_date: string
+    items: NewsThemeRankingItem[]
+    updated_at: string
+}
+
+export interface NewsThemePerformanceItem {
+    theme: string
+    rank?: number | null
+    score?: number | null
+    message_count?: number | null
+    consensus_rate?: number | null
+    horizon: string
+    start_date?: string | null
+    end_date?: string | null
+    change_pct?: number | null
+    source: string
+    detail?: Record<string, unknown>
+}
+
+export interface NewsThemePerformanceResponse {
+    snapshot_date: string
+    horizon: string
+    items: NewsThemePerformanceItem[]
+    updated_at: string
+}
+
 // Structured extraction types
 export interface RiskItem {
     name: string
@@ -1110,7 +1187,7 @@ export interface StrategyDefinition {
     strategy_type: StrategyPlatformType
     status: StrategyPlatformStatus
     description?: string
-    source?: 'manual' | 'llm' | 'evolution' | 'template'
+    source?: 'manual' | 'llm' | 'evolution' | 'template' | 'test'
     current_version_id?: string
     version: number
     is_active: boolean

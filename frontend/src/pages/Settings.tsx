@@ -83,6 +83,8 @@ type DailyKlineCoverageCalendarDay = {
     day: number
     weekday: number
     has_data: boolean
+    is_trading_day?: boolean
+    is_rest_day?: boolean
     symbol_count: number
     row_count: number
 }
@@ -101,7 +103,12 @@ type DailyKlineCoverageCalendarResponse = {
     max_year: number
     available_years: number[]
     total_days_with_data: number
+    source_tables?: string[]
     months: DailyKlineCoverageCalendarMonth[]
+}
+
+function isDailyCalendarRestDay(day: DailyKlineCoverageCalendarDay): boolean {
+    return day.is_rest_day ?? day.weekday >= 5
 }
 
 const SETTINGS_SECTIONS = [
@@ -3065,7 +3072,7 @@ export default function Settings() {
                             <div>
                                 <div className="text-lg font-semibold text-slate-900 dark:text-slate-100">股票日 K 线数据视图</div>
                                 <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                                    3 x 4 月卡展示全年覆盖情况，绿色表示当天已有数据，灰色表示当天暂无数据。
+                                    3 x 4 月卡展示全年覆盖情况，绿色表示当天已有数据，灰色表示当天暂无数据，红色角标表示休息日。
                                 </div>
                             </div>
                             <button
@@ -3142,19 +3149,27 @@ export default function Settings() {
                                                 </div>
                                             </div>
                                             <div className="grid grid-cols-7 gap-1">
-                                                {month.days.map((day) => (
-                                                    <div
-                                                        key={day.date}
-                                                        title={`${day.date} · ${day.has_data ? `有数据（${day.symbol_count} 只股票）` : '暂无数据'}`}
-                                                        className={`flex aspect-square items-center justify-center rounded-lg text-xs font-medium transition ${
-                                                            day.has_data
-                                                                ? 'bg-emerald-500 text-white shadow-sm'
-                                                                : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
-                                                        }`}
-                                                    >
-                                                        {day.day}
-                                                    </div>
-                                                ))}
+                                                {month.days.map((day) => {
+                                                    const isRestDay = isDailyCalendarRestDay(day)
+                                                    return (
+                                                        <div
+                                                            key={day.date}
+                                                            title={`${day.date} · ${isRestDay ? '休息日 · ' : ''}${day.has_data ? `有数据（${day.symbol_count} 只股票）` : '暂无数据'}`}
+                                                            className={`relative flex aspect-square items-center justify-center overflow-hidden rounded-lg text-xs font-medium transition ${
+                                                                day.has_data
+                                                                    ? 'bg-emerald-500 text-white shadow-sm'
+                                                                    : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                                                            }`}
+                                                        >
+                                                            {isRestDay && (
+                                                                <span className="pointer-events-none absolute right-0 top-0 rounded-bl-md bg-rose-500 px-1 text-[9px] font-semibold leading-3 text-white shadow-sm">
+                                                                    休
+                                                                </span>
+                                                            )}
+                                                            {day.day}
+                                                        </div>
+                                                    )
+                                                })}
                                             </div>
                                         </div>
                                     ))}

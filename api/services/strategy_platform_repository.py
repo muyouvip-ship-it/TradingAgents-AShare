@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import re
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,10 @@ from api.models.strategy_models import (
 
 
 PLATFORM_META_KEY = "strategy_platform"
+_REALTIME_TEST_STRATEGY_NAME_RE = re.compile(
+    r"^(实时测试策略|实盘监控策略|审批策略|单轮执行策略|同K线去重策略|同K线延迟信号策略|"
+    r"不可卖卖出策略|非交易时段策略|禁用缓存快照策略|撤单补单策略|首日波段回补策略)-[0-9a-f]{6}$"
+)
 
 
 def list_platform_strategies(
@@ -28,9 +33,12 @@ def list_platform_strategies(
     strategy_type: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    include_test: bool = False,
 ) -> list[dict[str, Any]]:
     rows = db.query(StrategyDB).order_by(StrategyDB.updated_at.desc()).all()
     items = [_strategy_to_payload(row) for row in rows if _is_platform_strategy(row)]
+    if not include_test:
+        items = [item for item in items if not _is_test_strategy(item)]
     if strategy_type:
         items = [item for item in items if item["strategy_type"] == strategy_type]
     if status:
@@ -435,6 +443,19 @@ def _candidate_to_payload(row: EvolutionCandidateDB) -> dict[str, Any]:
 
 def _is_platform_strategy(row: StrategyDB) -> bool:
     return isinstance(row.parameters, dict) and PLATFORM_META_KEY in row.parameters
+
+
+def _is_test_strategy(item: dict[str, Any]) -> bool:
+    if item.get("source") == "test":
+        return True
+    tags = set(item.get("tags") or [])
+    if "测试污染已归档" in tags:
+        return True
+    if not {"AI创建", "待回测"}.issubset(tags):
+        return False
+    if int(item.get("run_count") or 0) != 0:
+        return False
+    return bool(_REALTIME_TEST_STRATEGY_NAME_RE.match(str(item.get("name") or "")))
 
 
 def _is_platform_backtest(row: BacktestJobDB) -> bool:

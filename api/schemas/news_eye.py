@@ -51,3 +51,24 @@ class NewsEyeListResponse(BaseModel):
     data_governance: dict[str, Any] = Field(default_factory=dict)
     background: dict[str, Any] = Field(default_factory=dict)
     history: NewsEyeHistoryMeta
+
+
+class NewsThemeRankingResponse(BaseModel):
+    window: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    updated_at: str
+    source: str
+    message: str
+
+
+class NewsThemeSnapshotResponse(BaseModel):
+    snapshot_date: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    updated_at: str
+
+
+class NewsThemePerformanceResponse(BaseModel):
+    snapshot_date: str
+    horizon: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    updated_at: str

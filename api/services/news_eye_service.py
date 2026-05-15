@@ -591,6 +591,17 @@ def refresh_news_cache(
             tracked_symbols=symbols,
             saved_count=saved,
         )
+        try:
+            from api.services import news_theme_service
+
+            news_theme_service.refresh_theme_rankings(
+                db,
+                windows=("premarket", "24h", "72h", "7d"),
+                limit=20,
+                persist=True,
+            )
+        except Exception:
+            logger.exception("[news-eye] theme ranking refresh failed trigger=%s", trigger)
         db.commit()
         return {
             "saved": saved,
