@@ -6,27 +6,81 @@ from datetime import datetime, timezone
 from typing import Generator
 
 from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, inspect, text
+from sqlalchemy import inspection
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 from api.core.env import load_project_env
 
 load_project_env()
 
-# Database URL - PostgreSQL only
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required. This project now supports PostgreSQL only.")
-if not (DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("postgres://")):
-    raise RuntimeError("DATABASE_URL must point to PostgreSQL.")
+_POSTGRES_PREFIXES = ("postgresql://", "postgresql+", "postgres://")
 
-# Create engine
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-)
 
-# Session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def _database_url() -> str | None:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return None
+    if not database_url.startswith(_POSTGRES_PREFIXES):
+        raise RuntimeError("DATABASE_URL must point to PostgreSQL.")
+    return database_url
+
+
+_engine: Engine | None = None
+_session_local = None
+
+
+def _require_engine() -> Engine:
+    global _engine, _session_local
+    if _engine is not None:
+        return _engine
+    database_url = _database_url()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is required. This project now supports PostgreSQL only.")
+    _engine = create_engine(database_url, echo=False)
+    _session_local = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    return _engine
+
+
+class _LazySessionLocal:
+    def __call__(self, *args, **kwargs):
+        return _session_local_factory()(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(_session_local_factory(), item)
+
+
+def _session_local_factory():
+    _require_engine()
+    assert _session_local is not None
+    return _session_local
+
+
+class _LazyEngineProxy:
+    def _engine(self) -> Engine:
+        return _require_engine()
+
+    def __getattr__(self, item):
+        return getattr(self._engine(), item)
+
+    @property
+    def url(self):
+        return self._engine().url
+
+    def __repr__(self) -> str:
+        try:
+            return repr(self._engine())
+        except Exception:
+            return "<LazyEngineProxy unresolved>"
+
+
+@inspection._inspects(_LazyEngineProxy)
+def _inspect_lazy_engine(target: _LazyEngineProxy):
+    return inspect(target._engine())
+
+
+engine = _LazyEngineProxy()
+SessionLocal = _LazySessionLocal()
 
 # Base class for models
 Base = declarative_base()
@@ -163,10 +217,12 @@ def _ensure_market_data_schema() -> None:
                 )
             """))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_daily_kline_symbol_date ON stock_daily_kline(symbol, trade_date)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_daily_kline_trade_date ON stock_daily_kline(trade_date)"))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
-            if inspector.has_table("stock_minute_kline"):
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS stock_minute_kline_symbol_trade_time_key ON stock_minute_kline(symbol, trade_time)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_minute_symbol ON stock_minute_kline(symbol)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_minute_time ON stock_minute_kline(trade_time)"))
             current_inspector = inspect(conn)
             if current_inspector.has_table("stock_daily_kline"):
                 stock_daily_columns = {column["name"] for column in current_inspector.get_columns("stock_daily_kline")}

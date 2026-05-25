@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import text
 
 from tests.postgres_test_utils import isolated_postgres_session
 from api.database import Base
@@ -93,6 +94,181 @@ def test_fetch_external_news_collects_general_and_symbol_sources(monkeypatch):
     assert "东方财富全球快讯" in active_sources
     assert any(source.startswith("东方财富个股新闻:300750.SZ") for source in active_sources)
     assert not any("拉取失败" in warning for warning in warnings)
+
+
+def test_fetch_external_news_uses_extra_general_sources_and_dedupes(monkeypatch):
+    import pandas as pd
+    import akshare as ak
+
+    duplicate_content = "上市公司签约算力订单，人工智能板块走强"
+    monkeypatch.setattr(ak, "stock_info_global_cls", lambda symbol="全部": pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_cjzc_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(
+        ak,
+        "stock_info_global_sina",
+        lambda: pd.DataFrame([{"时间": "2026-04-30 20:10:01", "内容": duplicate_content}]),
+    )
+    monkeypatch.setattr(
+        ak,
+        "stock_info_global_futu",
+        lambda: pd.DataFrame(
+            [
+                {
+                    "标题": "",
+                    "内容": duplicate_content,
+                    "发布时间": "2026-04-30 20:10:08",
+                    "链接": "https://example.com/futu-1",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ak,
+        "stock_info_global_ths",
+        lambda: pd.DataFrame(
+            [{"标题": "龙虎榜活跃", "内容": "龙虎榜显示机器人板块资金活跃", "发布时间": "2026-04-30 20:12:00"}]
+        ),
+    )
+
+    items, active_sources, warnings = news_eye_service._fetch_external_news(20, symbols=[])
+
+    assert "新浪7x24" in active_sources
+    assert "富途快讯" in active_sources
+    assert "同花顺全球直播" in active_sources
+    assert len(items) == 2
+    assert sum(1 for item in items if duplicate_content in item["content"]) == 1
+    assert not news_eye_service._sync_state_error_from_warnings(warnings, active_sources)
+
+
+def test_refresh_news_cache_dedupes_shared_pool_by_content(db, monkeypatch):
+    duplicate_content = "宁德时代签约扩产，锂电池板块走强"
+    monkeypatch.setattr(
+        news_eye_service,
+        "_fetch_external_news",
+        lambda limit, symbols: (
+            [
+                {
+                    "content": duplicate_content,
+                    "published_at": "2026-04-30T20:30:01",
+                    "source": "新浪7x24",
+                    "url": None,
+                },
+                {
+                    "content": duplicate_content,
+                    "published_at": "2026-04-30T20:30:08",
+                    "source": "富途快讯",
+                    "url": "https://example.com/futu-duplicate",
+                },
+            ],
+            ["新浪7x24", "富途快讯"],
+            [],
+        ),
+    )
+
+    result = news_eye_service.refresh_news_cache(db, limit=20, symbols=[], trigger="manual")
+    listing = news_eye_service.list_news_items(db, limit=20)
+
+    assert result["saved"] == 1
+    assert listing["total"] == 1
+    assert listing["items"][0]["content"] == duplicate_content
+
+
+def test_refresh_news_cache_indexes_actual_digest_when_dedupe_hits_legacy_row(db, monkeypatch):
+    content = "宁德时代签约扩产，锂电池板块走强"
+    legacy_digest = "a" * 64
+    dedupe_key = news_eye_service._make_news_dedupe_key({"content": content, "published_at": "2026-04-30T20:30:01"})
+    news_eye_service.ensure_news_tables(db)
+    db.execute(
+        text(
+            """
+            INSERT INTO market_news_items (
+                digest, dedupe_key, content, published_at, source, url, sentiment,
+                positive_sectors_json, negative_sectors_json, positive_symbols_json,
+                negative_symbols_json, related_symbols_json, fetched_at
+            )
+            VALUES (
+                :digest, :dedupe_key, :content, :published_at, '旧源', NULL, 'neutral',
+                '[]', '[]', '[]', '[]', '[]', :published_at
+            )
+            """
+        ),
+        {
+            "digest": legacy_digest,
+            "dedupe_key": dedupe_key,
+            "content": content,
+            "published_at": "2026-04-30T20:30:01",
+        },
+    )
+    db.commit()
+    monkeypatch.setattr(news_eye_service, "get_reverse_stock_map", lambda: {})
+    monkeypatch.setattr(
+        news_eye_service,
+        "_fetch_external_news",
+        lambda limit, symbols: (
+            [
+                {
+                    "content": content,
+                    "published_at": "2026-04-30T20:30:01",
+                    "source": "新浪7x24",
+                    "url": "https://example.com/sina-duplicate",
+                    "seed_symbols": ["300750.SZ"],
+                }
+            ],
+            ["新浪7x24"],
+            [],
+        ),
+    )
+
+    news_eye_service.refresh_news_cache(db, limit=20, symbols=["300750.SZ"], trigger="manual")
+    indexed = db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS count
+            FROM market_news_item_symbols
+            WHERE digest = :digest AND symbol = '300750.SZ'
+            """
+        ),
+        {"digest": legacy_digest},
+    ).scalar()
+    wrong_digest_indexed = db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS count
+            FROM market_news_item_symbols
+            WHERE digest = :digest
+            """
+        ),
+        {"digest": dedupe_key},
+    ).scalar()
+
+    assert indexed >= 1
+    assert wrong_digest_indexed == 0
+
+
+def test_refresh_news_cache_ignores_symbol_only_failures_for_sync_state(db, monkeypatch):
+    monkeypatch.setattr(
+        news_eye_service,
+        "_fetch_external_news",
+        lambda limit, symbols: (
+            [
+                {
+                    "content": "证监会完善上市公司分红制度，A股红利板块受关注",
+                    "published_at": "2026-04-30T20:30:00",
+                    "source": "财联社电报",
+                    "url": "https://example.com/source-ok",
+                }
+            ],
+            ["财联社电报"],
+            ["东方财富个股新闻(600047.SH) 拉取失败: 'code'"],
+        ),
+    )
+
+    news_eye_service.refresh_news_cache(db, limit=20, symbols=["600047.SH"], trigger="background")
+    listing = news_eye_service.list_news_items(db, limit=20)
+
+    assert listing["background"]["status"] == "success"
+    assert listing["background"]["last_error"] is None
 
 
 def test_extract_impact_payload_separates_positive_and_negative_entities(monkeypatch):

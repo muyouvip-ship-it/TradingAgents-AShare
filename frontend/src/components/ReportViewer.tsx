@@ -1,5 +1,5 @@
 import { FileText, Download, ChevronDown, ChevronRight, Loader2, MousePointerClick } from 'lucide-react'
-import { Suspense, lazy, useState, useEffect } from 'react'
+import { Suspense, lazy, useState } from 'react'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import type { ReportDetail } from '@/types'
 import { sanitizeReportMarkdown } from '@/utils/reportText'
@@ -49,8 +49,15 @@ interface ReportViewerProps {
 
 export default function ReportViewer({ reportData, activeSection }: ReportViewerProps = {}) {
     const { report, streamingSections, isAnalyzing } = useAnalysisStore()
-    const [expandedSections, setExpandedSections] = useState<string[]>([])
     const isHistorical = !!reportData
+    const [expandedSections, setExpandedSections] = useState<string[]>(
+        () => reportData
+            ? REPORT_SECTIONS
+                .filter(s => !!reportData?.[s.key as keyof ReportDetail])
+                .map(s => s.key)
+                .slice(0, 2)
+            : [],
+    )
 
     const getSectionContent = (key: string): string => {
         if (isHistorical) {
@@ -72,15 +79,6 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
     const hasAnyContent = isHistorical
         ? REPORT_SECTIONS.some(s => !!reportData?.[s.key as keyof ReportDetail])
         : Object.keys(streamingSections).length > 0 || (report && Object.values(report).some(v => typeof v === 'string' && v.length > 0))
-
-    // ── Historical mode: auto-expand first 2 sections with content ────────────
-    useEffect(() => {
-        if (!isHistorical) return
-        const withContent = REPORT_SECTIONS
-            .filter(s => !!reportData?.[s.key as keyof ReportDetail])
-            .map(s => s.key)
-        setExpandedSections(withContent.slice(0, 2))
-    }, [isHistorical, reportData])
 
     // Historical mode: accordion toggle
     const toggleSection = (key: string) =>

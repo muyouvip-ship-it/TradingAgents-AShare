@@ -136,8 +136,8 @@ export default function Settings() {
     const [customBaseUrl, setCustomBaseUrl] = useState('')
     const [deepThinkLlm, setDeepThinkLlm] = useState('')
     const [quickThinkLlm, setQuickThinkLlm] = useState('')
-    const [newsProviderPreset, setNewsProviderPreset] = useState('ollama')
-    const [newsCustomBaseUrl, setNewsCustomBaseUrl] = useState('http://127.0.0.1:11434/v1')
+    const [newsProviderPreset, setNewsProviderPreset] = useState('openai')
+    const [newsCustomBaseUrl, setNewsCustomBaseUrl] = useState('')
     const [newsAnalysisLlm, setNewsAnalysisLlm] = useState('')
     const [maxDebateRounds, setMaxDebateRounds] = useState(1)
     const [maxRiskRounds, setMaxRiskRounds] = useState(1)
@@ -263,9 +263,12 @@ export default function Settings() {
         setCustomBaseUrl(cfg.backend_url || '')
         setDeepThinkLlm(cfg.deep_think_llm)
         setQuickThinkLlm(cfg.quick_think_llm)
-        setNewsProviderPreset(inferPreset(cfg.news_llm_provider, cfg.news_backend_url))
-        setNewsCustomBaseUrl(cfg.news_backend_url || 'http://127.0.0.1:11434/v1')
-        setNewsAnalysisLlm(cfg.news_analysis_llm || '')
+        const inheritedNewsProvider = cfg.news_llm_provider || cfg.llm_provider
+        const inheritedNewsBaseUrl = cfg.news_backend_url || cfg.backend_url
+        const inheritedNewsModel = cfg.news_analysis_llm || cfg.quick_think_llm || cfg.deep_think_llm
+        setNewsProviderPreset(inferPreset(inheritedNewsProvider, inheritedNewsBaseUrl))
+        setNewsCustomBaseUrl(inheritedNewsBaseUrl || '')
+        setNewsAnalysisLlm(inheritedNewsModel || '')
         setMaxDebateRounds(cfg.max_debate_rounds)
         setMaxRiskRounds(cfg.max_risk_discuss_rounds)
         setHasStoredApiKey(!!cfg.has_api_key)
@@ -315,12 +318,6 @@ export default function Settings() {
         fetchTokens()
         
     }, [])
-
-    useEffect(() => {
-        if (activeSettingsSection !== 'backtest') return
-        if (backtestInfoLoaded || loadingStats) return
-        void loadBacktestDataInfo().finally(() => setBacktestInfoLoaded(true))
-    }, [activeSettingsSection, backtestInfoLoaded, loadingStats])
 
     const fetchTokens = async () => {
         setTokensLoading(true)
@@ -391,7 +388,7 @@ export default function Settings() {
         void loadSystemDataSources()
     }, [activeSettingsSection, loadSystemDataSources, systemDataSources, systemDataSourcesLoading])
 
-    const loadBacktestConfigSnapshot = async (options?: { syncForm?: boolean }) => {
+    const loadBacktestConfigSnapshot = useCallback(async (options?: { syncForm?: boolean }) => {
         const syncForm = options?.syncForm !== false
         const configResponse = await api.getBacktestDataConfigs()
         const configs = Array.isArray(configResponse?.configs) ? configResponse.configs : []
@@ -416,9 +413,9 @@ export default function Settings() {
             })
         }
         return activeConfig || null
-    }
+    }, [])
 
-    const loadBacktestTaskList = async () => {
+    const loadBacktestTaskList = useCallback(async () => {
         const tasksResponse = await api.request<{tasks?: any[], total?: number}>('/v1/backtest-data/tasks')
         if (tasksResponse && Array.isArray(tasksResponse.tasks)) {
             setDataTasks(tasksResponse.tasks)
@@ -431,9 +428,21 @@ export default function Settings() {
         console.warn('tasks API返回数据格式异常:', tasksResponse)
         setDataTasks([])
         return []
-    }
+    }, [])
 
-    const ensureTaskPollingForActiveTasks = (tasks: any[]) => {
+    // 启动任务状态轮询
+    const startTaskPolling = useCallback((taskIds: number[] = [], mode: 'download' | 'subscription' = 'download') => {
+        taskPollingRef.current = { taskIds, mode }
+        setTaskPollingEnabled(true)
+
+        // 立即执行一次轻量刷新
+        Promise.all([
+            loadBacktestConfigSnapshot({ syncForm: false }),
+            loadBacktestTaskList(),
+        ])
+    }, [loadBacktestConfigSnapshot, loadBacktestTaskList])
+
+    const ensureTaskPollingForActiveTasks = useCallback((tasks: any[]) => {
         const activeTasks = (Array.isArray(tasks) ? tasks : []).filter(
             task => task?.status === 'running' || task?.status === 'pending',
         )
@@ -446,9 +455,9 @@ export default function Settings() {
         const activeIds = activeTasks.map(task => Number(task.id)).filter(Number.isFinite)
         setActiveDownloadTaskIds(activeIds)
         startTaskPolling(activeIds, 'download')
-    }
+    }, [startTaskPolling])
 
-    const loadBacktestStats = async () => {
+    const loadBacktestStats = useCallback(async () => {
         const statsResponse = await api.request<{stats?: BacktestDataStatItem[], total?: number}>('/v1/backtest-data/stats')
         const rawStats = statsResponse && Array.isArray(statsResponse.stats)
             ? statsResponse.stats
@@ -468,9 +477,9 @@ export default function Settings() {
         }
         setDataStats([])
         return []
-    }
+    }, [])
 
-    const loadBacktestDataInfo = async () => {
+    const loadBacktestDataInfo = useCallback(async () => {
         setLoadingStats(true)
         try {
             const [, , tasks] = await Promise.all([
@@ -488,7 +497,13 @@ export default function Settings() {
         } finally {
             setLoadingStats(false)
         }
-    }
+    }, [loadBacktestConfigSnapshot, loadBacktestStats, loadBacktestTaskList, loadDailyKlineGovernanceSummary, ensureTaskPollingForActiveTasks])
+
+    useEffect(() => {
+        if (activeSettingsSection !== 'backtest') return
+        if (backtestInfoLoaded || loadingStats) return
+        void loadBacktestDataInfo().finally(() => setBacktestInfoLoaded(true))
+    }, [activeSettingsSection, backtestInfoLoaded, loadBacktestDataInfo, loadingStats])
 
     const formatDateTime = (value?: string | null) => {
         if (!value) return '--'
@@ -497,7 +512,7 @@ export default function Settings() {
         return date.toLocaleString('zh-CN', { hour12: false })
     }
 
-    const loadDailyCalendarView = async (year: number) => {
+    const loadDailyCalendarView = useCallback(async (year: number) => {
         setDailyCalendarLoading(true)
         setDailyCalendarError(null)
         try {
@@ -511,23 +526,23 @@ export default function Settings() {
         } finally {
             setDailyCalendarLoading(false)
         }
-    }
+    }, [])
 
-    const handleOpenDailyCalendarView = (stat: BacktestDataStatItem) => {
+    const handleOpenDailyCalendarView = useCallback((stat: BacktestDataStatItem) => {
         const fallbackYear = new Date().getFullYear()
         const endYear = stat.date_range_end ? new Date(stat.date_range_end).getFullYear() : fallbackYear
         const targetYear = Number.isFinite(endYear) ? endYear : fallbackYear
         setDailyCalendarOpen(true)
         setDailyCalendarYear(targetYear)
         void loadDailyCalendarView(targetYear)
-    }
+    }, [loadDailyCalendarView])
 
-    const handleChangeDailyCalendarYear = (nextYear: number) => {
+    const handleChangeDailyCalendarYear = useCallback((nextYear: number) => {
         if (!dailyCalendarData) return
         if (nextYear < dailyCalendarData.min_year || nextYear > dailyCalendarData.max_year) return
         setDailyCalendarYear(nextYear)
         void loadDailyCalendarView(nextYear)
-    }
+    }, [dailyCalendarData, loadDailyCalendarView])
 
     const getQualityCheckParams = (dataType: string) => {
         if (dataType === 'minute_kline') return { tableName: 'stock_minute_kline', queryType: 'minute_kline' }
@@ -699,18 +714,6 @@ export default function Settings() {
         }
     }
 
-    // 启动任务状态轮询
-    const startTaskPolling = (taskIds: number[] = [], mode: 'download' | 'subscription' = 'download') => {
-        taskPollingRef.current = { taskIds, mode }
-        setTaskPollingEnabled(true)
-
-        // 立即执行一次轻量刷新
-        Promise.all([
-            loadBacktestConfigSnapshot({ syncForm: false }),
-            loadBacktestTaskList(),
-        ])
-    }
-
     usePolling(
         async () => {
             const currentPolling = taskPollingRef.current
@@ -853,8 +856,8 @@ export default function Settings() {
         () => Object.fromEntries((qmtDiagnostics?.items || []).map(item => [item.account_key, item])),
         [qmtDiagnostics],
     )
-    const dataSourceRegistryItems = systemDataSources?.sources || []
-    const dataSourceSurfaceItems = systemDataSources?.surfaces || []
+    const dataSourceRegistryItems = useMemo(() => systemDataSources?.sources || [], [systemDataSources?.sources])
+    const dataSourceSurfaceItems = useMemo(() => systemDataSources?.surfaces || [], [systemDataSources?.surfaces])
     const dataSourceCategoryCount = useMemo(
         () => new Set(dataSourceRegistryItems.map(item => item.category)).size,
         [dataSourceRegistryItems],
@@ -1571,7 +1574,7 @@ export default function Settings() {
                     <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">资讯 LLM</h2>
                 </div>
                 <p className="text-sm text-slate-500 dark:text-slate-400">
-                    这套配置只用于资讯之眼里的“LLM 解读”，和上面的智能分析模型分开保存。
+                    这套配置用于资讯之眼里的“LLM 解读”和主线核心个股推荐，默认跟随上面的智能分析模型。
                 </p>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1616,9 +1619,9 @@ export default function Settings() {
                             />
                             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                                 {selectedNewsPreset.id === 'ollama'
-                                    ? '推荐直接接本机 Ollama，适合把资讯解读放到本地模型上跑。'
+                                    ? '仅在明确需要本地模型时使用；当前建议保持远端主模型一致。'
                                     : selectedNewsPreset.id === 'local-openai'
-                                        ? '适用于 LM Studio、vLLM 等本地 OpenAI 兼容服务。'
+                                        ? '仅在明确需要本地 OpenAI 兼容服务时使用。'
                                         : selectedNewsPreset.editableBaseUrl
                                             ? '可填写自定义资讯模型服务地址。'
                                             : '使用该厂商的默认接入地址。'}
@@ -1657,7 +1660,7 @@ export default function Settings() {
                         </div>
                         <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
                             <div className="text-xs text-slate-500 dark:text-slate-400">
-                                资讯之眼的 LLM 解读优先使用这里的配置；留空时会回退到上面的智能分析模型。
+                                资讯之眼默认使用上面的智能分析模型；这里用于显式指定同一套远端模型或单独的资讯模型。
                             </div>
                             {hasStoredNewsApiKey && (
                                 <button
@@ -2531,19 +2534,19 @@ export default function Settings() {
                             <div>
                                 <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-slate-100">
                                     <Link2 className="h-4 w-4 text-blue-500" />
-                                    多源增量治理
+                                    多源行情治理
                                     {loadingStats && <Loader2 className="h-4 w-4 animate-spin text-slate-400" />}
                                 </div>
                                 <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                    {dailyKlineGovernance?.read_policy || '当前页面读取历史主表与发布层增量的统一视图。'}
+                                    {dailyKlineGovernance?.read_policy || '业务侧读取 stock_daily_kline 最终业务表，过程层用于审计。'}
                                 </div>
                             </div>
                             <div className="flex flex-wrap gap-2 text-[11px] text-slate-500 dark:text-slate-400">
                                 <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
-                                    统一视图：{dailyKlineGovernance?.unified?.table_name || 'market_stock_daily_kline'}
+                                    最终表：{dailyKlineGovernance?.unified?.table_name || 'stock_daily_kline'}
                                 </span>
                                 <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
-                                    发布层：{dailyKlineGovernance?.published?.table_name || 'pub_stock_daily_kline'}
+                                    发布审计：{dailyKlineGovernance?.published?.table_name || 'pub_stock_daily_kline'}
                                 </span>
                                 <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
                                     标准层：{dailyKlineGovernance?.norm?.table_name || 'norm_stock_daily_kline'}
@@ -2552,14 +2555,14 @@ export default function Settings() {
                                     Raw 源：{dailyKlineRawLayers.filter((item) => item.exists).length}/{dailyKlineRawLayers.length || 5}
                                 </span>
                                 <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">
-                                    历史主表：{dailyKlineGovernance?.legacy?.table_name || 'stock_daily_kline'}
+                                    业务主表：{dailyKlineGovernance?.legacy?.table_name || 'stock_daily_kline'}
                                 </span>
                             </div>
                         </div>
 
                         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                             <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
-                                <div className="text-xs text-slate-500 dark:text-slate-400">统一视图最新日期</div>
+                                <div className="text-xs text-slate-500 dark:text-slate-400">最终表最新日期</div>
                                 <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
                                     {dailyKlineGovernance?.unified?.date_range_end || '--'}
                                 </div>
@@ -2568,7 +2571,7 @@ export default function Settings() {
                                 </div>
                             </div>
                             <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
-                                <div className="text-xs text-slate-500 dark:text-slate-400">发布层最新日期</div>
+                                <div className="text-xs text-slate-500 dark:text-slate-400">发布审计最新日期</div>
                                 <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
                                     {dailyKlineGovernance?.published?.date_range_end || '--'}
                                 </div>
@@ -2577,7 +2580,7 @@ export default function Settings() {
                                 </div>
                             </div>
                             <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">
-                                <div className="text-xs text-slate-500 dark:text-slate-400">历史主表覆盖</div>
+                                <div className="text-xs text-slate-500 dark:text-slate-400">业务主表覆盖</div>
                                 <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
                                     {dailyKlineGovernance?.legacy?.date_range_end || '--'}
                                 </div>
@@ -2598,7 +2601,7 @@ export default function Settings() {
 
                         <div className="mt-4 grid gap-3 xl:grid-cols-2">
                             <div className="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-slate-900/40">
-                                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">发布层来源概览</div>
+                                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">发布审计来源概览</div>
                                 <div className="mt-2 space-y-2">
                                     {dailyKlinePublishedSources.slice(0, 4).map((source) => (
                                         <div key={`${source.source}-${source.quality_status}-${source.publish_status}`} className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-800 dark:bg-slate-950">
@@ -2616,7 +2619,7 @@ export default function Settings() {
                                         </div>
                                     ))}
                                     {dailyKlinePublishedSources.length === 0 && (
-                                        <div className="text-xs text-slate-500 dark:text-slate-400">暂无发布层来源摘要，先执行一次日 K 同步或补数。</div>
+                                        <div className="text-xs text-slate-500 dark:text-slate-400">暂无发布审计来源摘要，先执行一次日 K 同步或补数。</div>
                                     )}
                                 </div>
                             </div>

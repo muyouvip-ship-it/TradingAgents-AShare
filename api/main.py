@@ -47,6 +47,15 @@ _cn_stock_reverse_map = _core_cn_stock_reverse_map
 logger = logging.getLogger(__name__)
 
 
+def run() -> None:
+    import uvicorn
+
+    host = os.getenv("API_HOST", "127.0.0.1")
+    port = int(os.getenv("API_PORT", "8500"))
+    reload_enabled = os.getenv("API_RELOAD", "0").strip().lower() in {"1", "true", "yes", "on"}
+    uvicorn.run("api.app:app", host=host, port=port, reload=reload_enabled)
+
+
 def _build_runtime_config(*args, **kwargs):
     overrides = args[0] if args else kwargs.get("overrides", {})
     user_id = kwargs.get("user_id")

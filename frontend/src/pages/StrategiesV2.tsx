@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowPathIcon,
@@ -102,7 +102,7 @@ export default function StrategiesV2() {
     selectedStrategy?.strategy_type,
   );
 
-  const loadStrategies = async () => {
+  const loadStrategies = useCallback(async () => {
     setLoading(true);
     try {
       const response = await api.getStrategyPlatformList({
@@ -125,11 +125,11 @@ export default function StrategiesV2() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [search, typeFilter]);
 
   useEffect(() => {
     void loadStrategies();
-  }, [typeFilter]);
+  }, [loadStrategies]);
 
   useEffect(() => {
     const loadOfficialPacks = async () => {

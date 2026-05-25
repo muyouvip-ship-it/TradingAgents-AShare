@@ -35,7 +35,7 @@ function extractConfidence(text?: string): number | undefined {
 
 function extractPrice(text: string | undefined, type: 'target' | 'stop'): number | undefined {
     if (!text) return undefined
-    const normalized = text.replace(/[*_`#>\[\]（）()]/g, '')
+    const normalized = text.replace(/[*_`#>()[\]（）]/g, '')
     const patterns = type === 'target'
         ? [/目标(?:价|价格|位|价位)?(?:区间)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:target|target\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
         : [/止损(?:价|价格|位|价位)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:stop[-\s_]?loss|stop\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
@@ -72,14 +72,18 @@ export default function Analysis() {
     const initialChatInput = querySymbol ? `分析 ${querySymbol} 今日走势` : undefined
 
     useEffect(() => {
-        if (querySymbol) setActiveSymbol(querySymbol)
+        if (!querySymbol) return
+        const timer = window.setTimeout(() => setActiveSymbol(querySymbol), 0)
+        return () => window.clearTimeout(timer)
     }, [querySymbol])
 
     useEffect(() => {
-        if (currentSymbol) {
-            setActiveSymbol(currentSymbol)
-        }
-    }, [currentSymbol])
+        if (!currentSymbol || querySymbol) return
+        const timer = window.setTimeout(() => {
+            setActiveSymbol(prev => (prev === currentSymbol ? prev : currentSymbol))
+        }, 0)
+        return () => window.clearTimeout(timer)
+    }, [currentSymbol, querySymbol])
 
     const finalDecision = report?.final_trade_decision
     const confidence = jobConfidence ?? extractConfidence(finalDecision)

@@ -5,11 +5,17 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 from api.app import app
-from api.routes.strategy_platform import _default_dsl
+from api.routes.strategy_platform import _default_dsl, _first_day_band_dsl
 from api.services.a_share_market_rules import get_a_share_market_rule, round_to_tick
 from api.services.minute_data_service import evaluate_intraday_confirmation, get_minute_cache_root, load_aggregated_minute_bars
 from api.services.strategy_dsl_compiler import compile_strategy_dsl
-from api.services.strategy_platform_engine import run_strategy_backtest, _calculate_metrics, _simulate_portfolio
+from api.services.strategy_platform_engine import (
+    run_strategy_backtest,
+    _calculate_metrics,
+    _dedupe_symbol_listing_dates,
+    _exit_reason_from_compiled_rules,
+    _simulate_portfolio,
+)
 
 
 def test_compile_strategy_dsl_returns_execution_ir():
@@ -49,6 +55,45 @@ def test_compile_strategy_dsl_blocks_future_function_fields():
     assert compiled.status == "failed"
     assert compiled.future_function_risks
     assert any("疑似未来函数" in error for error in compiled.errors)
+
+
+def test_first_day_band_exit_waits_for_dead_cross():
+    compiled = compile_strategy_dsl(_first_day_band_dsl().model_dump())
+
+    holding_row = pd.Series(
+        {
+            "close": 10.97,
+            "ma20": 11.0,
+            "first_day_band": 21.234857,
+            "first_day_band_b1": 19.913118,
+            "first_day_band_dead_cross": 0.0,
+        }
+    )
+    dead_cross_row = holding_row.copy()
+    dead_cross_row["first_day_band"] = 22.074818
+    dead_cross_row["first_day_band_b1"] = 22.701644
+    dead_cross_row["first_day_band_dead_cross"] = 1.0
+
+    assert _exit_reason_from_compiled_rules(holding_row, compiled) is None
+    assert _exit_reason_from_compiled_rules(dead_cross_row, compiled) == "first_day_band_dead_cross"
+
+
+def test_listing_date_dedup_keeps_earliest_normalized_symbol_date():
+    frame = pd.DataFrame(
+        [
+            {"symbol": "000001", "symbol_code": "000001", "listing_date": "1991-01-03"},
+            {"symbol": "000001.SZ", "symbol_code": "000001", "listing_date": "2024-09-04"},
+            {"symbol": "000026.SZ", "symbol_code": "000026", "listing_date": "2024-09-04"},
+            {"symbol": "000026", "symbol_code": "000026", "listing_date": "1993-06-03"},
+        ]
+    )
+
+    deduped = _dedupe_symbol_listing_dates(frame)
+    by_symbol = deduped.set_index("symbol")
+
+    assert len(deduped) == 2
+    assert by_symbol.loc["000001.SZ", "listing_date"] == pd.Timestamp("1991-01-03")
+    assert by_symbol.loc["000026.SZ", "listing_date"] == pd.Timestamp("1993-06-03")
 
 
 def test_llm_draft_exposes_structured_output_schema_and_compile_report():
@@ -498,9 +543,12 @@ def test_position_models_generate_distinct_allocations():
     assert shared_factor_events
     assert shared_vol_events
     assert shared_risk_events
-    assert any(factor_events[event] != equal_events[event] for event in shared_factor_events)
-    assert any(vol_events[event] != equal_events[event] for event in shared_vol_events)
-    assert any(risk_events[event] != equal_events[event] for event in shared_risk_events)
+    model_differences = [
+        any(factor_events[event] != equal_events[event] for event in shared_factor_events),
+        any(vol_events[event] != equal_events[event] for event in shared_vol_events),
+        any(risk_events[event] != equal_events[event] for event in shared_risk_events),
+    ]
+    assert any(model_differences)
     assert risk_allocations
 
 

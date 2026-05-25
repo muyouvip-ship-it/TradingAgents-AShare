@@ -73,7 +73,7 @@
 
 ## 关键数据与后台任务
 
-- 日 K 数据：核心表包括 `market_stock_daily_kline`、`pub_stock_daily_kline`、治理/水位表和 Parquet 缓存。
+- 日 K/分钟线数据：业务读取以最终表 `stock_daily_kline`、`stock_minute_kline` 为准；`raw_*`、`norm_*`、`pub_*` 和对账表保留为采集、标准化、发布审计与质量追踪过程层，Parquet 缓存服务回测加速。新增写入统一使用 `000001.SZ` / `600000.SH` / `920118.BJ` 这类带交易所后缀格式。
 - 多源治理：设置页和相关接口需要展示 raw/norm/pub/market 关系、质量状态、发布状态和对账结果。
 - 资讯之眼：资讯入库表为 `market_news_items`，后台 worker 会周期性抓取财联社、东方财富等来源。
 - QMT 同步：`ENABLE_QMT_SYNC_WORKER=1` 后，后台同步实盘仓/虚拟仓快照；页面状态要区分“实时直连 / 后台在线 / 快照可用 / 未连接”。

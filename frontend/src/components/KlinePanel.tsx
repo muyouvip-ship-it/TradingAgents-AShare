@@ -322,7 +322,8 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         const handleDblClick = () => {
             chartRef.current?.timeScale().fitContent()
         }
-        containerRef.current.addEventListener('dblclick', handleDblClick)
+        const container = containerRef.current
+        container.addEventListener('dblclick', handleDblClick)
 
         const onResize = () => {
             if (!containerRef.current || !chartRef.current) return
@@ -335,7 +336,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         window.addEventListener('resize', onResize)
         return () => {
             window.removeEventListener('resize', onResize)
-            containerRef.current?.removeEventListener('dblclick', handleDblClick)
+            container.removeEventListener('dblclick', handleDblClick)
             chart.unsubscribeCrosshairMove(handleCrosshairMove)
             chartRef.current?.remove()
             chartRef.current = null

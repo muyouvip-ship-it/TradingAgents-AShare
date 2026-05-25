@@ -1,6 +1,7 @@
 import {
   Suspense,
   lazy,
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -469,7 +470,7 @@ export default function BacktestResult() {
   const [selectedDate, setSelectedDate] = useState("");
   const [focusedEventDate, setFocusedEventDate] = useState("");
 
-  const load = async (silent = false) => {
+  const load = useCallback(async (silent = false) => {
     if (!runId) return;
     if (silent) setRefreshing(true);
     else setLoading(true);
@@ -527,11 +528,11 @@ export default function BacktestResult() {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, [runId]);
 
   useEffect(() => {
     void load();
-  }, [runId]);
+  }, [load]);
 
   const symbols = useMemo(
     () =>
@@ -681,7 +682,7 @@ export default function BacktestResult() {
     }
     const warnings: string[] = []
     if (syntheticMode) warnings.push("当前回测使用 Synthetic 数据，只适合验证流程，不应解释收益、胜率和成交质量。")
-    if (Boolean(diagnostics.fallback_mode)) warnings.push("当前结果经过 fallback_engine 回退链路，精度与真实性应以真引擎结果为准。")
+    if (diagnostics.fallback_mode) warnings.push("当前结果经过 fallback_engine 回退链路，精度与真实性应以真引擎结果为准。")
     if (error) warnings.push(error)
     return warnings
   }, [backendGovernance?.warnings, diagnostics.fallback_mode, error, syntheticMode])

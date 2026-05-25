@@ -50,7 +50,7 @@ function extractConfidence(text?: string): number | undefined {
 
 function extractPrice(text: string | undefined, type: 'target' | 'stop'): number | undefined {
     if (!text) return undefined
-    const normalized = text.replace(/[*_`#>\[\]（）()]/g, '')
+    const normalized = text.replace(/[*_`#>()[\]（）]/g, '')
     const patterns = type === 'target'
         ? [/目标(?:价|价格|位|价位)?(?:区间)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:target|target\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
         : [/止损(?:价|价格|位|价位)?\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/, /(?:stop[-\s_]?loss|stop\s*price)\s*[:：]?\s*[¥$]?\s*(\d+(?:\.\d+)?)/i]
@@ -580,7 +580,7 @@ export default function Reports() {
                             </div>
                         )}
                     >
-                        <ReportViewer reportData={selectedReport} />
+                        <ReportViewer key={selectedReport?.id ?? 'none'} reportData={selectedReport} />
                     </Suspense>
                 </div>
             </div>

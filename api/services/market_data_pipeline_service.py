@@ -33,6 +33,8 @@ DAILY_SOURCE_PRIORITY = {"quantclass": 110, "akshare": 100, "baostock": 80, "pos
 MINUTE_SOURCE_PRIORITY = {"qmt": 100, "tdx": 90, "postgresql": 70, "akshare": 50}
 MINUTE_EXPECTED_BARS = 240
 MINUTE_PUBLISH_MIN_RATIO = 0.98
+FINAL_DAILY_KLINE_TABLE = "stock_daily_kline"
+FINAL_MINUTE_KLINE_TABLE = "stock_minute_kline"
 
 
 @dataclass
@@ -43,19 +45,23 @@ class PublicationSummary:
 
 
 def preferred_daily_kline_table() -> str:
+    if _has_table(FINAL_DAILY_KLINE_TABLE):
+        return FINAL_DAILY_KLINE_TABLE
     if _has_table("market_stock_daily_kline"):
         return "market_stock_daily_kline"
     if _table_has_rows("pub_stock_daily_kline"):
         return "pub_stock_daily_kline"
-    return "stock_daily_kline"
+    return FINAL_DAILY_KLINE_TABLE
 
 
 def preferred_minute_kline_table() -> str:
+    if _has_table(FINAL_MINUTE_KLINE_TABLE):
+        return FINAL_MINUTE_KLINE_TABLE
     if _has_table("market_stock_minute_kline"):
         return "market_stock_minute_kline"
     if _published_minute_reads_enabled() and _table_has_rows("pub_stock_minute_kline"):
         return "pub_stock_minute_kline"
-    return "stock_minute_kline"
+    return FINAL_MINUTE_KLINE_TABLE
 
 
 def published_daily_kline_table() -> str:
@@ -181,8 +187,7 @@ def reconcile_daily_trade_dates(
 
             if published_rows:
                 _upsert_published_daily_rows(conn, published_rows)
-                if _legacy_writes_enabled():
-                    _mirror_published_daily_rows_to_legacy(conn, published_rows)
+                _mirror_published_daily_rows_to_legacy(conn, published_rows)
             _upsert_daily_reconciliation_run(
                 conn,
                 run_id=run_id,
@@ -294,8 +299,7 @@ def publish_minute_trade_date(
 
         if published_rows:
             _upsert_published_minute_rows(conn, published_rows)
-            if _legacy_writes_enabled():
-                _mirror_published_minute_rows_to_legacy(conn, published_rows)
+            _mirror_published_minute_rows_to_legacy(conn, published_rows)
         _upsert_minute_reconciliation_run(
             conn,
             run_id=run_id,
@@ -827,9 +831,13 @@ def _mirror_published_daily_rows_to_legacy(conn: Any, rows: list[dict[str, Any]]
         text(
             """
             INSERT INTO stock_daily_kline
-            (symbol, trade_date, open, high, low, close, volume, amount, turnover_rate, pre_close, created_at, updated_at)
+            (symbol, trade_date, open, high, low, close, volume, amount, turnover_rate, pre_close,
+             float_market_cap, total_market_cap, net_profit_ttm, sw_industry_l1, sw_industry_l2, sw_industry_l3,
+             created_at, updated_at)
             VALUES
-            (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount, :turnover_rate, :pre_close, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount, :turnover_rate, :pre_close,
+             :float_market_cap, :total_market_cap, :net_profit_ttm, :sw_industry_l1, :sw_industry_l2, :sw_industry_l3,
+             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT (symbol, trade_date) DO UPDATE SET
                 open = EXCLUDED.open,
                 high = EXCLUDED.high,
@@ -839,6 +847,12 @@ def _mirror_published_daily_rows_to_legacy(conn: Any, rows: list[dict[str, Any]]
                 amount = EXCLUDED.amount,
                 turnover_rate = EXCLUDED.turnover_rate,
                 pre_close = EXCLUDED.pre_close,
+                float_market_cap = EXCLUDED.float_market_cap,
+                total_market_cap = EXCLUDED.total_market_cap,
+                net_profit_ttm = EXCLUDED.net_profit_ttm,
+                sw_industry_l1 = EXCLUDED.sw_industry_l1,
+                sw_industry_l2 = EXCLUDED.sw_industry_l2,
+                sw_industry_l3 = EXCLUDED.sw_industry_l3,
                 updated_at = CURRENT_TIMESTAMP
             """
         ),
@@ -1068,6 +1082,9 @@ def _load_daily_publish_summary(
 ) -> dict[str, Any]:
     if trade_date is None or not _has_table(table_name):
         return {"summary": {}, "items": []}
+    columns = _relation_columns(table_name)
+    if "publish_status" not in columns:
+        return _load_final_daily_summary(db, table_name=table_name, trade_date=trade_date, symbols=symbols, limit=limit)
     params: dict[str, Any] = {"trade_date": trade_date, "limit": max(int(limit or 200), 1)}
     filters = ["trade_date = :trade_date"]
     if symbols:
@@ -1116,6 +1133,9 @@ def _load_minute_publish_summary(
         return {"summary": {}, "items": []}
     if table_name == "market_stock_minute_kline" and not symbols:
         return _load_market_minute_overview(db, trade_date=trade_date, limit=limit)
+    columns = _relation_columns(table_name)
+    if "publish_status" not in columns:
+        return _load_final_minute_summary(db, table_name=table_name, trade_date=trade_date, symbols=symbols, limit=limit)
     params: dict[str, Any] = {"trade_date": trade_date, "limit": max(int(limit or 200), 1)}
     filters = ["trade_date = :trade_date"]
     if symbols:
@@ -1159,6 +1179,101 @@ def _load_minute_publish_summary(
                 "updated_at": item.get("updated_at").isoformat() if hasattr(item.get("updated_at"), "isoformat") else item.get("updated_at"),
             }
             for item in items
+        ],
+    }
+
+
+def _load_final_daily_summary(
+    db: Any,
+    *,
+    table_name: str,
+    trade_date: date,
+    symbols: list[str],
+    limit: int,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"trade_date": trade_date, "limit": max(int(limit or 200), 1)}
+    filters = ["trade_date = :trade_date"]
+    if symbols:
+        params["symbols"] = symbols
+        filters.append("symbol IN :symbols")
+    statement = text(
+        f"""
+        SELECT symbol, updated_at
+        FROM {table_name}
+        WHERE {" AND ".join(filters)}
+        ORDER BY symbol ASC
+        LIMIT :limit
+        """
+    )
+    if symbols:
+        statement = statement.bindparams(bindparam("symbols", expanding=True))
+    rows = [dict(row) for row in db.execute(statement, params).mappings().all()]
+    summary = _load_final_status_counts(db, table_name=table_name, trade_date=trade_date, symbols=symbols)
+    return {
+        "summary": summary,
+        "items": [
+            {
+                "symbol": str(row["symbol"]),
+                "source": "final_table",
+                "publish_status": "final",
+                "quality_status": "validated",
+                "freshness_status": "business_source",
+                "coverage_ratio": 1.0,
+                "updated_at": row.get("updated_at").isoformat() if hasattr(row.get("updated_at"), "isoformat") else row.get("updated_at"),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _load_final_minute_summary(
+    db: Any,
+    *,
+    table_name: str,
+    trade_date: date,
+    symbols: list[str],
+    limit: int,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "start_dt": datetime.combine(trade_date, time.min),
+        "end_dt": datetime.combine(trade_date + timedelta(days=1), time.min),
+        "limit": max(int(limit or 200), 1),
+    }
+    filters = ["trade_time >= :start_dt", "trade_time < :end_dt"]
+    if symbols:
+        params["symbols"] = symbols
+        filters.append("symbol IN :symbols")
+    statement = text(
+        f"""
+        SELECT symbol,
+               COUNT(*) AS bars,
+               MAX(updated_at) AS updated_at
+        FROM {table_name}
+        WHERE {" AND ".join(filters)}
+        GROUP BY symbol
+        ORDER BY symbol ASC
+        LIMIT :limit
+        """
+    )
+    if symbols:
+        statement = statement.bindparams(bindparam("symbols", expanding=True))
+    rows = [dict(row) for row in db.execute(statement, params).mappings().all()]
+    summary = _load_final_status_counts(db, table_name=table_name, trade_date=trade_date, symbols=symbols)
+    return {
+        "summary": summary,
+        "items": [
+            {
+                "symbol": str(row["symbol"]),
+                "primary_source": "final_table",
+                "source_mix": "final_table",
+                "publish_status": "final",
+                "quality_status": "validated",
+                "freshness_status": "business_source",
+                "coverage_ratio": round((int(row["bars"] or 0) / MINUTE_EXPECTED_BARS), 4) if MINUTE_EXPECTED_BARS else None,
+                "bars": int(row["bars"] or 0),
+                "updated_at": row.get("updated_at").isoformat() if hasattr(row.get("updated_at"), "isoformat") else row.get("updated_at"),
+            }
+            for row in rows
         ],
     }
 
@@ -1255,6 +1370,8 @@ def _load_market_minute_overview(db: Any, *, trade_date: date, limit: int) -> di
 
 
 def _load_status_counts(db: Any, *, table_name: str, trade_date: date, symbols: list[str]) -> dict[str, Any]:
+    if "publish_status" not in _relation_columns(table_name):
+        return _load_final_status_counts(db, table_name=table_name, trade_date=trade_date, symbols=symbols)
     params: dict[str, Any] = {"trade_date": trade_date}
     filters = ["trade_date = :trade_date"]
     if symbols:
@@ -1281,6 +1398,38 @@ def _load_status_counts(db: Any, *, table_name: str, trade_date: date, symbols: 
         "counts": counts,
         "last_updated_at": last_updated.isoformat() if hasattr(last_updated, "isoformat") else None,
         "symbol_count": sum(counts.values()),
+    }
+
+
+def _load_final_status_counts(db: Any, *, table_name: str, trade_date: date, symbols: list[str]) -> dict[str, Any]:
+    columns = _relation_columns(table_name)
+    params: dict[str, Any] = {}
+    if "trade_date" in columns:
+        params["trade_date"] = trade_date
+        filters = ["trade_date = :trade_date"]
+    else:
+        params["start_dt"] = datetime.combine(trade_date, time.min)
+        params["end_dt"] = datetime.combine(trade_date + timedelta(days=1), time.min)
+        filters = ["trade_time >= :start_dt", "trade_time < :end_dt"]
+    if symbols:
+        params["symbols"] = symbols
+        filters.append("symbol IN :symbols")
+    statement = text(
+        f"""
+        SELECT COUNT(DISTINCT symbol) AS symbol_count, MAX(updated_at) AS last_updated_at
+        FROM {table_name}
+        WHERE {" AND ".join(filters)}
+        """
+    )
+    if symbols:
+        statement = statement.bindparams(bindparam("symbols", expanding=True))
+    row = db.execute(statement, params).mappings().first()
+    symbol_count = int((row or {}).get("symbol_count") or 0)
+    last_updated = (row or {}).get("last_updated_at")
+    return {
+        "counts": {"final": symbol_count} if symbol_count else {},
+        "last_updated_at": last_updated.isoformat() if hasattr(last_updated, "isoformat") else None,
+        "symbol_count": symbol_count,
     }
 
 
@@ -1399,10 +1548,6 @@ def _safe_text(value: Any) -> str | None:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _legacy_writes_enabled() -> bool:
-    return os.getenv("MARKET_DATA_WRITE_LEGACY_TABLES", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _published_minute_reads_enabled() -> bool:

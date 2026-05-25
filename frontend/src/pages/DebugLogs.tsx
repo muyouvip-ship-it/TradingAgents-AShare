@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, Clock3, FileText, RefreshCw, ShieldAlert, TerminalSquare } from 'lucide-react'
 
 import VirtualList from '@/components/VirtualList'
@@ -34,7 +34,29 @@ export default function DebugLogs() {
     ? Math.max(360, Math.min(Math.floor(window.innerHeight * 0.72), 780))
     : 640
 
-  const loadSources = async () => {
+  const appendRuntimeLogLine = useCallback((line: string) => {
+    setPayload(current => {
+      const sourceInfo = current?.source ?? currentSource ?? {
+        id: selectedSource,
+        label: selectedSource,
+        path: selectedSource,
+        exists: true,
+        size_bytes: 0,
+        modified_at: null,
+      }
+      const nextLines = [...(current?.lines ?? []), line].slice(-selectedLines)
+      return {
+        source: sourceInfo,
+        lines: nextLines,
+        line_count: nextLines.length,
+        max_lines: selectedLines,
+        truncated: nextLines.length >= selectedLines,
+        read_at: new Date().toISOString(),
+      }
+    })
+  }, [currentSource, selectedLines, selectedSource])
+
+  const loadSources = useCallback(async () => {
     try {
       const response = await api.getRuntimeLogSources()
       setSources(response.sources)
@@ -44,9 +66,9 @@ export default function DebugLogs() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '获取日志来源失败')
     }
-  }
+  }, [selectedSource])
 
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
@@ -61,11 +83,11 @@ export default function DebugLogs() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [selectedLevel, selectedLines, selectedSource])
 
   useEffect(() => {
     void loadSources()
-  }, [])
+  }, [loadSources])
 
   useEffect(() => {
     if (!sources.length) return
@@ -74,7 +96,7 @@ export default function DebugLogs() {
       return
     }
     void loadLogs()
-  }, [liveMode, selectedSource, selectedLines, selectedLevel, sources.length])
+  }, [liveMode, loadLogs, sources.length])
 
   useEffect(() => {
     if (!liveMode || !sources.length) {
@@ -137,29 +159,7 @@ export default function DebugLogs() {
 
     void startStream()
     return () => controller.abort()
-  }, [liveMode, selectedSource, selectedLevel, selectedLines, sources.length])
-
-  const appendRuntimeLogLine = (line: string) => {
-    setPayload(current => {
-      const sourceInfo = current?.source ?? currentSource ?? {
-        id: selectedSource,
-        label: selectedSource,
-        path: selectedSource,
-        exists: true,
-        size_bytes: 0,
-        modified_at: null,
-      }
-      const nextLines = [...(current?.lines ?? []), line].slice(-selectedLines)
-      return {
-        source: sourceInfo,
-        lines: nextLines,
-        line_count: nextLines.length,
-        max_lines: selectedLines,
-        truncated: nextLines.length >= selectedLines,
-        read_at: new Date().toISOString(),
-      }
-    })
-  }
+  }, [appendRuntimeLogLine, liveMode, selectedLevel, selectedLines, selectedSource, sources.length])
 
   return (
     <div className="space-y-4">

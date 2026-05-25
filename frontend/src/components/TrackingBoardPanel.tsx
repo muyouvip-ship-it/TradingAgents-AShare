@@ -55,7 +55,7 @@ export default function TrackingBoardPanel() {
     const fileInputRef = useRef<HTMLInputElement>(null)
     const navigate = useNavigate()
 
-    const trackingItems = trackingBoard?.items || []
+    const trackingItems = useMemo(() => trackingBoard?.items || [], [trackingBoard?.items])
     const trackingRefreshSeconds = trackingBoard?.refresh_interval_seconds || 20
     const liveMarketValueTotal = trackingItems.reduce(
         (sum, item) => sum + (item.live_market_value ?? item.market_value ?? 0),

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 interface UseTypeWriterOptions {
     speed?: number        // 每字符间隔(ms)，默认30ms
@@ -35,49 +35,89 @@ export function useTypeWriter(
     const [displayed, setDisplayed] = useState('')
     const [isTyping, setIsTyping] = useState(false)
     const [hasCompleted, setHasCompleted] = useState(false)
+    const displayedRef = useRef('')
+    const hasCompletedRef = useRef(false)
+    const timeoutRef = useRef<number | null>(null)
+    const intervalRef = useRef<number | null>(null)
 
     useEffect(() => {
-        // 重置状态当文本变化时
-        if (!isActive) {
-            setDisplayed('')
-            setIsTyping(false)
-            setHasCompleted(false)
-            return
+        displayedRef.current = displayed
+    }, [displayed])
+
+    useEffect(() => {
+        hasCompletedRef.current = hasCompleted
+    }, [hasCompleted])
+
+    useEffect(() => {
+        if (timeoutRef.current != null) {
+            window.clearTimeout(timeoutRef.current)
+            timeoutRef.current = null
+        }
+        if (intervalRef.current != null) {
+            window.clearInterval(intervalRef.current)
+            intervalRef.current = null
         }
 
-        // 如果已经完成，不再重复
-        if (hasCompleted && displayed === text) {
-            return
-        }
+        timeoutRef.current = window.setTimeout(() => {
+            timeoutRef.current = null
 
-        // 如果文本为空，直接完成
-        if (!text) {
-            setIsTyping(false)
-            if (!hasCompleted) {
-                setHasCompleted(true)
-                onComplete?.()
-            }
-            return
-        }
-
-        setIsTyping(true)
-        let index = 0
-        setDisplayed('')
-
-        const timer = setInterval(() => {
-            if (index < text.length) {
-                setDisplayed(text.slice(0, index + 1))
-                index++
-            } else {
-                clearInterval(timer)
+            if (!isActive) {
+                displayedRef.current = ''
+                hasCompletedRef.current = false
+                setDisplayed('')
                 setIsTyping(false)
-                setHasCompleted(true)
-                onComplete?.()
+                setHasCompleted(false)
+                return
             }
+
+            if (hasCompletedRef.current && displayedRef.current === text) {
+                return
+            }
+
+            if (!text) {
+                setIsTyping(false)
+                if (!hasCompletedRef.current) {
+                    hasCompletedRef.current = true
+                    setHasCompleted(true)
+                    onComplete?.()
+                }
+                return
+            }
+
+            setIsTyping(true)
+            displayedRef.current = ''
+            setDisplayed('')
+            let index = 0
+            intervalRef.current = window.setInterval(() => {
+                if (index < text.length) {
+                    const next = text.slice(0, index + 1)
+                    displayedRef.current = next
+                    setDisplayed(next)
+                    index++
+                } else {
+                    if (intervalRef.current != null) {
+                        window.clearInterval(intervalRef.current)
+                        intervalRef.current = null
+                    }
+                    setIsTyping(false)
+                    hasCompletedRef.current = true
+                    setHasCompleted(true)
+                    onComplete?.()
+                }
+            }, speed)
         }, speed)
 
-        return () => clearInterval(timer)
-    }, [text, isActive, speed, onComplete, hasCompleted, displayed])
+        return () => {
+            if (timeoutRef.current != null) {
+                window.clearTimeout(timeoutRef.current)
+                timeoutRef.current = null
+            }
+            if (intervalRef.current != null) {
+                window.clearInterval(intervalRef.current)
+                intervalRef.current = null
+            }
+        }
+    }, [text, isActive, speed, onComplete])
 
     const progress = text.length > 0 ? displayed.length / text.length : 0
 
@@ -107,44 +147,86 @@ export function useStreamingSection(
     const [displayed, setDisplayed] = useState('')
     const [isTyping, setIsTyping] = useState(false)
     const [isComplete, setIsComplete] = useState(false)
+    const displayedRef = useRef('')
+    const completeRef = useRef(false)
+    const timeoutRef = useRef<number | null>(null)
+    const intervalRef = useRef<number | null>(null)
 
     useEffect(() => {
-        if (!isActive || chunks.length === 0) {
-            if (!isActive) {
-                setDisplayed('')
+        displayedRef.current = displayed
+    }, [displayed])
+
+    useEffect(() => {
+        completeRef.current = isComplete
+    }, [isComplete])
+
+    useEffect(() => {
+        if (timeoutRef.current != null) {
+            window.clearTimeout(timeoutRef.current)
+            timeoutRef.current = null
+        }
+        if (intervalRef.current != null) {
+            window.clearInterval(intervalRef.current)
+            intervalRef.current = null
+        }
+
+        timeoutRef.current = window.setTimeout(() => {
+            timeoutRef.current = null
+            if (!isActive || chunks.length === 0) {
+                if (!isActive) {
+                    displayedRef.current = ''
+                    setDisplayed('')
+                }
                 setIsTyping(false)
                 setIsComplete(false)
+                completeRef.current = false
+                return
             }
-            return
-        }
 
-        // 合并所有片段
-        const fullText = chunks.join('')
-        
-        // 如果已经显示完整内容，标记完成
-        if (displayed === fullText && fullText.length > 0) {
-            setIsTyping(false)
-            setIsComplete(true)
-            return
-        }
-
-        setIsTyping(true)
-        setIsComplete(false)
-
-        const timer = setInterval(() => {
-            setDisplayed(prev => {
-                if (prev.length < fullText.length) {
-                    return fullText.slice(0, prev.length + 1)
-                }
-                clearInterval(timer)
+            const fullText = chunks.join('')
+            if (displayedRef.current === fullText && fullText.length > 0) {
                 setIsTyping(false)
                 setIsComplete(true)
-                return prev
-            })
-        }, speed)
+                completeRef.current = true
+                return
+            }
 
-        return () => clearInterval(timer)
-    }, [chunks, isActive, speed, displayed])
+            setIsTyping(true)
+            setIsComplete(false)
+            completeRef.current = false
+
+            let index = 0
+            displayedRef.current = ''
+            setDisplayed('')
+            intervalRef.current = window.setInterval(() => {
+                if (index < fullText.length) {
+                    const next = fullText.slice(0, index + 1)
+                    displayedRef.current = next
+                    setDisplayed(next)
+                    index++
+                    return
+                }
+                if (intervalRef.current != null) {
+                    window.clearInterval(intervalRef.current)
+                    intervalRef.current = null
+                }
+                setIsTyping(false)
+                setIsComplete(true)
+                completeRef.current = true
+            }, speed)
+        }, 0)
+
+        return () => {
+            if (timeoutRef.current != null) {
+                window.clearTimeout(timeoutRef.current)
+                timeoutRef.current = null
+            }
+            if (intervalRef.current != null) {
+                window.clearInterval(intervalRef.current)
+                intervalRef.current = null
+            }
+        }
+    }, [chunks, isActive, speed])
 
     return { displayed, isTyping, isComplete }
 }

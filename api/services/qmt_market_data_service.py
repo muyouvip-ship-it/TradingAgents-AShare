@@ -1217,21 +1217,6 @@ def _upsert_intraday_rows(table_name: str, rows: list[dict[str, Any]]) -> int:
         payload.append(row)
     if not payload:
         return 0
-    stock_minute_target = table_name in {"stock_minute_kline", "pub_stock_minute_kline", "market_stock_minute_kline"}
-    if stock_minute_target and os.getenv("MARKET_DATA_WRITE_LEGACY_TABLES", "0").strip().lower() not in {"1", "true", "yes", "on"}:
-        try:
-            result = ingest_raw_minute_rows(source="qmt", rows=payload)
-            for trade_day in result.get("trade_dates") or []:
-                affected_symbols = sorted({str(item["symbol"]) for item in payload if item.get("symbol")})
-                publish_minute_trade_date(
-                    trade_date=trade_day,
-                    symbols=affected_symbols or None,
-                    minimum_coverage_ratio=0.0,
-                )
-        except Exception as exc:
-            logger.warning("[qmt-market] raw/published minute pipeline update failed rows=%s error=%s", len(payload), exc)
-            return 0
-        return len(payload)
     insert_columns = ["symbol", "trade_time", "open", "high", "low", "close", "volume", "amount"]
     if has_created_at:
         insert_columns.append("created_at")

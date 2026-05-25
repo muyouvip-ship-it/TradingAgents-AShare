@@ -390,7 +390,7 @@ def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -
 
 def _resolve_market_daily_actual_end(db, *, symbols: list[str] | None) -> date | None:
     values: list[date] = []
-    for table_name in ("pub_stock_daily_kline", "stock_daily_kline"):
+    for table_name in ("stock_daily_kline", "pub_stock_daily_kline"):
         if not _relation_exists(db, table_name):
             continue
         if symbols:

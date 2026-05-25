@@ -9,9 +9,9 @@ DEFAULT_CONFIG = {
     ),
     # LLM settings
     "llm_provider": os.getenv("TA_LLM_PROVIDER", "openai"),
-    "deep_think_llm": os.getenv("TA_LLM_DEEP", "gpt-4o"),
-    "quick_think_llm": os.getenv("TA_LLM_QUICK", "gpt-4o-mini"),
-    "backend_url": os.getenv("TA_BASE_URL", "https://api.openai.com/v1"),
+    "deep_think_llm": os.getenv("TA_LLM_DEEP", "astron-code-latest"),
+    "quick_think_llm": os.getenv("TA_LLM_QUICK", "astron-code-latest"),
+    "backend_url": os.getenv("TA_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"),
     "api_key": os.getenv("TA_API_KEY", ""),
     
     # Provider-specific thinking configuration

@@ -1,5 +1,5 @@
 import { AlertCircle, CheckCircle2, Loader2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import type { TaskFeedbackStatus } from '@/utils/progressFeedback'
 
@@ -21,22 +21,30 @@ export default function TaskProgressBanner({
     className = '',
 }: TaskProgressBannerProps) {
     const [visible, setVisible] = useState(status !== 'idle')
+    const showTimerRef = useRef<number | null>(null)
+    const hideTimerRef = useRef<number | null>(null)
 
     useEffect(() => {
+        if (showTimerRef.current != null) {
+            window.clearTimeout(showTimerRef.current)
+            showTimerRef.current = null
+        }
+        if (hideTimerRef.current != null) {
+            window.clearTimeout(hideTimerRef.current)
+            hideTimerRef.current = null
+        }
+
         if (status === 'idle') {
-            setVisible(false)
+            showTimerRef.current = window.setTimeout(() => setVisible(false), 0)
             return
         }
 
-        setVisible(true)
+        showTimerRef.current = window.setTimeout(() => setVisible(true), 0)
 
         if (status === 'success' || status === 'error') {
-            const timer = window.setTimeout(() => setVisible(false), STATUS_HOLD_MS)
-            return () => window.clearTimeout(timer)
+            hideTimerRef.current = window.setTimeout(() => setVisible(false), STATUS_HOLD_MS)
         }
-
-        return undefined
-    }, [status, label, detail, progress])
+    }, [status])
 
     if (!visible || status === 'idle') return null
 

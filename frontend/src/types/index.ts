@@ -602,6 +602,7 @@ export interface NewsThemeRankingItem {
     neutral_count?: number
     consensus_rate?: number | null
     source_tier: 'S' | 'A' | 'B' | 'C' | string
+    top_source_tier?: 'S' | 'A' | 'B' | 'C' | string
     policy_boost: boolean
     disagreement_level: 'none' | 'healthy' | 'high' | string
     crowding_risk?: string | null

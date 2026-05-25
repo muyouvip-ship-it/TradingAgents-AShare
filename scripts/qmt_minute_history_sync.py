@@ -928,7 +928,7 @@ def _ensure_minute_table(engine) -> None:
                 conn.execute(text("ALTER TABLE stock_minute_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
             if "updated_at" not in columns:
                 conn.execute(text("ALTER TABLE stock_minute_kline ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_minute_kline_symbol_time ON stock_minute_kline(symbol, trade_time)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_minute_time ON stock_minute_kline(trade_time)"))
 
 
 def _import_frame_to_db(frame: pd.DataFrame, engine) -> int:

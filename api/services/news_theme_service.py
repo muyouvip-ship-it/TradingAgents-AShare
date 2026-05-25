@@ -5,14 +5,23 @@ import json
 import logging
 import math
 import os
-from collections import defaultdict
+import re
+import threading
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+from api.database import SessionLocal
+from api.core.runtime_config import build_runtime_config
+from api.core.stock_map import get_reverse_stock_map
+from api.services import auth_service
+from tradingagents.llm_clients.factory import create_llm_client
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +29,18 @@ logger = logging.getLogger(__name__)
 CN_TZ = ZoneInfo("Asia/Shanghai")
 SUPPORTED_WINDOWS = ("premarket", "24h", "72h", "7d")
 SUPPORTED_HORIZONS = {"1d": 1, "3d": 3, "5d": 5}
+SYMBOL_SUGGESTION_CACHE_VERSION = "theme-core-stocks-v3"
+LLM_SYMBOL_THEME_LIMIT = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_THEME_LIMIT", "12")), 1)
+LLM_SYMBOL_PER_THEME_LIMIT = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_PER_THEME_LIMIT", "8")), 1)
+LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_ERROR_TTL_SECONDS", "600")), 0)
+LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS", "300")), 0)
+LLM_SYMBOL_TIMEOUT_SECONDS = max(float(os.getenv("NEWS_THEME_LLM_SYMBOL_TIMEOUT_SECONDS", "120")), 5.0)
+LLM_SYMBOL_EVIDENCE_LIMIT = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_EVIDENCE_LIMIT", "3")), 1)
+LLM_SYMBOL_EVIDENCE_CHARS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_EVIDENCE_CHARS", "160")), 80)
+
+_CORE_STOCK_SUGGESTION_TASKS: set[str] = set()
+_CORE_STOCK_SUGGESTION_TASKS_LOCK = threading.Lock()
+_CORE_STOCK_LAST_FAILURE_AT: dict[str, datetime] = {}
 
 POLICY_AUTHORITY_KEYWORDS = (
     "中共中央",
@@ -65,6 +86,23 @@ TIER_A_KEYWORDS = (
 TIER_C_KEYWORDS = ("传闻", "网传", "小作文", "据传", "未经证实")
 STRONG_POSITIVE_KEYWORDS = ("超预期", "大幅增长", "中标", "获批", "涨价", "补贴", "专项", "突破")
 NEGATIVE_RISK_KEYWORDS = ("澄清", "减持", "监管", "处罚", "调查", "亏损", "不及预期", "退市", "风险")
+RESEARCH_SOURCE_SYMBOL_VERBS = (
+    "表示",
+    "指出",
+    "认为",
+    "称",
+    "研报",
+    "维持",
+    "上调",
+    "下调",
+    "给予",
+    "目标价",
+    "买入评级",
+    "看好",
+    "建议关注",
+    "预计",
+)
+THEME_SYMBOL_CLAUSE_SPLIT_PATTERN = re.compile(r"[。！？!?\n；;]+|(?<=\S)，")
 
 THEME_CATALOG: dict[str, dict[str, Any]] = {
     "算力": {
@@ -218,6 +256,24 @@ def ensure_theme_tables(db: Session) -> None:
             """
         )
     )
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS market_news_theme_symbol_suggestions (
+                cache_key VARCHAR(64) PRIMARY KEY,
+                window_label VARCHAR(20) NOT NULL,
+                evidence_hash VARCHAR(64) NOT NULL,
+                provider VARCHAR(40),
+                model VARCHAR(120),
+                suggestions_json TEXT DEFAULT '{}',
+                error TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+    )
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_theme_symbol_suggestions_window ON market_news_theme_symbol_suggestions (window_label, updated_at DESC)"))
     db.commit()
 
 
@@ -227,8 +283,9 @@ def list_theme_rankings(
     window: str = "premarket",
     limit: int = 20,
     include_evidence: bool = True,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
-    rows = refresh_theme_rankings(db, windows=(window,), limit=limit, persist=True).get(window, [])
+    rows = refresh_theme_rankings(db, windows=(window,), limit=limit, persist=True, user_id=user_id).get(window, [])
     if not include_evidence:
         rows = [{**row, "evidence_items": []} for row in rows]
     return {
@@ -247,6 +304,7 @@ def refresh_theme_rankings(
     limit: int = 20,
     persist: bool = True,
     now: datetime | None = None,
+    user_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     ensure_theme_tables(db)
     current = _normalize_dt(now) or _now_cn_naive()
@@ -263,6 +321,14 @@ def refresh_theme_rankings(
             window_end=window_end,
             market_confirmation=market_confirmation,
             limit=limit,
+        )
+        ranking = _apply_llm_core_stock_suggestions(
+            db,
+            ranking,
+            window=window,
+            window_start=window_start,
+            window_end=window_end,
+            user_id=user_id,
         )
         if persist:
             _persist_ranking_snapshot(
@@ -442,6 +508,7 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
 
     source_tiers = [event.source_tier for event in events]
     top_tier = _top_source_tier(source_tiers)
+    dominant_tier = _dominant_source_tier(events)
     policy_boost = any(event.policy_boost for event in events)
     source_count = len({event.source for event in events if event.source})
     related_symbols = _collect_related_symbols(events)
@@ -466,7 +533,7 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
     score = max(score, 0.0)
 
     evidence = _build_evidence(events)
-    summary = _build_summary(theme, message_count, negative_count, top_tier, policy_boost, consensus_rate)
+    summary = _build_summary(theme, message_count, negative_count, dominant_tier, policy_boost, consensus_rate)
     catalyst = _build_catalyst(evidence, raw_tags, confirmation)
     risk_note = _build_risk_note(crowding_risk, disagreement_level, negative_events)
     return {
@@ -479,11 +546,13 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
         "negative_count": negative_count,
         "neutral_count": len({event.digest for event in neutral_events}),
         "consensus_rate": consensus_rate,
-        "source_tier": top_tier,
+        "source_tier": dominant_tier,
+        "top_source_tier": top_tier,
         "policy_boost": policy_boost,
         "disagreement_level": disagreement_level,
         "crowding_risk": crowding_risk,
         "related_symbols": related_symbols,
+        "symbol_suggestion_source": "fallback:positive_news",
         "raw_tags": raw_tags,
         "summary": summary,
         "catalyst": catalyst,
@@ -493,31 +562,539 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
     }
 
 
+def _apply_llm_core_stock_suggestions(
+    db: Session,
+    ranking: list[dict[str, Any]],
+    *,
+    window: str,
+    window_start: datetime,
+    window_end: datetime,
+    user_id: str | None,
+) -> list[dict[str, Any]]:
+    if not ranking or not user_id or not _llm_symbol_suggestions_enabled():
+        return ranking
+
+    prompt_items = _build_core_stock_prompt_items(ranking[:LLM_SYMBOL_THEME_LIMIT])
+    if not prompt_items:
+        return ranking
+
+    config = _resolve_core_stock_llm_config(db, user_id=user_id)
+    if not config:
+        return ranking
+
+    config_hash = _make_core_stock_config_hash(config)
+    evidence_hash = _make_core_stock_evidence_hash(prompt_items)
+    cache_key = _make_core_stock_cache_key(window, evidence_hash, config_hash)
+    cached = _load_core_stock_suggestion_cache(db, cache_key)
+    if cached is not None:
+        return _merge_core_stock_suggestions(ranking, cached, source="llm:cache")
+
+    if not _llm_symbol_suggestions_sync_enabled():
+        _queue_core_stock_suggestion_refresh(
+            config=config,
+            cache_key=cache_key,
+            window=window,
+            evidence_hash=evidence_hash,
+            window_start=window_start,
+            window_end=window_end,
+            prompt_items=prompt_items,
+        )
+        return ranking
+
+    try:
+        raw_suggestions = _invoke_core_stock_llm(
+            config,
+            {
+                "window": window,
+                "window_start": _iso(window_start),
+                "window_end": _iso(window_end),
+                "themes": prompt_items,
+            },
+        )
+        suggestions = _normalize_core_stock_suggestions(raw_suggestions)
+        _store_core_stock_suggestion_cache(
+            db,
+            cache_key=cache_key,
+            window=window,
+            evidence_hash=evidence_hash,
+            provider=str(config.get("provider") or ""),
+            model=str(config.get("model") or ""),
+            suggestions=suggestions,
+            error=None,
+        )
+        return _merge_core_stock_suggestions(
+            ranking,
+            suggestions,
+            source=f"llm:{config.get('provider')}/{config.get('model')}",
+        )
+    except Exception as exc:
+        logger.warning("[news-theme] LLM core stock suggestions failed: %s", exc)
+        _store_core_stock_suggestion_cache(
+            db,
+            cache_key=cache_key,
+            window=window,
+            evidence_hash=evidence_hash,
+            provider=str(config.get("provider") or ""),
+            model=str(config.get("model") or ""),
+            suggestions={},
+            error=str(exc)[:500],
+        )
+        return ranking
+
+
+def _llm_symbol_suggestions_enabled() -> bool:
+    return os.getenv("NEWS_THEME_LLM_SYMBOLS", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _llm_symbol_suggestions_sync_enabled() -> bool:
+    return os.getenv("NEWS_THEME_LLM_SYMBOLS_SYNC", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _queue_core_stock_suggestion_refresh(
+    *,
+    config: dict[str, Any],
+    cache_key: str,
+    window: str,
+    evidence_hash: str,
+    window_start: datetime,
+    window_end: datetime,
+    prompt_items: list[dict[str, Any]],
+) -> bool:
+    config_hash = _make_core_stock_config_hash(config)
+    with _CORE_STOCK_SUGGESTION_TASKS_LOCK:
+        if _CORE_STOCK_SUGGESTION_TASKS:
+            return False
+        if _core_stock_global_failure_cooldown_active(_now_cn_naive(), config_hash=config_hash):
+            return False
+        if cache_key in _CORE_STOCK_SUGGESTION_TASKS:
+            return False
+        _CORE_STOCK_SUGGESTION_TASKS.add(cache_key)
+
+    thread = threading.Thread(
+        target=_refresh_core_stock_suggestion_cache_background,
+        kwargs={
+            "config": dict(config),
+            "cache_key": cache_key,
+            "window": window,
+            "evidence_hash": evidence_hash,
+            "window_start": window_start,
+            "window_end": window_end,
+            "prompt_items": prompt_items,
+        },
+        name=f"news-theme-llm-{cache_key[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def _refresh_core_stock_suggestion_cache_background(
+    *,
+    config: dict[str, Any],
+    cache_key: str,
+    window: str,
+    evidence_hash: str,
+    window_start: datetime,
+    window_end: datetime,
+    prompt_items: list[dict[str, Any]],
+) -> None:
+    failed = False
+    config_hash = _make_core_stock_config_hash(config)
+    try:
+        raw_suggestions = _invoke_core_stock_llm(
+            config,
+            {
+                "window": window,
+                "window_start": _iso(window_start),
+                "window_end": _iso(window_end),
+                "themes": prompt_items,
+            },
+        )
+        suggestions = _normalize_core_stock_suggestions(raw_suggestions)
+        _store_core_stock_suggestion_cache_in_new_session(
+            cache_key=cache_key,
+            window=window,
+            evidence_hash=evidence_hash,
+            provider=str(config.get("provider") or ""),
+            model=str(config.get("model") or ""),
+            suggestions=suggestions,
+            error=None,
+        )
+        logger.info(
+            "[news-theme] LLM core stock suggestions cached window=%s themes=%s",
+            window,
+            len(suggestions),
+        )
+    except Exception as exc:
+        failed = True
+        logger.warning("[news-theme] LLM core stock suggestions async failed: %s", exc)
+        _store_core_stock_suggestion_cache_in_new_session(
+            cache_key=cache_key,
+            window=window,
+            evidence_hash=evidence_hash,
+            provider=str(config.get("provider") or ""),
+            model=str(config.get("model") or ""),
+            suggestions={},
+            error=str(exc)[:500],
+        )
+    finally:
+        with _CORE_STOCK_SUGGESTION_TASKS_LOCK:
+            _CORE_STOCK_SUGGESTION_TASKS.discard(cache_key)
+            if failed:
+                _CORE_STOCK_LAST_FAILURE_AT[config_hash] = _now_cn_naive()
+            else:
+                _CORE_STOCK_LAST_FAILURE_AT.pop(config_hash, None)
+
+
+def _core_stock_global_failure_cooldown_active(now: datetime, *, config_hash: str) -> bool:
+    if LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS <= 0:
+        return False
+    failed_at = _CORE_STOCK_LAST_FAILURE_AT.get(config_hash)
+    if failed_at is None:
+        return False
+    return (now - failed_at).total_seconds() < LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS
+
+
+def _store_core_stock_suggestion_cache_in_new_session(
+    *,
+    cache_key: str,
+    window: str,
+    evidence_hash: str,
+    provider: str,
+    model: str,
+    suggestions: dict[str, list[dict[str, str]]],
+    error: str | None,
+) -> None:
+    try:
+        with SessionLocal() as db:
+            ensure_theme_tables(db)
+            _store_core_stock_suggestion_cache(
+                db,
+                cache_key=cache_key,
+                window=window,
+                evidence_hash=evidence_hash,
+                provider=provider,
+                model=model,
+                suggestions=suggestions,
+                error=error,
+            )
+            db.commit()
+    except Exception:
+        logger.exception("[news-theme] failed to store LLM core stock suggestions cache")
+
+
+def _build_core_stock_prompt_items(ranking: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prompt_items: list[dict[str, Any]] = []
+    for item in ranking:
+        evidence = _positive_or_policy_evidence(item)
+        if not evidence:
+            continue
+        prompt_items.append(
+            {
+                "theme": item.get("theme"),
+                "parent_theme": item.get("parent_theme"),
+                "summary": str(item.get("summary") or "")[:120],
+                "catalyst": str(item.get("catalyst") or "")[:120],
+                "raw_tags": item.get("raw_tags") or [],
+                "evidence": evidence,
+            }
+        )
+    return prompt_items
+
+
+def _positive_or_policy_evidence(item: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for row in item.get("evidence_items") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("sentiment") != "positive" and not row.get("policy_boost"):
+            continue
+        evidence.append(
+            {
+                "source": row.get("source"),
+                "source_tier": row.get("source_tier"),
+                "published_at": row.get("published_at"),
+                "raw_tags": row.get("raw_tags") or [],
+                "content": str(row.get("content") or "")[:LLM_SYMBOL_EVIDENCE_CHARS],
+            }
+        )
+        if len(evidence) >= LLM_SYMBOL_EVIDENCE_LIMIT:
+            break
+    return evidence
+
+
+def _make_core_stock_evidence_hash(prompt_items: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(json.dumps(prompt_items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _make_core_stock_config_hash(config: dict[str, Any]) -> str:
+    api_key = str(config.get("api_key") or "")
+    payload = {
+        "provider": str(config.get("provider") or "").strip().lower(),
+        "model": str(config.get("model") or "").strip(),
+        "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
+        "api_key_hash": hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else "",
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _make_core_stock_cache_key(window: str, evidence_hash: str, config_hash: str) -> str:
+    raw = f"{SYMBOL_SUGGESTION_CACHE_VERSION}|{window}|{config_hash}|{evidence_hash}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_core_stock_suggestion_cache(db: Session, cache_key: str) -> dict[str, list[dict[str, str]]] | None:
+    row = db.execute(
+        text(
+            """
+            SELECT suggestions_json, error, updated_at
+            FROM market_news_theme_symbol_suggestions
+            WHERE cache_key = :cache_key
+            """
+        ),
+        {"cache_key": cache_key},
+    ).mappings().first()
+    if not row:
+        return None
+    if row.get("error"):
+        updated_at = _safe_datetime(row.get("updated_at"))
+        if (
+            LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS > 0
+            and updated_at is not None
+            and (_now_cn_naive() - updated_at).total_seconds() <= LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS
+        ):
+            return {}
+        return None
+    payload = _loads(row.get("suggestions_json"), default={})
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_core_stock_suggestion_cache(
+    db: Session,
+    *,
+    cache_key: str,
+    window: str,
+    evidence_hash: str,
+    provider: str,
+    model: str,
+    suggestions: dict[str, list[dict[str, str]]],
+    error: str | None,
+) -> None:
+    now = _iso(_now_cn_naive())
+    db.execute(
+        text(
+            """
+            INSERT INTO market_news_theme_symbol_suggestions (
+                cache_key, window_label, evidence_hash, provider, model, suggestions_json, error, created_at, updated_at
+            )
+            VALUES (
+                :cache_key, :window_label, :evidence_hash, :provider, :model, :suggestions_json, :error, :created_at, :updated_at
+            )
+            ON CONFLICT (cache_key) DO UPDATE SET
+                provider = EXCLUDED.provider,
+                model = EXCLUDED.model,
+                suggestions_json = EXCLUDED.suggestions_json,
+                error = EXCLUDED.error,
+                updated_at = EXCLUDED.updated_at
+            """
+        ),
+        {
+            "cache_key": cache_key,
+            "window_label": window,
+            "evidence_hash": evidence_hash,
+            "provider": provider or None,
+            "model": model or None,
+            "suggestions_json": json.dumps(suggestions or {}, ensure_ascii=False),
+            "error": error,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+
+def _resolve_core_stock_llm_config(db: Session, *, user_id: str) -> dict[str, Any] | None:
+    config = build_runtime_config({}, user_id=user_id, db=db)
+    user_cfg = auth_service.get_user_llm_config(db, user_id)
+    provider = str(config.get("llm_provider") or "").strip().lower()
+    base_url = str(config.get("backend_url") or "").strip()
+    model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
+    api_key = str(config.get("api_key") or "").strip()
+    if user_cfg:
+        news_provider = str(getattr(user_cfg, "news_llm_provider", None) or "").strip().lower()
+        news_backend_url = str(getattr(user_cfg, "news_backend_url", None) or "").strip()
+        news_model = str(getattr(user_cfg, "news_analysis_llm", None) or "").strip()
+        news_api_key = auth_service.decrypt_secret(getattr(user_cfg, "news_api_key_encrypted", None))
+        provider = news_provider or provider
+        base_url = news_backend_url or base_url
+        model = news_model or model
+        api_key = news_api_key or api_key
+    if not provider or not model:
+        return None
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url or None,
+        "api_key": api_key or None,
+    }
+
+
+_CORE_STOCK_SYSTEM_PROMPT = """你是A股主题投研助手。你需要根据利好资讯和政策证据，为每个主题给出最相关的A股核心标的。
+
+要求：
+1. 只输出JSON，不要输出Markdown或解释。
+2. 输出格式：{"items":[{"theme":"人工智能","symbols":[{"symbol":"603019.SH","name":"中科曙光","reason":"算力基础设施核心受益"}]}]}
+3. 只能推荐A股股票，symbol必须使用 .SH/.SZ/.BJ 后缀。
+4. 不要把券商、基金、期货、媒体、交易所、海外公司或研报发布方当成受益标的。
+5. 每个主题最多8只，优先核心龙头、产业链直接受益、政策明确指向或证据中提及的标的。
+6. 如果证据不足以支撑具体标的，symbols返回空数组。"""
+
+
+def _invoke_core_stock_llm(config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    client_kwargs: dict[str, Any] = {}
+    if config.get("api_key"):
+        client_kwargs["api_key"] = config["api_key"]
+    client = create_llm_client(
+        provider=str(config["provider"]),
+        model=str(config["model"]),
+        base_url=config.get("base_url"),
+        timeout=LLM_SYMBOL_TIMEOUT_SECONDS,
+        **client_kwargs,
+    )
+    llm = client.get_llm()
+    result = llm.invoke(
+        [
+            SystemMessage(content=_CORE_STOCK_SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps(context, ensure_ascii=False)),
+        ]
+    )
+    raw = str(getattr(result, "content", "") or "").strip()
+    parsed = _parse_json_object(raw)
+    if not parsed:
+        raise ValueError("LLM core stock response is not valid JSON")
+    return parsed
+
+
+def _parse_json_object(raw: str) -> dict[str, Any] | None:
+    text_value = str(raw or "").strip()
+    if not text_value:
+        return None
+    text_value = re.sub(r"^```(?:json)?\s*", "", text_value, flags=re.IGNORECASE | re.MULTILINE)
+    text_value = re.sub(r"\s*```$", "", text_value, flags=re.MULTILINE)
+    candidates = [text_value]
+    match = re.search(r"\{.*\}", text_value, flags=re.DOTALL)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(re.sub(r",\s*([\]}])", r"\1", candidate.strip()))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_core_stock_suggestions(payload: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    rows = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    reverse_map = get_reverse_stock_map()
+    code_to_symbol = {symbol.split(".", 1)[0]: symbol for symbol in reverse_map if "." in symbol}
+    name_to_symbol = {str(name).strip(): symbol for symbol, name in reverse_map.items() if str(name).strip()}
+    normalized: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        theme = str(row.get("theme") or "").strip()
+        if not theme:
+            continue
+        stocks = row.get("symbols") or row.get("stocks") or []
+        if not isinstance(stocks, list):
+            continue
+        seen: set[str] = set()
+        items: list[dict[str, str]] = []
+        for stock in stocks:
+            if not isinstance(stock, dict):
+                continue
+            symbol = _resolve_llm_stock_symbol(
+                raw_symbol=str(stock.get("symbol") or "").strip().upper(),
+                raw_name=str(stock.get("name") or "").strip(),
+                code_to_symbol=code_to_symbol,
+                name_to_symbol=name_to_symbol,
+            )
+            if not symbol or symbol in seen or symbol not in reverse_map:
+                continue
+            name = reverse_map.get(symbol, symbol)
+            if theme != "金融" and any(token in str(name) for token in ("证券", "期货", "基金")):
+                continue
+            seen.add(symbol)
+            items.append({"symbol": symbol, "name": str(name)})
+            if len(items) >= LLM_SYMBOL_PER_THEME_LIMIT:
+                break
+        normalized[theme] = items
+    return normalized
+
+
+def _resolve_llm_stock_symbol(
+    *,
+    raw_symbol: str,
+    raw_name: str,
+    code_to_symbol: dict[str, str],
+    name_to_symbol: dict[str, str],
+) -> str | None:
+    if raw_symbol:
+        symbol = raw_symbol
+        if "." not in symbol and len(symbol) == 6 and symbol.isdigit():
+            symbol = code_to_symbol.get(symbol, "")
+        if symbol:
+            return symbol
+    if raw_name:
+        return name_to_symbol.get(raw_name)
+    return None
+
+
+def _merge_core_stock_suggestions(
+    ranking: list[dict[str, Any]],
+    suggestions: dict[str, list[dict[str, str]]],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    if not suggestions:
+        return ranking
+    for item in ranking:
+        theme = str(item.get("theme") or "")
+        if theme not in suggestions:
+            continue
+        item["related_symbols"] = suggestions.get(theme) or []
+        item["symbol_suggestion_source"] = source
+    return ranking
+
+
 def _row_to_theme_events(row: Any, *, now: datetime) -> list[ThemeEvent]:
     content = str(row["content"] or "")
     source = str(row["source"] or "未知来源")
     published_at = _safe_datetime(row["published_at"]) or now
     positive_sectors = _loads(row["positive_sectors_json"])
     negative_sectors = _loads(row["negative_sectors_json"])
-    related_symbols = _loads(row["related_symbols_json"])
+    positive_symbols = _symbol_payloads(_loads(row.get("positive_symbols_json")))
     sentiment = str(row["sentiment"] or "neutral")
     tier, policy_boost = classify_source_tier(source, content)
 
     theme_sentiments: dict[str, dict[str, Any]] = {}
     for raw in positive_sectors:
         theme, raw_tags = normalize_theme_name(str(raw), content)
-        if theme:
+        if theme and _theme_tag_matches_content(theme, str(raw), content):
             theme_sentiments.setdefault(theme, {"sentiment": "positive", "raw_tags": []})
             theme_sentiments[theme]["raw_tags"].extend(raw_tags or [str(raw)])
     for raw in negative_sectors:
         theme, raw_tags = normalize_theme_name(str(raw), content)
-        if theme:
+        if theme and _theme_tag_matches_content(theme, str(raw), content):
             current = theme_sentiments.setdefault(theme, {"sentiment": "negative", "raw_tags": []})
             if current["sentiment"] != "positive":
                 current["sentiment"] = "negative"
             current["raw_tags"].extend(raw_tags or [str(raw)])
     for alias, theme in ALIAS_TO_THEME:
-        if alias in content:
+        if _theme_alias_has_valid_match(theme, alias, content):
             current = theme_sentiments.setdefault(theme, {"sentiment": sentiment, "raw_tags": []})
             current["raw_tags"].append(alias)
             if current["sentiment"] == "neutral" and sentiment in {"positive", "negative"}:
@@ -548,11 +1125,143 @@ def _row_to_theme_events(row: Any, *, now: datetime) -> list[ThemeEvent]:
                 published_at=published_at,
                 content=content,
                 url=row.get("url"),
-                related_symbols=related_symbols if isinstance(related_symbols, list) else [],
+                related_symbols=_theme_related_symbol_candidates(
+                    theme=theme,
+                    raw_tags=_dedupe_strings(data.get("raw_tags") or []),
+                    content=content,
+                    positive_symbols=positive_symbols,
+                    sentiment=event_sentiment,
+                    policy_boost=policy_boost,
+                ),
                 event_score=event_score,
             )
         )
     return events
+
+
+def _theme_related_symbol_candidates(
+    *,
+    theme: str,
+    raw_tags: list[str],
+    content: str,
+    positive_symbols: list[dict[str, str]],
+    sentiment: str,
+    policy_boost: bool,
+) -> list[dict[str, str]]:
+    if sentiment != "positive" and not policy_boost:
+        return []
+    if not positive_symbols:
+        return []
+
+    aliases = _theme_relevance_aliases(theme, raw_tags)
+    clauses = _split_theme_symbol_clauses(content)
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in positive_symbols:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        name = str(item.get("name") or "").strip()
+        if not _symbol_appears_in_theme_clause(theme=theme, symbol=symbol, name=name, aliases=aliases, clauses=clauses):
+            continue
+        seen.add(symbol)
+        result.append({"symbol": symbol, "name": name})
+        if len(result) >= 10:
+            break
+    return result
+
+
+def _theme_relevance_aliases(theme: str, raw_tags: list[str]) -> list[str]:
+    aliases = [theme]
+    aliases.extend(THEME_CATALOG.get(theme, {}).get("aliases", ()))
+    aliases.extend(raw_tags or [])
+    return _dedupe_strings(alias for alias in aliases if len(str(alias or "").strip()) >= 2)
+
+
+def _theme_tag_matches_content(theme: str, raw_tag: str, content: str) -> bool:
+    tag = str(raw_tag or "").strip()
+    if not tag:
+        return False
+    known_aliases = set(THEME_CATALOG.get(theme, {}).get("aliases", ())) | {theme}
+    if tag in known_aliases:
+        return _theme_alias_has_valid_match(theme, tag, content)
+    return True
+
+
+def _theme_alias_has_valid_match(theme: str, alias: str, text_value: str) -> bool:
+    alias_text = str(alias or "").strip()
+    if not alias_text:
+        return False
+    for match in re.finditer(re.escape(alias_text), str(text_value or "")):
+        if _ignore_theme_alias_match(theme=theme, alias=alias_text, text_value=str(text_value or ""), match=match):
+            continue
+        return True
+    return False
+
+
+def _ignore_theme_alias_match(*, theme: str, alias: str, text_value: str, match: re.Match[str]) -> bool:
+    if theme != "金融":
+        return False
+
+    before = text_value[max(match.start() - 8, 0):match.start()]
+    after = text_value[match.end():match.end() + 24]
+    context = f"{before}{alias}{after}"
+    if alias == "金融" and after.startswith("街"):
+        return True
+    if alias not in {"证券", "券商"}:
+        return False
+    if "证券报" in context:
+        return True
+    if not re.search(r"[\u4e00-\u9fff]{1,6}$", before):
+        return False
+    if after.startswith(("：", ":", "研报", "发布", "表示", "指出", "认为", "称", "维持", "上调", "下调", "给予", "建议", "点评")):
+        return True
+    return any(verb in after[:14] for verb in RESEARCH_SOURCE_SYMBOL_VERBS)
+
+
+def _split_theme_symbol_clauses(content: str) -> list[str]:
+    text_value = str(content or "").strip()
+    if not text_value:
+        return []
+    clauses = [part.strip(" ，,") for part in THEME_SYMBOL_CLAUSE_SPLIT_PATTERN.split(text_value) if part.strip(" ，,")]
+    return clauses or [text_value]
+
+
+def _symbol_appears_in_theme_clause(*, theme: str, symbol: str, name: str, aliases: list[str], clauses: list[str]) -> bool:
+    symbol_code = symbol.split(".", 1)[0]
+    for clause in clauses:
+        if not _symbol_appears_in_text(symbol=symbol, symbol_code=symbol_code, name=name, text_value=clause):
+            continue
+        if any(_theme_alias_has_valid_match(theme, alias, clause) for alias in aliases):
+            return True
+    return False
+
+
+def _symbol_appears_in_text(*, symbol: str, symbol_code: str, name: str, text_value: str) -> bool:
+    return bool(
+        (name and name in text_value)
+        or (symbol and symbol in text_value)
+        or (symbol_code and symbol_code in text_value)
+    )
+
+
+def _symbol_payloads(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in value:
+        if isinstance(row, dict):
+            symbol = str(row.get("symbol") or "").strip().upper()
+            name = str(row.get("name") or "").strip()
+        else:
+            symbol = str(row or "").strip().upper()
+            name = ""
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        result.append({"symbol": symbol, "name": name})
+    return result
 
 
 def _event_score(
@@ -603,10 +1312,10 @@ def _build_summary(theme: str, positive_count: int, negative_count: int, source_
     parts = [f"{theme}近窗口命中{positive_count}条利好线索"]
     if negative_count:
         parts.append(f"{negative_count}条风险或分歧线索")
+    if source_tier in {"S", "A", "B", "C"}:
+        parts.append(f"主导来源层级{source_tier}")
     if policy_boost:
-        parts.append("包含政策级催化")
-    elif source_tier in {"S", "A"}:
-        parts.append(f"最高来源层级{source_tier}")
+        parts.append("含S级政策催化")
     if consensus_rate is not None:
         parts.append(f"共识率{consensus_rate:.0%}")
     return "，".join(parts) + "。"
@@ -644,7 +1353,7 @@ def _build_evidence(events: list[ThemeEvent]) -> list[dict[str, Any]]:
         evidence.append(
             {
                 "id": event.digest,
-                "content": event.content[:180],
+                "content": event.content,
                 "source": event.source,
                 "published_at": _iso(event.published_at),
                 "sentiment": event.sentiment,
@@ -663,16 +1372,84 @@ def _build_evidence(events: list[ThemeEvent]) -> list[dict[str, Any]]:
 def _collect_related_symbols(events: list[ThemeEvent]) -> list[dict[str, str]]:
     by_symbol: dict[str, dict[str, str]] = {}
     for event in events:
+        if event.sentiment != "positive" and not event.policy_boost:
+            continue
         for item in event.related_symbols or []:
             if not isinstance(item, dict):
                 continue
             symbol = str(item.get("symbol") or "").strip().upper()
             if not symbol or symbol in by_symbol:
                 continue
-            by_symbol[symbol] = {"symbol": symbol, "name": str(item.get("name") or "").strip()}
+            name = str(item.get("name") or "").strip()
+            if _is_source_or_media_symbol(name=name, source=event.source, content=event.content):
+                continue
+            if _is_research_source_symbol(name, event.content):
+                continue
+            if _is_generic_theme_keyword_symbol(name, event.content):
+                continue
+            by_symbol[symbol] = {"symbol": symbol, "name": name}
             if len(by_symbol) >= 10:
                 return list(by_symbol.values())
     return list(by_symbol.values())
+
+
+def _is_source_or_media_symbol(*, name: str, source: str, content: str) -> bool:
+    symbol_name = str(name or "").strip()
+    if not symbol_name:
+        return False
+    source_name = str(source or "")
+    if symbol_name and symbol_name in source_name:
+        return True
+    headline = str(content or "")[:80]
+    if symbol_name in headline and any(token in headline for token in ("财经早餐", "快讯", "早报", "午报", "晚报", "新闻精选")):
+        return True
+    return False
+
+
+def _is_generic_theme_keyword_symbol(name: str, content: str) -> bool:
+    symbol_name = str(name or "").strip()
+    if not symbol_name:
+        return False
+    generic_names = {
+        str(value)
+        for theme, config in THEME_CATALOG.items()
+        for value in (theme, *(config.get("aliases") or ()))
+        if len(str(value)) >= 2
+    }
+    if symbol_name not in generic_names:
+        return False
+    text_value = str(content or "")
+    for match in re.finditer(re.escape(symbol_name), text_value):
+        after = text_value[match.end():match.end() + 16]
+        before = text_value[max(match.start() - 12, 0):match.start()]
+        context = f"{before}{symbol_name}{after}"
+        if re.search(r"[\(（]?\d{6}(?:\.(?:SH|SZ|BJ))?[\)）]?", context, flags=re.IGNORECASE):
+            return False
+        if after.startswith(("股份", "公司", "公告", "股价", "涨停", "跌停", "证券简称")):
+            return False
+    return True
+
+
+def _is_research_source_symbol(name: str, content: str) -> bool:
+    symbol_name = str(name or "").strip()
+    if not symbol_name or not content:
+        return False
+    if not any(token in symbol_name for token in ("证券", "期货", "基金")):
+        return False
+    text_value = str(content)
+    for match in re.finditer(re.escape(symbol_name), text_value):
+        after = text_value[match.end():match.end() + 18]
+        before = text_value[max(match.start() - 8, 0):match.start()]
+        context = f"{before}{symbol_name}{after}"
+        if "涨停" in after[:8] or "走强" in after[:8] or "板块" in after[:8]:
+            continue
+        if any(verb in after for verb in RESEARCH_SOURCE_SYMBOL_VERBS):
+            return True
+        if before.endswith(("【", "，", "；", "。")) and after.startswith(("：", ":")):
+            return True
+        if "研报" in context or "评级" in context:
+            return True
+    return False
 
 
 def _persist_ranking_snapshot(
@@ -786,6 +1563,12 @@ def _persist_ranking_snapshot(
 
 
 def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, Any]:
+    evidence_items = _loads(row["evidence_items_json"])
+    evidence_top_tier = (
+        _top_source_tier(item.get("source_tier") for item in evidence_items if isinstance(item, dict))
+        if evidence_items
+        else row["source_tier"]
+    )
     payload = {
         "theme": row["theme"],
         "parent_theme": row["parent_theme"],
@@ -796,6 +1579,7 @@ def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, A
         "negative_count": int(row["negative_count"] or 0),
         "consensus_rate": row["consensus_rate"],
         "source_tier": row["source_tier"],
+        "top_source_tier": evidence_top_tier,
         "policy_boost": bool(row["policy_boost"]),
         "disagreement_level": row["disagreement_level"],
         "crowding_risk": row["crowding_risk"],
@@ -809,7 +1593,7 @@ def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, A
         "window_end": _iso(row["window_end"]),
         "snapshot_date": row["snapshot_date"],
     }
-    payload["evidence_items"] = _loads(row["evidence_items_json"]) if include_evidence else []
+    payload["evidence_items"] = evidence_items if include_evidence else []
     return payload
 
 
@@ -895,7 +1679,7 @@ def _load_news_rows(db: Session, *, window_start: datetime, window_end: datetime
         text(
             """
             SELECT digest, content, published_at, source, url, sentiment,
-                   positive_sectors_json, negative_sectors_json, related_symbols_json, fetched_at
+                   positive_sectors_json, negative_sectors_json, positive_symbols_json, related_symbols_json, fetched_at
             FROM market_news_items
             WHERE published_at >= :window_start
               AND published_at <= :window_end
@@ -951,7 +1735,7 @@ def _load_market_confirmation(db: Session) -> dict[str, dict[str, float]]:
 
 
 def _select_daily_table(db: Session) -> str | None:
-    for table in ("pub_stock_daily_kline", "market_stock_daily_kline", "stock_daily_kline"):
+    for table in ("stock_daily_kline", "pub_stock_daily_kline", "market_stock_daily_kline"):
         if _has_table(db, table) and _has_column(db, table, "trade_date") and _has_column(db, table, "symbol"):
             return table
     return None
@@ -1017,6 +1801,22 @@ def _normalize_sentiment(value: str) -> str:
 def _top_source_tier(tiers: Iterable[str]) -> str:
     order = {"S": 4, "A": 3, "B": 2, "C": 1}
     return max((tier for tier in tiers if tier), key=lambda tier: order.get(tier, 0), default="B")
+
+
+def _dominant_source_tier(events: Iterable[ThemeEvent]) -> str:
+    order = {"S": 4, "A": 3, "B": 2, "C": 1}
+    tiers_by_digest: dict[str, str] = {}
+    for event in events:
+        tier = str(event.source_tier or "").strip()
+        if not tier:
+            continue
+        current = tiers_by_digest.get(event.digest)
+        if current is None or order.get(tier, 0) > order.get(current, 0):
+            tiers_by_digest[event.digest] = tier
+    counts = Counter(tiers_by_digest.values())
+    if not counts:
+        return "B"
+    return max(counts, key=lambda tier: (counts[tier], order.get(tier, 0)))
 
 
 def _make_snapshot_id(snapshot_date: str, window: str, theme: str) -> str:

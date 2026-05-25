@@ -35,6 +35,7 @@ SYMBOL_METADATA_CACHE_PATH = UNIVERSE_METADATA_ROOT / "symbol_metadata.parquet"
 SYMBOL_METADATA_JSON_PATH = UNIVERSE_METADATA_ROOT / "symbol_metadata.json"
 SECTOR_MEMBERSHIP_CACHE_PATH = UNIVERSE_METADATA_ROOT / "sector_memberships.parquet"
 SECTOR_MEMBERSHIP_JSON_PATH = UNIVERSE_METADATA_ROOT / "sector_memberships.json"
+SYMBOL_METADATA_CACHE_VERSION = 2
 
 _symbol_metadata_cache_df: pd.DataFrame | None = None
 _sector_membership_cache_df: pd.DataFrame | None = None
@@ -1015,14 +1016,18 @@ def _build_symbol_metadata(end_date: str) -> pd.DataFrame | None:
         metadata = listing_dates.merge(industry_metadata, on=["symbol", "symbol_code"], how="outer")
     metadata = _attach_concept_aliases(metadata)
     metadata = metadata.drop_duplicates(["symbol"], keep="first").reset_index(drop=True)
+    metadata["metadata_version"] = SYMBOL_METADATA_CACHE_VERSION
     return metadata
 
 
 def _is_symbol_metadata_cache_usable(frame: pd.DataFrame | None) -> bool:
     if frame is None or frame.empty:
         return False
-    required = {"symbol", "symbol_code", "listing_date", "sw_industry_l1", "sw_industry_l2", "sw_industry_l3", "concepts"}
-    return required.issubset(set(frame.columns))
+    required = {"symbol", "symbol_code", "listing_date", "sw_industry_l1", "sw_industry_l2", "sw_industry_l3", "concepts", "metadata_version"}
+    if not required.issubset(set(frame.columns)):
+        return False
+    version_values = pd.to_numeric(frame["metadata_version"], errors="coerce").dropna().unique().tolist()
+    return bool(version_values) and all(int(value) == SYMBOL_METADATA_CACHE_VERSION for value in version_values)
 
 
 def _is_sector_membership_cache_usable(frame: pd.DataFrame | None) -> bool:
@@ -1052,8 +1057,7 @@ def _load_symbol_listing_dates(end_date: str) -> pd.DataFrame | None:
                 ([str(path) for path in parquet_files], end_date),
             ).fetchdf()
             if not frame.empty:
-                frame["symbol"] = frame["symbol"].map(_normalize_symbol)
-                return frame
+                return _dedupe_symbol_listing_dates(frame)
         except Exception:
             pass
     return _load_symbol_listing_dates_from_db(end_date)
@@ -1084,8 +1088,7 @@ def _load_symbol_listing_dates_from_db(end_date: str) -> pd.DataFrame | None:
         )
         if frame.empty:
             return None
-        frame["symbol"] = frame["symbol"].map(_normalize_symbol)
-        return frame
+        return _dedupe_symbol_listing_dates(frame)
     except Exception:
         return None
 
@@ -1127,10 +1130,51 @@ def _load_symbol_industry_metadata(end_date: str) -> pd.DataFrame | None:
         )
         if frame.empty:
             return None
-        frame["symbol"] = frame["symbol"].map(_normalize_symbol)
-        return frame
+        return _dedupe_symbol_industry_metadata(frame)
     except Exception:
         return None
+
+
+def _dedupe_symbol_listing_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    normalized["symbol"] = normalized["symbol"].map(_normalize_symbol)
+    normalized = normalized[normalized["symbol"].astype(str).str.len() > 0]
+    normalized["symbol_code"] = normalized["symbol"].astype(str).str.split(".", n=1).str[0]
+    normalized["listing_date"] = pd.to_datetime(normalized["listing_date"], errors="coerce")
+    normalized = normalized.dropna(subset=["listing_date"])
+    if normalized.empty:
+        return normalized
+    return (
+        normalized.groupby(["symbol", "symbol_code"], as_index=False)["listing_date"]
+        .min()
+        .sort_values(["symbol"])
+        .reset_index(drop=True)
+    )
+
+
+def _dedupe_symbol_industry_metadata(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    normalized["symbol"] = normalized["symbol"].map(_normalize_symbol)
+    normalized = normalized[normalized["symbol"].astype(str).str.len() > 0]
+    normalized["symbol_code"] = normalized["symbol"].astype(str).str.split(".", n=1).str[0]
+    value_columns = [column for column in ("sw_industry_l1", "sw_industry_l2", "sw_industry_l3") if column in normalized.columns]
+    if not value_columns:
+        return normalized.drop_duplicates(["symbol"], keep="first").reset_index(drop=True)
+
+    def first_text(series: pd.Series) -> str | None:
+        for value in series:
+            text_value = _safe_text(value)
+            if text_value:
+                return text_value
+        return None
+
+    aggregations = {column: first_text for column in value_columns}
+    return (
+        normalized.groupby(["symbol", "symbol_code"], as_index=False)
+        .agg(aggregations)
+        .sort_values(["symbol"])
+        .reset_index(drop=True)
+    )
 
 
 def _read_dataframe_cache(parquet_path: Path, json_path: Path) -> pd.DataFrame | None:
@@ -1214,8 +1258,10 @@ def _exit_reason_from_compiled_rules(row: pd.Series, compiled: CompiledStrategy)
         if rule_key == "close_below_indicator":
             left = str(params.get("left") or "close")
             right = str(params.get("right") or "ma20")
-            if left == "first_day_band" and right == "first_day_band_b1" and float(row.get("first_day_band_dead_cross", 0.0) or 0.0) > 0:
-                return "first_day_band_dead_cross"
+            if left == "first_day_band" and right == "first_day_band_b1":
+                if float(row.get("first_day_band_dead_cross", 0.0) or 0.0) > 0:
+                    return "first_day_band_dead_cross"
+                continue
             if left in row and right in row and float(row[left]) < float(row[right]):
                 return f"{left}_below_{right}"
             if right in row and float(row["close"]) < float(row[right]):

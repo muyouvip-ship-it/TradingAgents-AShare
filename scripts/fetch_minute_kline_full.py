@@ -50,6 +50,34 @@ CATEGORY_1MIN = 8
 MINUTES_PER_DAY = 240
 
 
+def normalize_stock_symbol(code: str, market: str | int | None = None) -> str:
+    raw = str(code or "").strip().upper()
+    if not raw:
+        return ""
+    if "." in raw:
+        return raw
+    if len(raw) == 6 and raw.isdigit():
+        market_text = str(market or "").lower()
+        if market_text in {"1", "sh"}:
+            return f"{raw}.SH"
+        if raw.startswith(("4", "8")) or raw.startswith("92"):
+            return f"{raw}.BJ"
+        if raw.startswith(("5", "6", "9")):
+            return f"{raw}.SH"
+        return f"{raw}.SZ"
+    return raw
+
+
+def symbol_variants(symbol: str) -> tuple[str, ...]:
+    normalized = normalize_stock_symbol(symbol)
+    variants = {normalized, str(symbol or "").strip().upper()}
+    if "." in normalized:
+        variants.add(normalized.split(".", 1)[0])
+    if normalized.endswith(".BJ"):
+        variants.add(f"BJ{normalized.split('.', 1)[0]}")
+    return tuple(item for item in variants if item)
+
+
 def get_tdx_api():
     from pytdx.hq import TdxHq_API
     for host, port in TDX_SERVERS:
@@ -127,7 +155,7 @@ def fetch_minute_data_history(api, market, code, date_int):
             minute = idx % 60
 
         trade_time = datetime(year, month, day, hour, minute)
-        rows.append((code, trade_time, price, price, price, price, vol, round(price * vol, 2)))
+        rows.append((normalize_stock_symbol(code, market), trade_time, price, price, price, price, vol, round(price * vol, 2)))
 
     return rows
 
@@ -144,7 +172,7 @@ def fetch_recent_bars(api, market, code, existing_max_time=None):
             if existing_max_time and trade_time <= existing_max_time:
                 continue
             all_bars.append((
-                code, trade_time,
+                normalize_stock_symbol(code, market), trade_time,
                 float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"]),
                 int(bar["vol"]), float(bar["amount"]),
             ))
@@ -153,18 +181,20 @@ def fetch_recent_bars(api, market, code, existing_max_time=None):
 
 def get_existing_dates(conn, symbol):
     cur = conn.cursor()
+    variants = symbol_variants(symbol)
     cur.execute(
-        "SELECT DISTINCT DATE(trade_time) FROM stock_minute_kline WHERE symbol = %s",
-        (symbol,),
+        "SELECT DISTINCT DATE(trade_time) FROM stock_minute_kline WHERE symbol = ANY(%s)",
+        (list(variants),),
     )
     return {row[0] for row in cur.fetchall()}
 
 
 def get_existing_max_time(conn, symbol):
     cur = conn.cursor()
+    variants = symbol_variants(symbol)
     cur.execute(
-        "SELECT MAX(trade_time) FROM stock_minute_kline WHERE symbol = %s",
-        (symbol,),
+        "SELECT MAX(trade_time) FROM stock_minute_kline WHERE symbol = ANY(%s)",
+        (list(variants),),
     )
     return cur.fetchone()[0]
 

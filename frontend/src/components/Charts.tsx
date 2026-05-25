@@ -198,11 +198,13 @@ export function DrawdownChart({ data }: { data: any[] }) {
     }
   }
 
-  // 计算回撤
-  let peak = data[0].value
-  const chartData = data.map((item) => {
-    if (item.value > peak) peak = item.value
-    const drawdown = (item.value - peak) / peak
+  const peaks = data.reduce<number[]>((acc, item, index) => {
+    acc.push(index === 0 ? item.value : Math.max(acc[index - 1], item.value))
+    return acc
+  }, [])
+  const chartData = data.map((item, index) => {
+    const peak = peaks[index] ?? item.value
+    const drawdown = peak === 0 ? 0 : (item.value - peak) / peak
     return {
       date: formatDate(item.date),
       回撤: drawdown,

@@ -877,7 +877,7 @@ export default function RealtimeMonitorPage() {
     max_signals_per_cycle: 3,
   })
 
-  const accountOptions = warehouse?.accounts || []
+  const accountOptions = useMemo(() => warehouse?.accounts || [], [warehouse?.accounts])
   const selectedAccountRole = useMemo(
     () => accountOptions.find(item => item.account_key === form.account_key)?.role || 'paper',
     [accountOptions, form.account_key],
@@ -1332,7 +1332,7 @@ export default function RealtimeMonitorPage() {
     if (streamStatus === '连接失败') warnings.push('事件流连接失败时，页面上的实例状态可能会滞后于后端实际运行状态。')
     if (error) warnings.push(error)
     return warnings
-  }, [error, positionsPayload?.data_governance?.warnings, selectedMonitor, selectedMonitor?.data_governance?.warnings, streamStatus])
+  }, [error, positionsPayload?.data_governance?.warnings, selectedMonitor, streamStatus])
 
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">实时监控模块加载中...</div>

@@ -38,14 +38,14 @@ from api.services import backtest_data_auto_update_service
 router = APIRouter(prefix="/v1/backtest-data", tags=["backtest-data"])
 
 _TABLE_STATS_MAPPING = {
-    # 设置页统计必须走物理表/增量表的轻量汇总，不能扫 market_* 统一视图。
+    # 设置页统计必须走最终物理表，不能扫 market_* 兼容视图。
     "daily_kline": ("stock_daily_kline", "trade_date"),
     "index_data": ("index_daily_data", "trade_date"),
     "minute_kline": ("stock_minute_kline", "trade_time"),
     "index_minute_kline": ("index_minute_kline", "trade_time"),
 }
 
-_DAILY_KLINE_CALENDAR_TABLES = ("stock_daily_kline", "pub_stock_daily_kline")
+_DAILY_KLINE_CALENDAR_TABLES = ("stock_daily_kline",)
 
 
 def _normalize_config_payload(payload: dict) -> dict:
@@ -267,24 +267,13 @@ def _build_daily_kline_stat(db: Session, *, data_type: str, table_name: str, dat
 
 def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, date_column: str) -> BacktestDataStats | None:
     base_records = _estimate_table_rows(db, table_name)
-    pub_records = 0
-    pub_range = None
-    pub_updated_at = None
-    if data_type == "minute_kline" and _relation_exists(db, "pub_stock_minute_kline"):
-        pub_records = _estimate_table_rows(db, "pub_stock_minute_kline")
-        if pub_records <= 0:
-            pub_records = _count_table_rows(db, "pub_stock_minute_kline")
-        pub_range = _fast_min_max_date(db, "pub_stock_minute_kline", "trade_time")
-        pub_updated_at = _latest_table_timestamp(db, "pub_stock_minute_kline")
-
-    estimated_total_records = int(base_records or 0) + int(pub_records or 0)
-    if estimated_total_records <= 0:
+    if int(base_records or 0) <= 0:
         return None
 
-    base_range = _fast_min_max_date(db, table_name, date_column)
-    min_date = _min_date(base_range[0] if base_range else None, pub_range[0] if pub_range else None)
-    max_date = _max_date(base_range[1] if base_range else None, pub_range[1] if pub_range else None)
-    last_table_updated_at = pub_updated_at
+    base_range = _fast_min_max_date(db, table_name, date_column) if _estimate_is_small(base_records) else None
+    min_date = base_range[0] if base_range else None
+    max_date = base_range[1] if base_range else None
+    last_table_updated_at = _latest_table_timestamp(db, table_name) if _estimate_is_small(base_records) else None
     now = last_table_updated_at or datetime.utcnow()
 
     return BacktestDataStats(
@@ -292,12 +281,12 @@ def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, da
         symbol=None,
         date_range_start=min_date,
         date_range_end=max_date,
-        total_records=estimated_total_records,
+        total_records=int(base_records or 0),
         symbol_count=None,
         trading_days=None,
         last_updated_date=max_date,
         last_table_updated_at=last_table_updated_at,
-        coverage_source="postgresql_estimate+published_incremental" if pub_records > 0 else "postgresql_estimate",
+        coverage_source="postgresql_estimate",
         db_date_range_start=min_date,
         db_date_range_end=max_date,
         cache_date_range_start=None,
@@ -312,45 +301,11 @@ def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, da
 
 def _collect_daily_kline_stats(db: Session, *, table_name: str, date_column: str) -> dict | None:
     base_stats = _aggregate_table_stats(db, table_name=table_name, date_column=date_column)
-    pub_stats = None
-    if _relation_exists(db, "pub_stock_daily_kline"):
-        pub_stats = _aggregate_table_stats(db, table_name="pub_stock_daily_kline", date_column="trade_date")
-
-    if not base_stats and not pub_stats:
+    if not base_stats:
         return None
-
-    base_total = int((base_stats or {}).get("total_records") or 0)
-    pub_total = int((pub_stats or {}).get("total_records") or 0)
-    date_range_start = _min_date((base_stats or {}).get("date_range_start"), (pub_stats or {}).get("date_range_start"))
-    date_range_end = _max_date((base_stats or {}).get("date_range_end"), (pub_stats or {}).get("date_range_end"))
-
-    base_trading_days = int((base_stats or {}).get("trading_days") or 0)
-    if base_stats and pub_stats and base_stats.get("date_range_end"):
-        pub_new_trading_days = _count_distinct_dates_after(
-            db,
-            table_name="pub_stock_daily_kline",
-            date_column="trade_date",
-            after_date=base_stats.get("date_range_end"),
-        )
-        trading_days = base_trading_days + pub_new_trading_days
-    else:
-        trading_days = base_trading_days + int((pub_stats or {}).get("trading_days") or 0)
-
-    symbol_count = max(
-        int((base_stats or {}).get("symbol_count") or 0),
-        int((pub_stats or {}).get("symbol_count") or 0),
-    )
     return {
-        "total_records": base_total + pub_total,
-        "symbol_count": symbol_count,
-        "trading_days": trading_days,
-        "date_range_start": date_range_start,
-        "date_range_end": date_range_end,
-        "last_table_updated_at": _max_datetime(
-            (base_stats or {}).get("last_table_updated_at"),
-            (pub_stats or {}).get("last_table_updated_at"),
-        ),
-        "coverage_source": "postgresql+published_incremental" if pub_total > 0 else "postgresql",
+        **base_stats,
+        "coverage_source": "postgresql_final",
     }
 
 
@@ -399,19 +354,22 @@ def _estimate_table_rows(db: Session, table_name: str) -> int:
             NULLIF((
                 SELECT n_live_tup::bigint
                 FROM pg_stat_user_tables
-                WHERE schemaname = 'public' AND relname = :table_name
+                WHERE schemaname = ANY(current_schemas(false)) AND relname = :table_name
             ), 0),
             NULLIF((
                 SELECT reltuples::bigint
                 FROM pg_class
-                WHERE oid = to_regclass(:qualified_name)
+                WHERE oid = to_regclass(:table_name)
             ), 0),
             0
         )
     """), {
         "table_name": table_name,
-        "qualified_name": f"public.{table_name}",
     }).scalar() or 0)
+
+
+def _estimate_is_small(row_estimate: int | None, *, threshold: int = 5_000_000) -> bool:
+    return int(row_estimate or 0) <= threshold
 
 
 def _relation_exists(db: Session, table_name: str) -> bool:
@@ -1190,31 +1148,31 @@ def get_daily_kline_governance_summary(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """返回股票日 K 多源增量治理摘要，用于设置页解释 raw/norm/pub/market 口径。"""
+    """返回股票日 K 多源治理摘要，用于设置页解释最终表与过程层口径。"""
     try:
         del current_user
         preferred_table = preferred_daily_kline_table()
-        legacy = _daily_governance_table_stats(db, "stock_daily_kline")
+        final_table = _daily_governance_table_stats(db, "stock_daily_kline")
         published = _daily_governance_table_stats(db, "pub_stock_daily_kline")
         norm = _daily_governance_table_stats(db, "norm_stock_daily_kline")
-        unified_stats = _collect_daily_kline_stats(db, table_name="stock_daily_kline", date_column="trade_date")
-        unified = _serialize_governance_stats(
+        final_stats = _collect_daily_kline_stats(db, table_name="stock_daily_kline", date_column="trade_date")
+        final_summary = _serialize_governance_stats(
             {
-                **(unified_stats or {}),
+                **(final_stats or {}),
                 "table_name": preferred_table,
-                "layer": "market_view",
-                "description": "历史主表 + 发布层增量",
+                "layer": "final_table",
+                "description": "最终业务表，吸收治理链路发布后的日 K 数据",
             }
-        ) if unified_stats else {
+        ) if final_stats else {
             "table_name": preferred_table,
-            "layer": "market_view",
-            "description": "历史主表 + 发布层增量",
+            "layer": "final_table",
+            "description": "最终业务表，吸收治理链路发布后的日 K 数据",
             "exists": _relation_exists(db, preferred_table),
             "total_records": 0,
         }
-        latest_date = unified.get("date_range_end")
+        latest_date = final_summary.get("date_range_end")
         if latest_date:
-            unified["latest_date_row_count"] = _count_rows_on_date(
+            final_summary["latest_date_row_count"] = _count_rows_on_date(
                 db,
                 table_name=preferred_table,
                 date_column="trade_date",
@@ -1234,9 +1192,9 @@ def get_daily_kline_governance_summary(
             "success": True,
             "updated_at": datetime.utcnow().isoformat(),
             "preferred_table": preferred_table,
-            "read_policy": "业务侧通过 market_stock_daily_kline 统一读取历史主表与发布层增量。",
-            "unified": unified,
-            "legacy": legacy,
+            "read_policy": "业务侧统一读取 stock_daily_kline 最终业务表；raw/norm/pub/对账表仅用于采集、标准化、审计和质量追踪。",
+            "unified": final_summary,
+            "legacy": final_table,
             "published": published,
             "norm": norm,
             "raw_layers": raw_layers,

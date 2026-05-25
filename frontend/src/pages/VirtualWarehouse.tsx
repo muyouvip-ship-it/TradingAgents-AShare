@@ -245,7 +245,7 @@ export function WarehousePage({
   const bulkSellStreamAbortRef = useRef<AbortController | null>(null)
   const account = payload?.account
   const connection = payload?.connection
-  const positions = payload?.positions || []
+  const positions = useMemo(() => payload?.positions || [], [payload?.positions])
   const orders = useMemo(
     () => [...(payload?.orders || [])]
       .filter(item => isSameLocalDate(item.order_time))

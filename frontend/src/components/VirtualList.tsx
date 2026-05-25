@@ -25,8 +25,7 @@ export default function VirtualList<T>({
   renderItem,
 }: VirtualListProps<T>) {
   const [scrollTop, setScrollTop] = useState(0)
-  const sizeMapRef = useRef(new Map<number, number>())
-  const [sizeVersion, setSizeVersion] = useState(0)
+  const [sizeMap, setSizeMap] = useState(() => new Map<number, number>())
 
   const layout = useMemo(() => {
     if (items.length === 0) {
@@ -37,10 +36,10 @@ export default function VirtualList<T>({
     let cursor = 0
     for (let index = 0; index < items.length; index += 1) {
       offsets[index] = cursor
-      cursor += (sizeMapRef.current.get(index) || safeEstimate) + gap
+      cursor += (sizeMap.get(index) || safeEstimate) + gap
     }
     return { offsets, totalHeight: Math.max(cursor - gap, 0) }
-  }, [estimateSize, gap, items.length, sizeVersion])
+  }, [estimateSize, gap, items.length, sizeMap])
 
   const { startIndex, visibleItems } = useMemo(() => {
     if (items.length === 0) {
@@ -66,9 +65,12 @@ export default function VirtualList<T>({
   const handleSize = useCallback((index: number, size: number) => {
     const rounded = Math.ceil(size)
     if (!Number.isFinite(rounded) || rounded <= 0) return
-    if (sizeMapRef.current.get(index) === rounded) return
-    sizeMapRef.current.set(index, rounded)
-    setSizeVersion(version => version + 1)
+    setSizeMap(prev => {
+      if (prev.get(index) === rounded) return prev
+      const next = new Map(prev)
+      next.set(index, rounded)
+      return next
+    })
   }, [])
 
   if (items.length === 0) {

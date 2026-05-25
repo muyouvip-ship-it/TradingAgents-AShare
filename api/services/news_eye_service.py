@@ -7,8 +7,9 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from fastapi import HTTPException
@@ -25,6 +26,8 @@ from tradingagents.llm_clients.factory import create_llm_client
 
 
 logger = logging.getLogger(__name__)
+CN_TZ = ZoneInfo("Asia/Shanghai")
+NEWS_LLM_TIMEOUT_SECONDS = max(float(os.getenv("NEWS_EYE_LLM_TIMEOUT_SECONDS", "120")), 5.0)
 
 POSITIVE_KEYWORDS = ("利好", "增长", "突破", "中标", "回购", "增持", "涨价", "扩产", "创新高", "超预期", "获批", "签约")
 NEGATIVE_KEYWORDS = ("利空", "下滑", "亏损", "减持", "处罚", "调查", "暴跌", "下调", "违约", "风险", "退市", "低于预期")
@@ -105,6 +108,18 @@ A_SHARE_MARKET_KEYWORDS = (
     "工信部",
     "商务部",
     "国资委",
+    "上市公司",
+    "交易所",
+    "涨停",
+    "跌停",
+    "龙虎榜",
+    "北向资金",
+    "南向资金",
+    "沪股通",
+    "深股通",
+    "港股通",
+    "融资融券",
+    "两融",
     "人民币",
     "MLF",
     "LPR",
@@ -143,6 +158,7 @@ OVERSEAS_NOISE_KEYWORDS = (
 _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _SEARCH_INDEX_BACKFILLED = False
+_DEDUPE_KEYS_BACKFILLED = False
 _POLL_SECONDS = max(int(os.getenv("NEWS_EYE_POLL_SECONDS", "45")), 15)
 _BACKGROUND_LIMIT = max(int(os.getenv("NEWS_EYE_BACKGROUND_LIMIT", "120")), 20)
 _MANUAL_LIMIT = max(int(os.getenv("NEWS_EYE_MANUAL_LIMIT", "160")), 20)
@@ -152,6 +168,7 @@ _SYNC_STATE_KEY = "news_eye"
 _CLAUSE_SPLIT_PATTERN = re.compile(r"[。！？!?\n；;]+|(?<=\S)，")
 _A_SHARE_CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 _SYMBOL_NAME_FRAGMENT_PATTERN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]{2,}")
+_NEWS_CONTENT_DUPE_STRIP_PATTERN = re.compile(r"[\s\u3000【】\[\]（）()《》<>“”\"'‘’、，,。；;：:！？!?·.\-_/|]+")
 _SYMBOL_PREFIX_LENGTH = 2
 
 
@@ -178,6 +195,9 @@ GENERAL_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
     NewsSourceSpec("财联社电报", "stock_info_global_cls", {"symbol": "全部"}),
     NewsSourceSpec("东方财富全球快讯", "stock_info_global_em"),
     NewsSourceSpec("东方财富财经早餐", "stock_info_cjzc_em"),
+    NewsSourceSpec("新浪7x24", "stock_info_global_sina"),
+    NewsSourceSpec("富途快讯", "stock_info_global_futu"),
+    NewsSourceSpec("同花顺全球直播", "stock_info_global_ths"),
 )
 SYMBOL_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
     NewsSourceSpec(
@@ -244,12 +264,13 @@ def _scan_and_refresh_once() -> None:
 
 
 def ensure_news_tables(db: Session) -> None:
-    global _SEARCH_INDEX_BACKFILLED
+    global _DEDUPE_KEYS_BACKFILLED, _SEARCH_INDEX_BACKFILLED
     db.execute(
         text(
             """
             CREATE TABLE IF NOT EXISTS market_news_items (
                 digest VARCHAR(64) PRIMARY KEY,
+                dedupe_key VARCHAR(80),
                 content TEXT NOT NULL,
                 published_at TIMESTAMP NOT NULL,
                 source VARCHAR(80) NOT NULL,
@@ -265,6 +286,7 @@ def ensure_news_tables(db: Session) -> None:
             """
         )
     )
+    db.execute(text("ALTER TABLE market_news_items ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(80)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_items_published_at ON market_news_items (published_at DESC)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_items_source ON market_news_items (source)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_items_sentiment ON market_news_items (sentiment)"))
@@ -315,6 +337,11 @@ def ensure_news_tables(db: Session) -> None:
             """
         )
     )
+    db.commit()
+    if not _DEDUPE_KEYS_BACKFILLED:
+        _backfill_news_dedupe_keys_if_needed(db)
+        _DEDUPE_KEYS_BACKFILLED = True
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_news_items_dedupe_key ON market_news_items (dedupe_key)"))
     db.commit()
     if not _SEARCH_INDEX_BACKFILLED:
         _backfill_news_search_index_if_needed(db)
@@ -454,7 +481,7 @@ def analyze_news_item(db: Session, *, user_id: str, payload: dict[str, Any]) -> 
             provider=provider,
             model=model,
             base_url=str(config.get("backend_url") or "").strip() or None,
-            timeout=45.0,
+            timeout=NEWS_LLM_TIMEOUT_SECONDS,
             **client_kwargs,
         )
         llm = client.get_llm()
@@ -547,23 +574,26 @@ def refresh_news_cache(
     symbols = [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
     try:
         items, active_sources, warnings = _fetch_external_news(limit, symbols=symbols)
+        items = _dedupe_items(items)
+        sync_last_error = _sync_state_error_from_warnings(warnings, active_sources)
+        sync_status = "success" if active_sources and not sync_last_error else ("degraded" if active_sources else "degraded")
         saved = 0
         for item in items:
             enriched = _enrich_news_item(item)
-            db.execute(
+            saved_row = db.execute(
                 text(
                     """
                     INSERT INTO market_news_items (
-                        digest, content, published_at, source, url, sentiment,
+                        digest, dedupe_key, content, published_at, source, url, sentiment,
                         positive_sectors_json, negative_sectors_json, positive_symbols_json, negative_symbols_json,
                         related_symbols_json, fetched_at
                     )
                     VALUES (
-                        :digest, :content, :published_at, :source, :url, :sentiment,
+                        :digest, :dedupe_key, :content, :published_at, :source, :url, :sentiment,
                         :positive_sectors_json, :negative_sectors_json, :positive_symbols_json, :negative_symbols_json,
                         :related_symbols_json, :fetched_at
                     )
-                    ON CONFLICT (digest) DO UPDATE SET
+                    ON CONFLICT (dedupe_key) DO UPDATE SET
                         content = EXCLUDED.content,
                         published_at = EXCLUDED.published_at,
                         source = EXCLUDED.source,
@@ -575,18 +605,21 @@ def refresh_news_cache(
                         negative_symbols_json = EXCLUDED.negative_symbols_json,
                         related_symbols_json = EXCLUDED.related_symbols_json,
                         fetched_at = EXCLUDED.fetched_at
+                    RETURNING digest
                     """
                 ),
                 enriched,
-            )
+            ).mappings().first()
+            if saved_row and saved_row.get("digest"):
+                enriched["digest"] = saved_row["digest"]
             _replace_news_search_index(db, enriched)
             saved += 1
         _record_sync_state(
             db,
-            status="success" if active_sources else "degraded",
+            status=sync_status,
             last_run_at=run_started_at,
             last_success_at=run_started_at if active_sources else None,
-            last_error="；".join(warnings[:5]) if warnings else None,
+            last_error=sync_last_error,
             active_sources=active_sources,
             tracked_symbols=symbols,
             saved_count=saved,
@@ -607,13 +640,14 @@ def refresh_news_cache(
             "saved": saved,
             "source": ", ".join(active_sources) if active_sources else "external",
             "fallback": not bool(active_sources),
-            "message": "；".join(warnings[:3]) if warnings else f"资讯刷新完成（{trigger}）",
+            "message": sync_last_error or f"资讯刷新完成（{trigger}）",
             "updated_at": _iso_or_none(run_started_at),
             "active_sources": active_sources,
             "tracked_symbols": symbols,
             "warnings": warnings,
         }
     except Exception as exc:
+        db.rollback()
         _record_sync_state(
             db,
             status="error",
@@ -735,6 +769,20 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
     return _dedupe_items(items)[: max(limit, 20)], active_sources, warnings
 
 
+def _sync_state_error_from_warnings(warnings: list[str], active_sources: list[str]) -> str | None:
+    if not warnings:
+        return None
+    if not active_sources:
+        return "；".join(warnings[:5])
+    important_warnings = [warning for warning in warnings if not _is_noncritical_news_warning(warning)]
+    return "；".join(important_warnings[:5]) if important_warnings else None
+
+
+def _is_noncritical_news_warning(warning: str) -> bool:
+    text_value = str(warning or "")
+    return "个股新闻(" in text_value or "暂无高相关资讯" in text_value
+
+
 def _normalize_news_frame(
     frame: Any,
     source_name: str,
@@ -825,8 +873,7 @@ def _dedupe_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         if existing is None:
             best_by_key[key] = item
             continue
-        if str(item.get("published_at") or "") > str(existing.get("published_at") or ""):
-            best_by_key[key] = item
+        best_by_key[key] = _merge_duplicate_news_item(existing, item)
     return sorted(
         best_by_key.values(),
         key=lambda item: (str(item.get("published_at") or ""), str(item.get("source") or "")),
@@ -835,12 +882,45 @@ def _dedupe_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _news_identity_key(item: dict[str, Any]) -> str:
+    return f"dedupe:{_make_news_dedupe_key(item)}"
+
+
+def _merge_duplicate_news_item(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    preferred = dict(incoming if _news_preference_key(incoming) > _news_preference_key(existing) else existing)
+    preferred["seed_symbols"] = _merge_symbols(
+        list(existing.get("seed_symbols") or []),
+        list(incoming.get("seed_symbols") or []),
+    )
+    if not preferred.get("url"):
+        preferred["url"] = existing.get("url") or incoming.get("url")
+    return preferred
+
+
+def _news_preference_key(item: dict[str, Any]) -> tuple[int, int, str]:
+    content = str(item.get("content") or "")
+    return (
+        1 if str(item.get("url") or "").strip() else 0,
+        len(content),
+        str(item.get("published_at") or ""),
+    )
+
+
+def _make_news_dedupe_key(item: dict[str, Any]) -> str:
+    canonical_content = _canonicalize_news_content(str(item.get("content") or ""))
+    published_date = str(item.get("published_at") or "")[:10]
+    if canonical_content:
+        return hashlib.sha256(f"text:{published_date}:{canonical_content}".encode("utf-8")).hexdigest()
     url = str(item.get("url") or "").strip()
     if url:
-        return f"url:{url}"
-    content = " ".join(str(item.get("content") or "").split())
-    published_at = str(item.get("published_at") or "")[:16]
-    return f"text:{hashlib.sha256(f'{content}|{published_at}'.encode('utf-8')).hexdigest()}"
+        return hashlib.sha256(f"url:{url}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _canonicalize_news_content(content: str) -> str:
+    text_value = str(content or "").strip().lower()
+    if not text_value:
+        return ""
+    return _NEWS_CONTENT_DUPE_STRIP_PATTERN.sub("", text_value)[:600]
 
 
 def _enrich_news_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -857,6 +937,7 @@ def _enrich_news_item(item: dict[str, Any]) -> dict[str, Any]:
     digest = _make_news_digest(item)
     return {
         "digest": digest,
+        "dedupe_key": _make_news_dedupe_key(item),
         "content": content,
         "published_at": item.get("published_at") or _iso_or_none(_utcnow_naive()),
         "source": item.get("source") or "未知来源",
@@ -1237,6 +1318,65 @@ def _replace_news_search_index(db: Session, enriched: dict[str, Any]) -> None:
             )
 
 
+def _backfill_news_dedupe_keys_if_needed(db: Session) -> None:
+    rows = db.execute(
+        text(
+            """
+            SELECT digest, content, published_at, source, url
+            FROM market_news_items
+            WHERE dedupe_key IS NULL
+            """
+        )
+    ).mappings().all()
+    if not rows:
+        return
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        row_dict = dict(row)
+        groups.setdefault(_make_news_dedupe_key(row_dict), []).append(row_dict)
+
+    existing_rows = db.execute(
+        text(
+            """
+            SELECT dedupe_key, digest
+            FROM market_news_items
+            WHERE dedupe_key IS NOT NULL
+            """
+        )
+    ).mappings().all()
+    existing_by_key = {
+        str(row["dedupe_key"]): str(row["digest"])
+        for row in existing_rows
+        if row.get("dedupe_key") and row.get("digest")
+    }
+    update_rows: list[dict[str, str]] = []
+    delete_rows: list[dict[str, str]] = []
+    for dedupe_key, group in groups.items():
+        existing_digest = existing_by_key.get(dedupe_key)
+        if existing_digest:
+            keep_digest = existing_digest
+        else:
+            keep_digest = str(max(group, key=_news_preference_key)["digest"])
+            update_rows.append({"dedupe_key": dedupe_key, "digest": keep_digest})
+            existing_by_key[dedupe_key] = keep_digest
+
+        for row in group:
+            digest = str(row.get("digest") or "")
+            if digest and digest != keep_digest:
+                delete_rows.append({"digest": digest})
+
+    if update_rows:
+        db.execute(
+            text("UPDATE market_news_items SET dedupe_key = :dedupe_key WHERE digest = :digest"),
+            update_rows,
+        )
+    if delete_rows:
+        db.execute(text("DELETE FROM market_news_items WHERE digest = :digest"), delete_rows)
+
+    db.commit()
+
+
 def _backfill_news_search_index_if_needed(db: Session) -> None:
     total_row = db.execute(text("SELECT COUNT(*) AS total_count FROM market_news_items")).mappings().first() or {}
     total_items = int(total_row.get("total_count") or 0)
@@ -1282,12 +1422,7 @@ def _row_to_news_item(row: Any) -> dict[str, Any]:
 
 
 def _make_news_digest(item: dict[str, Any]) -> str:
-    url = str(item.get("url") or "").strip()
-    if url:
-        return hashlib.sha256(url.encode("utf-8")).hexdigest()
-    normalized_content = " ".join(str(item.get("content") or "").split())
-    published_at = str(item.get("published_at") or "")[:16]
-    return hashlib.sha256(f"{normalized_content}|{published_at}".encode("utf-8")).hexdigest()
+    return _make_news_dedupe_key(item)
 
 
 def _record_sync_state(
@@ -1363,7 +1498,7 @@ def _loads(value: str | None) -> list[Any]:
 
 
 def _utcnow_naive() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(CN_TZ).replace(tzinfo=None)
 
 
 def _iso_or_none(value: Any) -> str | None:

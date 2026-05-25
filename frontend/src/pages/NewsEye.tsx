@@ -9,7 +9,6 @@ import {
   Filter,
   Flame,
   Globe2,
-  History,
   Loader2,
   Radar,
   RefreshCw,
@@ -24,7 +23,7 @@ import {
 import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
-import type { ApiDataSourceGovernancePayload, NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag, NewsThemePerformanceItem, NewsThemeRankingItem, NewsThemeWindow } from '@/types'
+import type { ApiDataSourceGovernancePayload, NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag, NewsThemeRankingItem, NewsThemeWindow } from '@/types'
 
 const PAGE_SIZE = 80
 const NEWS_PREVIEW_COLLAPSE_THRESHOLD = 90
@@ -34,14 +33,6 @@ const THEME_WINDOWS: Array<{ value: NewsThemeWindow; label: string }> = [
   { value: '72h', label: '72h' },
   { value: '7d', label: '7d' },
 ]
-const THEME_PERFORMANCE_HORIZONS = ['1d', '3d', '5d'] as const
-
-function todayDateInputValue() {
-  const date = new Date()
-  const offset = date.getTimezoneOffset()
-  const local = new Date(date.getTime() - offset * 60_000)
-  return local.toISOString().slice(0, 10)
-}
 
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
@@ -53,12 +44,6 @@ function formatDateTime(value?: string | null) {
 function formatPercentValue(value?: number | null) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
   return `${(Number(value) * 100).toFixed(0)}%`
-}
-
-function formatChangePct(value?: number | null) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
-  const numberValue = Number(value)
-  return `${numberValue > 0 ? '+' : ''}${numberValue.toFixed(2)}%`
 }
 
 function sentimentLabel(sentiment: string) {
@@ -184,6 +169,7 @@ function ThemeRankingCard({
   selected: boolean
   onSelect: (item: NewsThemeRankingItem) => void
 }) {
+  const topTier = item.top_source_tier || item.source_tier
   return (
     <button
       type="button"
@@ -207,8 +193,13 @@ function ThemeRankingCard({
               </span>
             ) : null}
             <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(item.source_tier)}`}>
-              {item.source_tier}级源
+              主导{item.source_tier}级
             </span>
+            {item.policy_boost && topTier === 'S' && item.source_tier !== 'S' ? (
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(topTier)}`}>
+                含S级证据
+              </span>
+            ) : null}
           </div>
           <div className="mt-2 truncate text-base font-semibold text-slate-950 dark:text-white">
             {item.theme}
@@ -238,25 +229,6 @@ function ThemeRankingCard({
         {item.summary || item.catalyst || '等待更多资讯确认。'}
       </p>
     </button>
-  )
-}
-
-function PerformanceRow({ item }: { item: NewsThemePerformanceItem }) {
-  const positive = typeof item.change_pct === 'number' && item.change_pct > 0
-  const negative = typeof item.change_pct === 'number' && item.change_pct < 0
-  return (
-    <div className="grid grid-cols-[minmax(0,1fr)_80px_84px] items-center gap-2 rounded-xl border border-slate-200 bg-white/88 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900/68">
-      <div className="min-w-0">
-        <div className="truncate font-semibold text-slate-900 dark:text-slate-100">{item.theme}</div>
-        <div className="mt-0.5 truncate text-[11px] text-slate-400">
-          {item.start_date || '--'} 至 {item.end_date || '--'}
-        </div>
-      </div>
-      <div className="text-slate-500 dark:text-slate-400">{item.horizon}</div>
-      <div className={`text-right font-semibold ${positive ? 'text-rose-600 dark:text-rose-300' : negative ? 'text-emerald-600 dark:text-emerald-300' : 'text-slate-500 dark:text-slate-400'}`}>
-        {formatChangePct(item.change_pct)}
-      </div>
-    </div>
   )
 }
 
@@ -304,11 +276,6 @@ export default function NewsEye() {
   const [themeLoading, setThemeLoading] = useState(true)
   const [themeError, setThemeError] = useState<string | null>(null)
   const [selectedTheme, setSelectedTheme] = useState<string>('')
-  const [snapshotDate, setSnapshotDate] = useState(todayDateInputValue())
-  const [snapshotItems, setSnapshotItems] = useState<NewsThemeRankingItem[]>([])
-  const [performanceItems, setPerformanceItems] = useState<NewsThemePerformanceItem[]>([])
-  const [performanceHorizon, setPerformanceHorizon] = useState<typeof THEME_PERFORMANCE_HORIZONS[number]>('3d')
-  const [historyLoading, setHistoryLoading] = useState(false)
   const [filters, setFilters] = useState({
     source: '',
     sentiment: 'all',
@@ -333,23 +300,6 @@ export default function NewsEye() {
       setThemeLoading(false)
     }
   }, [themeWindow])
-
-  const loadThemeHistory = useCallback(async () => {
-    if (!snapshotDate) return
-    setHistoryLoading(true)
-    try {
-      const [snapshots, performance] = await Promise.all([
-        api.getNewsEyeThemeSnapshots({ date: snapshotDate, window: 'premarket', limit: 20 }),
-        api.getNewsEyeThemePerformance({ snapshot_date: snapshotDate, horizon: performanceHorizon }),
-      ])
-      setSnapshotItems(snapshots.items || [])
-      setPerformanceItems(performance.items || [])
-    } catch (err) {
-      setThemeError(err instanceof Error ? err.message : '加载历史回溯失败')
-    } finally {
-      setHistoryLoading(false)
-    }
-  }, [performanceHorizon, snapshotDate])
 
   const loadItems = useCallback(async (options?: { offset?: number; append?: boolean }) => {
     const offset = options?.offset ?? 0
@@ -415,10 +365,6 @@ export default function NewsEye() {
   useEffect(() => {
     void loadThemes()
   }, [loadThemes])
-
-  useEffect(() => {
-    void loadThemeHistory()
-  }, [loadThemeHistory])
 
   usePolling(
     () => Promise.all([
@@ -499,8 +445,9 @@ export default function NewsEye() {
   }, [filters.sector, filters.sentiment, filters.source, filters.symbol])
 
   const trackedSymbols = backgroundMeta?.tracked_symbols || []
-  const activeSources = backgroundMeta?.active_sources || []
+  const activeSources = useMemo(() => backgroundMeta?.active_sources || [], [backgroundMeta?.active_sources])
   const hasFilters = activeFilters.length > 0
+  const latestNewsTime = historyMeta?.latest_published_at || null
   const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => (backendGovernance?.items?.length ? backendGovernance.items : [
     {
       label: '页面主数据源',
@@ -785,9 +732,16 @@ export default function NewsEye() {
                   </h3>
                 </div>
                 {selectedThemeItem ? (
-                  <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${sourceTierTone(selectedThemeItem.source_tier)}`}>
-                    {selectedThemeItem.source_tier}级源
-                  </span>
+                  <div className="flex flex-wrap justify-end gap-1.5">
+                    <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${sourceTierTone(selectedThemeItem.source_tier)}`}>
+                      主导{selectedThemeItem.source_tier}级
+                    </span>
+                    {selectedThemeItem.policy_boost && (selectedThemeItem.top_source_tier || selectedThemeItem.source_tier) === 'S' && selectedThemeItem.source_tier !== 'S' ? (
+                      <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${sourceTierTone('S')}`}>
+                        含S级政策证据
+                      </span>
+                    ) : null}
+                  </div>
                 ) : null}
               </div>
 
@@ -828,13 +782,20 @@ export default function NewsEye() {
                   ) : null}
                   <div className="mt-3 space-y-2">
                     {(selectedThemeItem.evidence_items || []).slice(0, 4).map(evidence => (
-                      <div key={evidence.id} className="rounded-xl border border-slate-200 bg-white/86 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900/70">
+                      <div
+                        key={evidence.id}
+                        tabIndex={0}
+                        className="group relative rounded-xl border border-slate-200 bg-white/86 px-3 py-2 text-xs outline-none transition focus-within:z-40 focus-visible:ring-2 focus-visible:ring-sky-300 dark:border-slate-700 dark:bg-slate-900/70 dark:focus-visible:ring-sky-500/40"
+                      >
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(evidence.source_tier)}`}>{evidence.source_tier}</span>
                           <span className="text-[11px] text-slate-400">{evidence.source}</span>
                           <span className="text-[11px] text-slate-400">{formatDateTime(evidence.published_at)}</span>
                         </div>
                         <div className="mt-1.5 line-clamp-2 leading-5 text-slate-700 dark:text-slate-300">{evidence.content}</div>
+                        <div className="absolute left-2 right-2 top-full z-40 mt-2 hidden max-h-72 overflow-y-auto rounded-xl border border-slate-200 bg-white p-3 text-xs leading-5 text-slate-700 shadow-xl ring-1 ring-slate-900/5 group-hover:block group-focus:block dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:ring-white/10">
+                          {evidence.content}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -844,49 +805,6 @@ export default function NewsEye() {
               )}
             </div>
 
-            <div className="rounded-[18px] border border-slate-200 bg-white/90 p-4 dark:border-slate-800 dark:bg-slate-900/72">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="inline-flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 dark:text-slate-500">
-                    <History className="h-3 w-3" />
-                    Backtest Loop
-                  </div>
-                  <h3 className="mt-1 text-base font-semibold text-slate-950 dark:text-white">历史回溯</h3>
-                </div>
-                {historyLoading ? <Loader2 className="h-4 w-4 animate-spin text-slate-400" /> : null}
-              </div>
-              <div className="mt-3 grid grid-cols-[minmax(0,1fr)_92px] gap-2">
-                <input
-                  type="date"
-                  value={snapshotDate}
-                  onChange={(event) => setSnapshotDate(event.target.value)}
-                  className="input w-full"
-                />
-                <select
-                  value={performanceHorizon}
-                  onChange={(event) => setPerformanceHorizon(event.target.value as typeof THEME_PERFORMANCE_HORIZONS[number])}
-                  className="input w-full"
-                >
-                  {THEME_PERFORMANCE_HORIZONS.map(horizon => (
-                    <option key={horizon} value={horizon}>{horizon}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="mt-3 space-y-2">
-                {performanceItems.length ? performanceItems.slice(0, 5).map(item => (
-                  <PerformanceRow key={`${item.theme}-${item.horizon}`} item={item} />
-                )) : snapshotItems.length ? snapshotItems.slice(0, 5).map(item => (
-                  <div key={item.theme} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-800/60">
-                    <span className="font-semibold text-slate-900 dark:text-slate-100">#{item.rank} {item.theme}</span>
-                    <span className="ml-2 text-slate-500 dark:text-slate-400">等待后续表现数据</span>
-                  </div>
-                )) : (
-                  <div className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center text-xs text-slate-400 dark:border-slate-700 dark:text-slate-500">
-                    该日期暂无主线快照
-                  </div>
-                )}
-              </div>
-            </div>
           </div>
         </div>
 
@@ -921,7 +839,7 @@ export default function NewsEye() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-            <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">最近更新 {formatDateTime(updatedAt)}</span>
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">最新资讯 {formatDateTime(latestNewsTime || updatedAt)}</span>
             {hasFilters ? (
               <button
                 type="button"
@@ -1122,7 +1040,7 @@ export default function NewsEye() {
                   ) : null}
 
                   <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                    <span>入库时间 {formatDateTime(item.fetched_at)}</span>
+                    <span>采集入库 {formatDateTime(item.fetched_at)}</span>
                     {hasSymbolTags ? (
                       <span>已命中个股标签</span>
                     ) : item.related_symbols.length > 0 ? (

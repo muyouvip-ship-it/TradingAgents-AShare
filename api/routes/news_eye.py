@@ -51,12 +51,12 @@ def list_news_themes(
     db: Session = Depends(get_db),
     current_user=Depends(require_api_user),
 ) -> dict[str, Any]:
-    del current_user
     return news_theme_service.list_theme_rankings(
         db,
         window=window,
         limit=limit,
         include_evidence=include_evidence,
+        user_id=current_user.id,
     )
 
 

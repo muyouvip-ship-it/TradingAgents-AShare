@@ -45,7 +45,6 @@ def search_stocks(
     db: Session = Depends(get_db),
     current_user=Depends(require_api_user),
 ):
-    del current_user
     q = q.strip()
     if not q:
         return {"results": []}
@@ -595,7 +594,7 @@ def _preferred_market_latest_daily_table(db: Session) -> str:
     force expensive anti-join scans over the legacy 10M+ row table when the market
     page only needs the latest trading day.
     """
-    for table_name in ("pub_stock_daily_kline", "stock_daily_kline"):
+    for table_name in ("stock_daily_kline", "pub_stock_daily_kline"):
         if not _has_table(db, table_name):
             continue
         if _load_latest_daily_trade_date(db, table_name):

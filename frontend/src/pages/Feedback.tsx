@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { MessageSquarePlus, Send, Loader2, ChevronLeft, Clock, CheckCircle2, MessageCircle } from 'lucide-react'
 import { api } from '@/services/api'
 import type { FeedbackItem } from '@/types'
@@ -15,7 +15,7 @@ export default function Feedback() {
     const [submitting, setSubmitting] = useState(false)
     const pageSize = 10
 
-    const loadFeedbacks = async (p = page) => {
+    const loadFeedbacks = useCallback(async (p = page) => {
         setLoading(true)
         try {
             const res = await api.listFeedbacks(p, pageSize)
@@ -26,9 +26,9 @@ export default function Feedback() {
         } finally {
             setLoading(false)
         }
-    }
+    }, [page])
 
-    useEffect(() => { loadFeedbacks(page) }, [page])
+    useEffect(() => { loadFeedbacks(page) }, [loadFeedbacks, page])
 
     const [error, setError] = useState('')
 

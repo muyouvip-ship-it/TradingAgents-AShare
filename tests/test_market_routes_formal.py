@@ -1,7 +1,9 @@
+from types import SimpleNamespace
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.routes.market import router
+from api.routes.market import router, search_stocks
 
 
 def _client() -> TestClient:
@@ -73,3 +75,24 @@ def test_market_intraday_endpoint_returns_qmt_intraday_payload(monkeypatch):
     assert payload["symbol"] == "000001.SZ"
     assert payload["source"] == "qmt_intraday+postgresql_cache"
     assert payload["items"][0]["trade_time"] == "2026-04-28 09:31:00"
+
+
+def test_stock_search_uses_authenticated_user_for_quote_lookup(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr("api.routes.market.get_reverse_stock_map", lambda: {"600000.SH": "浦发银行"})
+    monkeypatch.setattr("api.routes.market.search_cn_stock_by_name", lambda query: None)
+    monkeypatch.setattr("api.routes.market._load_latest_stock_changes", lambda db, symbols: {})
+
+    def fake_load_quote_map(symbols, *, timeout_seconds=None, db=None, user_id=None):
+        seen["symbols"] = symbols
+        seen["user_id"] = user_id
+        return {"600000.SH": {"price": 8.88, "change_pct": 1.23}}
+
+    monkeypatch.setattr("api.routes.market._load_quote_map", fake_load_quote_map)
+
+    payload = search_stocks(q="浦发", db=object(), current_user=SimpleNamespace(id="user-123"))
+
+    assert seen == {"symbols": ["600000.SH"], "user_id": "user-123"}
+    assert payload["results"][0]["symbol"] == "600000.SH"
+    assert payload["results"][0]["current_price"] == 8.88

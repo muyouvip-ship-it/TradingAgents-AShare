@@ -13,18 +13,31 @@ function getInitials(email?: string | null): string {
 export default function Header() {
     const navigate = useNavigate()
     const { user, logout } = useAuthStore()
-    const [themeMode, setThemeMode] = useState<ThemeMode>('system')
-    const [notifPermission, setNotifPermission] = useState<NotificationPermission>('default')
+    const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+        const saved = (localStorage.getItem('ta-theme') || 'system') as ThemeMode
+        return ['system', 'light', 'dark'].includes(saved) ? saved : 'system'
+    })
+    const [notifPermission, setNotifPermission] = useState<NotificationPermission>(() =>
+        'Notification' in window ? Notification.permission : 'default',
+    )
     const [menuOpen, setMenuOpen] = useState(false)
     const menuRef = useRef<HTMLDivElement | null>(null)
 
+    function applyTheme(mode: ThemeMode) {
+        const root = document.documentElement
+        const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+        const shouldBeDark = mode === 'system' ? systemDark : mode === 'dark'
+        root.classList.toggle('dark', shouldBeDark)
+    }
+
     useEffect(() => {
-        const saved = (localStorage.getItem('ta-theme') || 'system') as ThemeMode
-        const mode: ThemeMode = ['system', 'light', 'dark'].includes(saved) ? saved : 'system'
-        setThemeMode(mode)
-        applyTheme(mode)
-        if ('Notification' in window) setNotifPermission(Notification.permission)
-    }, [])
+        applyTheme(themeMode)
+        if ('Notification' in window) {
+            const timer = window.setTimeout(() => setNotifPermission(Notification.permission), 0)
+            return () => window.clearTimeout(timer)
+        }
+        return undefined
+    }, [themeMode])
 
     useEffect(() => {
         const onClick = (event: MouseEvent) => {
@@ -35,13 +48,6 @@ export default function Header() {
         document.addEventListener('mousedown', onClick)
         return () => document.removeEventListener('mousedown', onClick)
     }, [])
-
-    const applyTheme = (mode: ThemeMode) => {
-        const root = document.documentElement
-        const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-        const shouldBeDark = mode === 'system' ? systemDark : mode === 'dark'
-        root.classList.toggle('dark', shouldBeDark)
-    }
 
     const cycleTheme = () => {
         const next: ThemeMode =

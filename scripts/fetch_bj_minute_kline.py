@@ -90,17 +90,19 @@ def get_bj_stock_list_from_em():
 
 
 def bj_symbol_to_code(symbol: str) -> str:
-    """bj920000 -> 920000"""
-    if symbol.startswith("bj"):
-        return symbol[2:]
-    return symbol
+    """Return the bare numeric code from bj920000 / 920000.BJ / 920000."""
+    normalized = str(symbol or "").strip().upper()
+    if normalized.startswith("BJ"):
+        return normalized[2:]
+    if normalized.endswith(".BJ"):
+        return normalized.split(".", 1)[0]
+    return normalized
 
 
 def code_to_bj_symbol(code: str) -> str:
-    """920000 -> bj920000"""
-    if not code.startswith("bj"):
-        return f"bj{code}"
-    return code
+    """Return final-table BJ symbol format."""
+    normalized = bj_symbol_to_code(code)
+    return f"{normalized}.BJ" if normalized else ""
 
 
 def fetch_minute_kline_em(code: str, start_date: str, end_date: str, max_retries=3) -> list:
@@ -192,9 +194,11 @@ def get_trading_days(start_date, end_date):
 def get_existing_max_time(conn, symbol):
     """获取该股票已有的最大时间"""
     cur = conn.cursor()
+    code = bj_symbol_to_code(symbol)
+    variants = [code_to_bj_symbol(code), f"bj{code}", code]
     cur.execute(
-        "SELECT MAX(trade_time) FROM stock_minute_kline WHERE symbol = %s",
-        (symbol,),
+        "SELECT MAX(trade_time) FROM stock_minute_kline WHERE symbol = ANY(%s)",
+        (variants,),
     )
     return cur.fetchone()[0]
 

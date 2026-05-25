@@ -5,6 +5,7 @@ import { getBaseUrl } from '@/services/api'
 
 export function useSSE(jobId: string | null) {
     const eventSourceRef = useRef<EventSource | null>(null)
+    const connectRef = useRef<(() => void) | null>(null)
     const agentMessageMapRef = useRef<Record<string, string>>({})
     const firstTokenMapRef = useRef<Record<string, boolean>>({})
     const tokenBufferRef = useRef<{
@@ -12,6 +13,7 @@ export function useSSE(jobId: string | null) {
         reports: Record<string, { agent: string; report: string; token: string; horizon?: string }>
     }>({ chat: {}, reports: {} })
     const tokenFlushTimerRef = useRef<number | null>(null)
+    const reconnectTimerRef = useRef<number | null>(null)
 
     const {
         setIsConnected,
@@ -266,10 +268,14 @@ export function useSSE(jobId: string | null) {
             })
 
             // Auto reconnect after 3 seconds
-            setTimeout(() => {
+            if (reconnectTimerRef.current != null) {
+                window.clearTimeout(reconnectTimerRef.current)
+            }
+            reconnectTimerRef.current = window.setTimeout(() => {
                 if (eventSourceRef.current?.readyState === EventSource.CLOSED) {
-                    connect()
+                    connectRef.current?.()
                 }
+                reconnectTimerRef.current = null
             }, 3000)
         }
 
@@ -279,23 +285,35 @@ export function useSSE(jobId: string | null) {
             eventSourceRef.current = null
             setIsConnected(false)
         }
-    }, [bufferAgentToken, flushTokenBuffers, jobId])
+    }, [addAgentMessage, addAgentReport, addAgentToolCall, addChatMessage, addLog, bufferAgentToken, flushTokenBuffers, jobId, setIsAnalyzing, setIsConnected, setMessageContent, setReport, setStructuredData, updateAgentSnapshot, updateAgentStatus])
+
+    useEffect(() => {
+        connectRef.current = connect
+    }, [connect])
 
     useEffect(() => {
         const cleanup = connect()
         return () => {
             cleanup?.()
+            if (reconnectTimerRef.current != null) {
+                window.clearTimeout(reconnectTimerRef.current)
+                reconnectTimerRef.current = null
+            }
         }
     }, [connect])
 
     const disconnect = useCallback(() => {
+        if (reconnectTimerRef.current != null) {
+            window.clearTimeout(reconnectTimerRef.current)
+            reconnectTimerRef.current = null
+        }
         if (eventSourceRef.current) {
             flushTokenBuffers()
             eventSourceRef.current.close()
             eventSourceRef.current = null
             setIsConnected(false)
         }
-    }, [flushTokenBuffers])
+    }, [flushTokenBuffers, setIsConnected])
 
     return { disconnect }
 }
